@@ -1297,17 +1297,17 @@ test_list_running() {
         fail "list exits 0" "exit code: $?"
     fi
 
-    if echo "$HARNESS_OUT" | grep -q "^NAME *STATE"; then
-        pass "list prints NAME/STATE header"
+    if echo "$HARNESS_OUT" | grep -qE "^NAME +NETWORK\$"; then
+        pass "list prints NAME/NETWORK header"
     else
-        fail "list prints NAME/STATE header" "got: $HARNESS_OUT"
+        fail "list prints NAME/NETWORK header" "got: $HARNESS_OUT"
     fi
 
     local expected_network="open"
     if [[ "$(uname -s)" == "Darwin" ]]; then
         expected_network="n/a"
     fi
-    if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} +running +${expected_network}\$"; then
+    if echo "$HARNESS_OUT" | sed -n '/^Running$/,/^Stopped$/p' | grep -qE "^${INSTANCE} +${expected_network}\$"; then
         pass "list shows instance as running"
     else
         fail "list shows instance as running" "got: $HARNESS_OUT"
@@ -1994,6 +1994,58 @@ test_claude_onboarding_seed() {
     fi
 }
 
+check_codex_code_mode_host() {
+    if coop_exec bash -o pipefail -c '
+        host=/usr/local/bin/codex-code-mode-host
+
+        # Codex 0.172 speaks HTTP/2 over stdio. Require an ACK to our SETTINGS;
+        # the initial server SETTINGS alone only proves that the host started.
+        http2_output=$(printf "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\4\0\0\0\0\0" |
+            timeout 10 "$host" --listen stdio 2>/dev/null | od -An -v -tu1) || exit $?
+        bytes=($http2_output)
+        offset=0 settings=0 acknowledged=0 count=${#bytes[@]}
+        while (( offset + 9 <= count )); do
+            length=$((bytes[offset] * 65536 + bytes[offset + 1] * 256 + bytes[offset + 2]))
+            (( offset + 9 + length <= count )) || exit 1
+            kind=${bytes[offset + 3]}
+            flags=${bytes[offset + 4]}
+            stream=$((bytes[offset + 5] + bytes[offset + 6] + bytes[offset + 7] + bytes[offset + 8]))
+            offset=$((offset + 9))
+            if (( kind == 4 && stream == 0 )); then
+                if (( flags == 0 && length % 6 == 0 )); then
+                    settings=1
+                elif (( flags == 1 && length == 0 && settings == 1 )); then
+                    acknowledged=1
+                fi
+            fi
+            offset=$((offset + length))
+        done
+        (( offset == count && settings == 1 && acknowledged == 1 ))
+    ' >/dev/null; then
+        pass "Codex Code Mode host completes a stdio handshake"
+        return
+    fi
+
+    # Older installed images use a length-prefixed JSON hello.
+    if coop_exec bash -o pipefail -c '
+        host=/usr/local/bin/codex-code-mode-host
+        hello="{\"type\":\"connection/hello\",\"supportedVersions\":[1],\"requiredCapabilities\":[],\"optionalCapabilities\":[]}"
+        if printf "\147\000\000\000%s" "$hello" |
+            timeout 10 "$host" --listen stdio 2>/dev/null |
+            dd bs=1 skip=4 status=none |
+            grep -Eq "\"type\"[[:space:]]*:[[:space:]]*\"connection/ready\""; then
+            exit 0
+        fi
+        exit 1
+    ' >/dev/null; then
+        pass "Codex Code Mode host completes a stdio handshake"
+        return
+    fi
+
+    fail "Codex Code Mode host completes a stdio handshake" \
+        "Neither HTTP/2 nor legacy handshake probe succeeded"
+}
+
 check_native_codex() {
     local guest_home launcher native_host version codex_path host_path
     guest_home=$(guest_exec printenv HOME)
@@ -2021,19 +2073,7 @@ check_native_codex() {
             "output: $version; stderr: $(guest_stderr)"
     fi
 
-    # The Code Mode protocol uses a little-endian length-prefixed JSON frame.
-    # A successful hello must return connection/ready; an exit-zero stub cannot.
-    if coop_exec bash -o pipefail -c '
-        hello='"'"'{"type":"connection/hello","supportedVersions":[1],"requiredCapabilities":[],"optionalCapabilities":[]}'"'"'
-        printf "\147\000\000\000%s" "$hello" |
-            timeout 10 /usr/local/bin/codex-code-mode-host --listen stdio |
-            dd bs=1 skip=4 status=none |
-            grep -Eq '"'"'"type"[[:space:]]*:[[:space:]]*"connection/ready"'"'"'
-    '; then
-        pass "Codex Code Mode host responds to stdio hello"
-    else
-        fail "Codex Code Mode host responds to stdio hello" "stderr: $(guest_stderr)"
-    fi
+    check_codex_code_mode_host
 
     codex_path=$(guest_exec readlink -f /usr/local/bin/codex)
     host_path=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host)
@@ -4386,7 +4426,7 @@ test_list_stopped() {
     if [[ "$(uname -s)" == "Darwin" ]]; then
         expected_network="n/a"
     fi
-    if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} +stopped +${expected_network}\$"; then
+    if echo "$HARNESS_OUT" | sed -n '/^Stopped$/,$p' | grep -qE "^${INSTANCE} +${expected_network}\$"; then
         pass "list shows instance as stopped"
     else
         fail "list shows instance as stopped" "got: $HARNESS_OUT"

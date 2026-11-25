@@ -28,6 +28,34 @@ def shell(script, *, bash="bash", **env):
 
 
 class ProbeTests(unittest.TestCase):
+    def test_web_editor_reports_launch_when_kill_probe_fails(self):
+        source = (Path(__file__).parent.parent / "scripts/guest/web-editor.sh").read_text()
+        observe = re.search(r"^observe_launch\(\) \{\n.*?^\}", source, re.M | re.S)[0]
+        running = re.search(r"^launch_child_running\(\) \{\n.*?^\}", source, re.M | re.S)[0]
+        launch_loop = re.search(r'^while .*"\$child".*; do\n.*?^done$', source, re.M | re.S)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            script = "set -euo pipefail\n" + observe + "\n" + running + '''
+launch_marker=$LAUNCH_MARKER
+service_started=0
+stage=systemd_launch
+reason=launch_failed
+ready=1
+launch_started=$SECONDS
+lease() { builtin kill "$child" 2>/dev/null || true; }
+# Simulate the service marker appearing as the launcher is polled.
+jobs() { : > "$launch_marker"; builtin jobs "$@"; }
+kill() { return 1; }
+sleep 10 & child=$!
+trap 'builtin kill "$child" 2>/dev/null || true' EXIT
+! kill -0 "$child"
+''' + launch_loop + '''
+[[ $service_started == 1 && $stage == code_server ]]
+wait "$child" || true
+'''
+            result = shell(script, LAUNCH_MARKER=str(Path(directory) / "launched"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "launched\n")
+
     def test_web_editor_lease_preserves_split_heartbeat(self):
         source = (Path(__file__).parent.parent / "scripts/guest/web-editor.sh").read_text()
         lease = re.search(r"^lease\(\) \{\n.*?^\}", source, re.M | re.S)[0]
@@ -101,6 +129,67 @@ lease
                                  capture_output=True, text=True, timeout=3)
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
         self.assertEqual(stopped.stdout, "cancelled lease_expired\n")
+
+    def test_codex_code_mode_host_requires_a_completed_handshake(self):
+        with tempfile.TemporaryDirectory(prefix="codex probe ") as directory:
+            host = Path(directory) / "codex-code-mode-host"
+            host.write_text('''#!/usr/bin/env python3
+import json
+import os
+import struct
+import sys
+
+request = sys.stdin.buffer.read()
+mode = os.environ["HOST_MODE"]
+settings = bytes.fromhex("000000040000000000")
+ack = bytes.fromhex("000000040100000000")
+preface = bytes.fromhex("505249202a20485454502f322e300d0a0d0a534d0d0a0d0a")
+if mode.startswith("http2") and request.startswith(preface):
+    sys.stdout.buffer.write(settings)
+    if mode in ("http2-ready", "http2-truncated") and request.endswith(settings):
+        sys.stdout.buffer.write(ack)
+        if mode == "http2-truncated":
+            sys.stdout.buffer.write(bytes.fromhex("000001000000000000"))
+elif mode.startswith("legacy") and len(request) >= 4:
+    length = struct.unpack("<I", request[:4])[0]
+    if length == len(request) - 4 and b"connection/hello" in request[4:]:
+        kind = "connection/ready" if mode == "legacy-ready" else "connection/error"
+        response = json.dumps({"type": kind, "selectedVersion": 1}).encode()
+        sys.stdout.buffer.write(struct.pack("<I", len(response)) + response)
+elif mode == "exit-error":
+    print("fixture-host-error", file=sys.stderr)
+    sys.exit(1)
+''')
+            host.chmod(0o755)
+            timeout = Path(directory) / "timeout"
+            timeout.write_text('#!/bin/sh\nshift\nexec "$@"\n')
+            timeout.chmod(0o755)
+            fragment = functions("check_codex_code_mode_host").replace(
+                "host=/usr/local/bin/codex-code-mode-host", 'host="$FIXTURE_HOST"')
+            fixture = fragment + '''
+                coop_exec() {
+                    [[ ${TRANSPORT_FAIL:-0} == 1 ]] && return 1
+                    "$@" 2>/dev/null
+                }
+                pass() { echo "PASS $*"; }
+                fail() { echo "FAIL $*"; }
+                check_codex_code_mode_host
+            '''
+            for mode in ("http2-ready", "legacy-ready", "http2-no-ack",
+                         "http2-truncated",
+                         "legacy-error", "exit-zero", "exit-error", "transport-error"):
+                with self.subTest(mode=mode):
+                    result = shell(fixture, HOST_MODE=mode, FIXTURE_HOST=str(host),
+                                   TRANSPORT_FAIL="1" if mode == "transport-error" else "0",
+                                   PATH=directory + os.pathsep + os.environ["PATH"])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    expected = "PASS" if mode.endswith("ready") else "FAIL"
+                    self.assertTrue(result.stdout.startswith(expected), result.stdout)
+                    if expected == "FAIL":
+                        self.assertIn("Neither HTTP/2 nor legacy handshake probe succeeded",
+                                      result.stdout)
+                    if mode == "exit-error":
+                        self.assertNotIn("fixture-host-error", result.stdout + result.stderr)
 
     def test_untrack_instance_handles_an_empty_array_with_nounset(self):
         result = shell('set -eu\n' + functions("untrack_instance") + '''

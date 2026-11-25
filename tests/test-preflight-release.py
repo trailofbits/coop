@@ -35,6 +35,9 @@ class PreflightTests(unittest.TestCase):
         for name in ('cargo', 'cargo-deny', 'taplo', 'zizmor', 'cargo-kani'):
             self.executable('bin/' + name, '''#!/bin/bash
 printf '%s %s\n' "${0##*/}" "$*" >> "$PREFLIGHT_CALLS"
+if [[ "${0##*/} $*" == "cargo metadata --locked --format-version 1" && -n "${PREFLIGHT_REAL_CARGO:-}" ]]; then
+  exec "$PREFLIGHT_REAL_CARGO" metadata --locked --format-version 1
+fi
 if [[ "${0##*/} $*" == "cargo build --release --workspace --target aarch64-unknown-linux-musl" ]]; then
   printf 'aarch64-musl-env %s %s\n' "${CC_aarch64_unknown_linux_musl:-}" "${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER:-}" >> "$PREFLIGHT_CALLS"
 fi
@@ -102,6 +105,7 @@ printf 'run-integration.sh %s\n' "$*" >> "$PREFLIGHT_CALLS"
         self.assertIn('Version sources agree; tag v9.8.7 is free.', result.stdout)
         calls = self.log.read_text().splitlines()
         for call in ('cargo clippy --workspace --all-targets --all-features -- -D warnings',
+                     'cargo metadata --locked --format-version 1',
                      'cargo test --workspace', 'cargo deny --workspace check',
                      'cargo build --release --workspace --target aarch64-unknown-linux-musl',
                      'taplo format --check', 'test-integration-probes.py',
@@ -110,6 +114,43 @@ printf 'run-integration.sh %s\n' "$*" >> "$PREFLIGHT_CALLS"
             self.assertIn(call, calls)
         self.assertNotIn('Next: tag', result.stdout)
         self.assertIn('unrun gates before tagging', result.stdout)
+
+    def test_stale_lockfile_fails_before_unlocked_cargo_and_stays_unchanged(self):
+        real_cargo = subprocess.check_output(
+            ['rustup', 'which', 'cargo'], text=True).strip()
+        real_rustc = subprocess.check_output(
+            ['rustup', 'which', 'rustc'], text=True).strip()
+        (self.root / 'Cargo.toml').write_text(
+            '[workspace]\nmembers = ["coop-proxy"]\n'
+            '[workspace.package]\nversion = "9.8.7"\n'
+            '[package]\nname = "coop"\nversion.workspace = true\n')
+        (self.root / 'src').mkdir()
+        (self.root / 'src/lib.rs').write_text('pub fn coop() {}\n')
+        proxy = self.root / 'coop-proxy'
+        (proxy / 'src').mkdir(parents=True)
+        (proxy / 'Cargo.toml').write_text(
+            '[package]\nname = "coop-proxy"\nversion.workspace = true\n')
+        (proxy / 'src/lib.rs').write_text('pub fn proxy() {}\n')
+        subprocess.run([real_cargo, 'generate-lockfile'], cwd=self.root,
+                       check=True, capture_output=True, text=True)
+        helper = self.root / 'helper'
+        (helper / 'src').mkdir(parents=True)
+        (helper / 'Cargo.toml').write_text(
+            '[package]\nname = "helper"\nversion = "0.1.0"\n')
+        (helper / 'src/lib.rs').write_text('pub fn helper() {}\n')
+        with (self.root / 'Cargo.toml').open('a') as manifest:
+            manifest.write('[dependencies]\nhelper = { path = "helper" }\n')
+        original_lock = (self.root / 'Cargo.lock').read_bytes()
+
+        result = self.run_preflight(extra_env={
+            'PREFLIGHT_REAL_CARGO': real_cargo, 'RUSTC': real_rustc})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('FAIL: Cargo.lock consistency', result.stdout)
+        self.assertIn('cannot update the lock file', result.stderr)
+        self.assertEqual((self.root / 'Cargo.lock').read_bytes(), original_lock)
+        self.assertEqual(self.log.read_text().splitlines(),
+                         ['cargo metadata --locked --format-version 1'])
 
     def test_non_linux_namespace_gates_are_reported_as_unrun(self):
         self.executable('bin/uname', '#!/bin/bash\necho Darwin\n')
