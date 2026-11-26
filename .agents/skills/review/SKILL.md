@@ -32,6 +32,9 @@ parents and do not attribute the synthetic merge commit to the contributor.
 Gather once and share with every reviewer:
 
 - PR description and linked issue, commit list, changed paths, and diff.
+- The current user task or failure, evidence for it, and the intended success
+  and recovery behavior. Mark claims from the PR or issue as unverified until
+  checked against existing behavior.
 - Post-change bodies of touched functions. A hunk alone is not enough.
 - For new or changed external configuration inputs or file-transfer behavior,
   a source-to-sink trace:
@@ -53,7 +56,34 @@ Omit generated files such as `Cargo.lock`, completions, and snapshots from the
 verbatim packet, but record their names and sizes and inspect them where a
 cross-file invariant depends on them.
 
-## 3. Run independent lenses
+## 3. Assess the problem and solution
+
+Before inspecting local code quality, reconstruct what users do today, the
+observed failure or security boundary, and the outcome the change must preserve
+on success and failure. Check the PR's account against the linked issue,
+existing code and tests, and relevant user documentation. If evidence is
+missing, name the uncertainty; do not silently adopt the proposed
+implementation as the requirement.
+
+For a substantive behavior change, seek at least one concrete alternative,
+including an existing coop or platform mechanism when one fits. Compare each
+candidate against the same failure and security contract: normal use, partial
+failure, timeout, cleanup, recovery, compatibility, and both backends where
+relevant. Check new state, migrations, dependencies, and operational costs.
+Fewer lines or less user friction alone do not make an alternative safer or
+more reliable. If no credible alternative exists, say why.
+For a mechanical or docs-only change, a short statement of the task and why
+the approach fits is enough.
+
+Record a brief assessment and recommendation with evidence: whether the
+solution addresses the problem, whether a material choice remains for the
+requester, and which assumptions need validation. If the approach fits, assess
+its design separately: where authority is checked, which states can exist, how
+failures are diagnosed, and whether resources and recovery remain bounded.
+Keep this assessment separate from diff-anchored findings; an unresolved
+solution choice need not be invented as an inline code defect.
+
+## 4. Run independent lenses
 
 The detailed lens prompts live in [`references/`](references/). Read every
 selected lens file in full before starting it; the summaries below select the
@@ -61,16 +91,20 @@ lenses but do not replace their project-specific checks.
 
 If parallel subagents are available, delegate the applicable lenses
 concurrently and pass the same packet to each. Otherwise run them sequentially.
-Each reviewer starts from fresh eyes, returns only diff-introduced issues (or a
-latent issue made reachable by the diff), and supplies file, changed line,
-severity, finding, and concrete evidence.
+Each reviewer starts from fresh eyes and treats the coordinator's problem
+account as a hypothesis. Findings must be diff-introduced issues (or a latent
+issue made reachable by the diff), with file, changed line, severity, finding,
+and concrete evidence. The design lens also returns its independent solution
+assessment. Touched symbols locate changed code but do not limit inspection of
+relevant callers, consumers, workflows, or existing mechanisms.
 
 Always run:
 
 - **Correctness:** conditions, boundaries, error propagation, process/resource
   lifetime, partial failure, retry, timeout, stale state, and both VM backends.
-- **Design:** simpler existing primitives, dead indirection, impossible states,
-  phantom features, and at most one structural concern.
+- **Design:** solution fit against the stated failure contract, simpler existing
+  primitives, dead indirection, impossible states, phantom features, and
+  independently supported structural concerns.
 - **Conventions:** project Rust idioms, rename completeness, shared constants,
   mutation scope, cross-file synchronization, and diff noise.
 - **User impact:** follow [`docs/user-impact.md`](../../../docs/user-impact.md)
@@ -98,7 +132,7 @@ Docs-only diffs need conventions and docs. For the always-run user-impact lens,
 record when a docs-only change affects no user task. Skip comments only when no
 code comment or adjacent behavior changed. Record every skipped lens and why.
 
-## 4. Apply the learned adversarial checks
+## 5. Apply the learned adversarial checks
 
 These checks come from maintainer discussion on PRs merged after `v0.5.4` and
 apply across all lenses:
@@ -197,7 +231,7 @@ apply across all lenses:
   trailing and encoded variants, cross-provider routes, and unknown profiles;
   document which auto-updating client operations are intentionally rejected.
 
-## 5. Validate findings in batches
+## 6. Validate findings in batches
 
 Group candidate findings by file. Open each post-change file once and reject a
 finding unless all of these hold:
@@ -213,10 +247,13 @@ Deduplicate overlapping findings. Falsify each survivor a second time: actively
 look for the guard, caller, platform fact, or version behavior that would make
 it wrong. For external API claims, cite the primary versioned source.
 
-## 6. Report or post
+## 7. Report or post
 
 Lead with findings ordered by severity, each with a precise file and line.
-Include a concise evidence paragraph and avoid speculative wording. Then state:
+Include a concise evidence paragraph and avoid speculative wording. Then give
+the problem, alternatives considered where applicable, the solution and design
+assessment, and any unverified assumption or material requester decision. State
+the assessment even when no diff-anchored finding survives. Then state:
 
 - lenses run and skipped;
 - commands/reproductions performed;
@@ -226,8 +263,8 @@ Include a concise evidence paragraph and avoid speculative wording. Then state:
 
 If no findings survive, say so and name residual test or platform gaps. Only
 post inline comments when asked; post substantive findings inline and one
-top-level coverage summary. Never include internal severity labels in GitHub
-comment bodies.
+top-level summary that includes the solution assessment and coverage. Never
+include internal severity labels in GitHub comment bodies.
 
 When posting is explicitly requested, prefer an available inline-comment tool.
 Otherwise resolve the PR head SHA once and call
