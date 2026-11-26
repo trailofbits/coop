@@ -418,7 +418,7 @@ coop list
 
 ### `status`
 
-Print instance status. Without a name, lists every instance with its state, selected network mode, image, backend, and resource usage (for running instances). With a name, prints detailed status for that instance.
+Print instance status. Without a name, shows the backend and groups instances into running and stopped tables, alphabetized by name within each group. Both tables show the image and, on Firecracker, the selected network mode. The running table also shows 1-minute load average and memory and disk usage. With a name, prints detailed status for that instance.
 
 ```
 coop status [NAME]
