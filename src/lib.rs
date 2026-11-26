@@ -2712,6 +2712,25 @@ mod tests {
     }
 
     #[test]
+    fn up_rejects_option_shaped_instance_name() {
+        let err = parse_err(&["up", "--name=--all"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("must not start with '-'"));
+    }
+
+    #[test]
+    fn up_accepts_leading_underscore_instance_name() {
+        let cli = parse(&["up", "--name", "_worker"]);
+        let super::Commands::Up { name, .. } = cli.command else {
+            panic!("expected Up variant");
+        };
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("_worker")
+        );
+    }
+
+    #[test]
     fn up_new_instance_requires_explicit_name() {
         let err = parse_err(&["up", "--new-instance"]);
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
