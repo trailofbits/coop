@@ -3017,6 +3017,35 @@ Host coop-other\n\
     }
 
     #[test]
+    fn skipped_pull_report_caps_groups_but_counts_every_omitted_path() {
+        let received = b"coop-pull-entry:keep.txt\n";
+        let mut offered = String::from("coop-pull-entry:keep.txt\n");
+        for index in 0..20 {
+            writeln!(offered, "coop-pull-entry:root-{index:02}/").unwrap();
+        }
+        offered.push_str("coop-pull-entry:root-00/child\n");
+        let ((), logs) = capture_warn(|| report_uncopied_pull_paths(offered.as_bytes(), received));
+        assert_eq!(logs.matches("Pull skipped root-").count(), 20, "{logs}");
+        assert!(logs.contains("  root-00/child"), "{logs}");
+        assert!(!logs.contains("paths in total"), "{logs}");
+
+        offered.push_str("coop-pull-entry:root-20/\ncoop-pull-entry:root-20/child\n");
+        let ((), logs) = capture_warn(|| report_uncopied_pull_paths(offered.as_bytes(), received));
+        assert_eq!(logs.matches("Pull skipped root-").count(), 20, "{logs}");
+        for index in 0..20 {
+            assert!(
+                logs.contains(&format!("Pull skipped root-{index:02}\n")),
+                "{logs}"
+            );
+        }
+        assert!(!logs.contains("root-20"), "{logs}");
+        assert!(
+            logs.contains("Showing the first 20 groups. Pull skipped 23 paths in total."),
+            "{logs}"
+        );
+    }
+
+    #[test]
     fn pull_staging_cleanup_repairs_guest_directory_modes_without_following_symlinks() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 

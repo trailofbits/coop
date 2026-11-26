@@ -257,7 +257,6 @@ exclude_re = [
   "\\brsync_pull\\b",
   "\\bprepare_pull_file_lists\\b",
   "\\bread_rsync_file_list\\b",
-  "\\breport_uncopied_pull_paths\\b",
   "\\bcheck_guest_dirty\\b",
   "\\batomic_write\\b",
   "\\bwrite_ssh_config\\b",
