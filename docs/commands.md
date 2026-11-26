@@ -391,7 +391,8 @@ Firecracker jail generations and per-instance VMM identity. Templates and the
 kernel are preserved unless you pass `--all`.
 
 ```
-coop destroy [NAME] [FLAGS]
+coop destroy [NAME]
+coop destroy --all
 ```
 
 | Flag | Description |
