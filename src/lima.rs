@@ -5,6 +5,8 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::num::NonZeroU8;
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -27,7 +29,7 @@ const BUILDER_NAME: &str = "coop-builder";
 const DEFAULT_BUILDER_PROVISION_TIMEOUT: Duration = Duration::from_secs(1800);
 const LIMA_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
 const PROVISION_STAGE_PREFIX: &str = "COOP_PROVISION_STAGE:";
-const PROVISION_DIAGNOSTIC_TAIL_BYTES: u64 = 8192;
+const PROVISION_DIAGNOSTIC_TAIL_BYTES: usize = 8192;
 
 /// Hostname Lima injects into the guest that resolves to the host machine.
 /// Used to rewrite local-model endpoints so the guest can reach a server
@@ -1449,8 +1451,13 @@ fn run_builder_provision_script(
     script_file
         .rewind()
         .context("Failed to rewind Lima provision script")?;
-    let mut diagnostic_file = tempfile::tempfile_in(&cfg.data_dir)
-        .context("Failed to stage Lima provision diagnostics")?;
+    let (mut diagnostic_reader, diagnostic_writer) =
+        UnixStream::pair().context("Failed to open Lima provision diagnostic channel")?;
+    diagnostic_reader
+        .set_nonblocking(true)
+        .context("Failed to configure Lima provision diagnostic channel")?;
+    let mut diagnostic_tail = VecDeque::new();
+    let diagnostic_writer: OwnedFd = diagnostic_writer.into();
 
     let mut child = private_limactl()?
         .args([
@@ -1465,11 +1472,7 @@ fn run_builder_provision_script(
             "bash <(cat) 3>&1 </dev/null >/dev/null 2>/dev/null",
         ])
         .stdin(Stdio::from(script_file))
-        .stdout(Stdio::from(
-            diagnostic_file
-                .try_clone()
-                .context("Failed to clone Lima provision diagnostic file")?,
-        ))
+        .stdout(Stdio::from(diagnostic_writer))
         .stderr(Stdio::null())
         .spawn()
         .context("Failed to launch provisioning in Lima builder")?;
@@ -1477,18 +1480,23 @@ fn run_builder_provision_script(
     let timeout = builder_timeout.unwrap_or(DEFAULT_BUILDER_PROVISION_TIMEOUT);
     let started = Instant::now();
     loop {
+        let _ = drain_provision_diagnostics(&mut diagnostic_reader, &mut diagnostic_tail);
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => bail!(
-                "Lima builder provisioning failed{}: {status}",
-                provision_stage_detail(&mut diagnostic_file)
-            ),
+            Ok(Some(status)) => {
+                let _ = drain_provision_diagnostics(&mut diagnostic_reader, &mut diagnostic_tail);
+                bail!(
+                    "Lima builder provisioning failed{}: {status}",
+                    provision_stage_detail(&diagnostic_tail)
+                )
+            }
             Ok(None) if started.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = drain_provision_diagnostics(&mut diagnostic_reader, &mut diagnostic_tail);
                 bail!(
                     "Lima builder provisioning timed out{} after {}",
-                    provision_stage_detail(&mut diagnostic_file),
+                    provision_stage_detail(&diagnostic_tail),
                     crate::format_duration(timeout)
                 );
             }
@@ -1502,27 +1510,30 @@ fn run_builder_provision_script(
     }
 }
 
-fn provision_stage_detail(file: &mut File) -> String {
-    let Some(length) = file.metadata().ok().map(|metadata| metadata.len()) else {
-        return String::new();
-    };
-    if file
-        .seek(SeekFrom::Start(
-            length.saturating_sub(PROVISION_DIAGNOSTIC_TAIL_BYTES),
-        ))
-        .is_err()
-    {
-        return String::new();
+fn drain_provision_diagnostics(reader: &mut UnixStream, tail: &mut VecDeque<u8>) -> io::Result<()> {
+    let mut chunk = [0_u8; 4096];
+    // Bound each drain so a noisy guest cannot prevent the timeout check.
+    for _ in 0..16 {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(count) => {
+                for byte in &chunk[..count] {
+                    if tail.len() == PROVISION_DIAGNOSTIC_TAIL_BYTES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(*byte);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        }
     }
-    let mut tail = Vec::new();
-    if file
-        .take(PROVISION_DIAGNOSTIC_TAIL_BYTES)
-        .read_to_end(&mut tail)
-        .is_err()
-    {
-        return String::new();
-    }
-    let output = String::from_utf8_lossy(&tail);
+    Ok(())
+}
+
+fn provision_stage_detail(tail: &VecDeque<u8>) -> String {
+    let bytes = tail.iter().copied().collect::<Vec<_>>();
+    let output = String::from_utf8_lossy(&bytes);
     output
         .lines()
         .rev()
@@ -4077,20 +4088,32 @@ mod tests {
 
     #[test]
     fn provision_stage_detail_reports_only_known_stages() {
-        let mut diagnostics = tempfile::tempfile().unwrap();
-        writeln!(diagnostics, "installer output containing a secret").unwrap();
-        writeln!(diagnostics, "{PROVISION_STAGE_PREFIX}profile-post").unwrap();
-        writeln!(diagnostics, "{PROVISION_STAGE_PREFIX}secret-value").unwrap();
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let mut tail = VecDeque::new();
+        for _ in 0..3 {
+            writer.write_all(&[b'x'; 4096]).unwrap();
+            drain_provision_diagnostics(&mut reader, &mut tail).unwrap();
+        }
+        let diagnostics = format!(
+            "installer output containing a secret\n\
+             {PROVISION_STAGE_PREFIX}profile-post\n\
+             {PROVISION_STAGE_PREFIX}secret-value\n"
+        );
+        writer.write_all(diagnostics.as_bytes()).unwrap();
+        drain_provision_diagnostics(&mut reader, &mut tail).unwrap();
 
         assert_eq!(
-            provision_stage_detail(&mut diagnostics),
+            provision_stage_detail(&tail),
             " during profile post-install"
         );
+        assert_eq!(tail.len(), PROVISION_DIAGNOSTIC_TAIL_BYTES);
 
-        let mut unknown_only = tempfile::tempfile().unwrap();
-        writeln!(unknown_only, "{PROVISION_STAGE_PREFIX}secret-value").unwrap();
+        let unknown_only = format!("{PROVISION_STAGE_PREFIX}secret-value\n")
+            .into_bytes()
+            .into();
         assert_eq!(
-            provision_stage_detail(&mut unknown_only),
+            provision_stage_detail(&unknown_only),
             " (no setup stage reported)"
         );
     }
