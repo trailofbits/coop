@@ -2,9 +2,9 @@
 //!
 //! The three agents are installed "latest at build time" during `coop setup`, so
 //! they go stale in long-running VMs and in VMs created from an old image.
-//! This command updates them in place against a *running* instance, without
-//! rebuilding the golden image (`coop setup --rebuild` remains the path for
-//! refreshing the image itself).
+//! `agent update` refreshes them in place against a *running* instance without
+//! rebuilding the golden image; `agent status` only reports their versions.
+//! `coop setup --rebuild` remains the path for refreshing the image itself.
 //!
 //! The agents differ in how they update, and the difference is encoded in
 //! [`UpdateStrategy`] so no caller can run the wrong one:
@@ -328,7 +328,7 @@ fn check_row(session: &SshSession, agent: Agent) -> CheckRow {
 }
 
 /// Best-effort lookup of the newest Codex release tag. Network failures
-/// degrade to `None` (reported as `Unknown`) rather than aborting the check.
+/// degrade to `None` (reported as `Unknown`) rather than aborting the status report.
 fn codex_latest() -> Option<AgentVersion> {
     match update::latest_release_tag(CODEX_REPO) {
         Ok(tag) => AgentVersion::parse(&tag).ok(),
