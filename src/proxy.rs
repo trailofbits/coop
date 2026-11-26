@@ -958,22 +958,26 @@ fn await_forwarding_ack(mut request: std::process::Child, deadline: Instant) -> 
     result
 }
 
-/// SIGTERM the process named by a PID file and remove the file. Best-effort;
-/// safe when the file is absent or malformed.
+/// Test-only cleanup for a direct child after a forwarding assertion. Handle
+/// both managed and legacy records so a failed assertion cannot strand it.
 #[cfg(test)]
 fn kill_pid_file(path: &Path, label: &str) {
-    let Ok(contents) = fs::read_to_string(path) else {
+    let Ok(Some(record)) = read_process_record(path) else {
         return;
     };
-    match contents.trim().parse::<i32>() {
-        Ok(pid) if pid > 0 => {
+    let pid = match record {
+        ProcessRecord::Managed(record) => record.pid,
+        ProcessRecord::Legacy(pid) => pid,
+    };
+    match pid {
+        pid if pid > 0 => {
             // Safety: `kill` with a parsed positive pid and a constant signal.
             unsafe {
                 libc::kill(pid, libc::SIGTERM);
             }
             tracing::debug!("Sent SIGTERM to {label} (pid {pid})");
         }
-        _ => tracing::debug!("Ignoring malformed pid file {}", path.display()),
+        _ => tracing::debug!("Ignoring invalid pid file {}", path.display()),
     }
     if let Err(e) = fs::remove_file(path) {
         tracing::debug!(
