@@ -216,8 +216,8 @@ Grok Build auto-updates in the background by default. To force an update
 immediately, run `grok update` inside the VM, or from the host:
 
 ```bash
-coop agent update --grok
+coop agent update --agent grok
 ```
 
-`coop agent update --grok` runs `grok update` synchronously as the guest
+`coop agent update --agent grok` runs `grok update` synchronously as the guest
 user. See [`agent update`](commands.md#agent-update).

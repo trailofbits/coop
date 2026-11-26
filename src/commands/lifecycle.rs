@@ -914,7 +914,13 @@ fn restart_confirmed_instance(
         pat_prompt::RepoHint::unrecorded()
     };
     if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated {
-        pat_prompt::maybe_prompt(cfg, opts.config_path, &inst, &hint, opts.no_prompt, None)?;
+        pat_prompt::maybe_prompt_existing_vm(
+            cfg,
+            opts.config_path,
+            &inst,
+            &hint,
+            &pat_prompt::SystemPromptIo::new(opts.no_prompt),
+        )?;
     }
     let mut stopped = be.as_stopped(inst.clone())?;
     let current = cfg.resolve_instance(Some(&inst.name))?;
@@ -1075,13 +1081,13 @@ fn start_instance(
                 .or_else(|| opts.mounts.first().map(|m| m.host_path.as_path())),
         )
     };
-    pat_prompt::maybe_prompt(
+    pat_prompt::maybe_prompt_new_vm(
         cfg,
         opts.config_path,
         inst,
         &hint,
-        opts.no_prompt,
         opts.pat_entry,
+        &pat_prompt::SystemPromptIo::new(opts.no_prompt),
     )?;
 
     // Forwards are checked up-front so an in-use host port fails fast,
@@ -2944,7 +2950,13 @@ fn confirm_reprovision(
         pat_prompt::RepoHint::unrecorded()
     };
     if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated {
-        pat_prompt::maybe_prompt(cfg, opts.config_path, inst, &hint, opts.no_prompt, None)?;
+        pat_prompt::maybe_prompt_existing_vm(
+            cfg,
+            opts.config_path,
+            inst,
+            &hint,
+            &pat_prompt::SystemPromptIo::new(opts.no_prompt),
+        )?;
     }
     Ok(())
 }
