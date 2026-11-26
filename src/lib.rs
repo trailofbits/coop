@@ -89,12 +89,12 @@ use clap_complete::engine::ArgValueCandidates;
 
 use backend::VmBackend as _;
 use commands::{
-    AgentKind, AgentUpdateOpts, ProfileImageTarget, ProjectTransport, ReprovisionOpts, ResizeOpts,
-    RestoreMode, RestoreOpts, StartOpts, UninstallOpts, UpOpts, UpRuntimeOpts,
-    apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit, cmd_destroy,
-    cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_network, cmd_profiles,
-    cmd_proxy, cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall,
-    cmd_up, cmd_validate, codex_launch_args, grok_launch_args, open_agent_session,
+    Agent, AgentKind, AgentSelection, ProfileImageTarget, ProjectTransport, ReprovisionOpts,
+    ResizeOpts, RestoreMode, RestoreOpts, StartOpts, UninstallOpts, UpOpts, UpRuntimeOpts,
+    apply_runtime_guest_env, apply_vm_overrides, cmd_agent_status, cmd_agent_update, cmd_commit,
+    cmd_destroy, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_network,
+    cmd_profiles, cmd_proxy, cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop,
+    cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, grok_launch_args, open_agent_session,
     preflight_start_target, prepend_binary, resolve_running,
 };
 
@@ -722,7 +722,7 @@ scripts after upgrading coop. Alternatively, generate them on shell startup:
 enum AgentAction {
     /// Update coding agent(s) to the latest version inside the VM.
     ///
-    /// With no agent flag, Claude Code, Codex, and Grok Build are updated.
+    /// With no --agent selector, Claude Code, Codex, and Grok Build are updated.
     /// The VM must be running.
     Update {
         /// Instance name (required if multiple instances exist)
@@ -731,21 +731,24 @@ enum AgentAction {
             add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// Update Claude Code (default: update every agent)
-        #[arg(long)]
-        claude: bool,
-        /// Update Codex (default: update every agent)
-        #[arg(long)]
-        codex: bool,
-        /// Update Grok Build (default: update every agent)
-        #[arg(long)]
-        grok: bool,
-        /// Only report installed vs. latest versions — change nothing
-        #[arg(long)]
-        check: bool,
-        /// Skip the confirmation prompt
-        #[arg(short = 'y', long)]
-        yes: bool,
+        /// Agent to update (repeatable; default: every agent)
+        #[arg(long, value_enum)]
+        agent: Vec<Agent>,
+    },
+    /// Report installed and latest coding-agent versions without changing them.
+    ///
+    /// With no --agent selector, Claude Code, Codex, and Grok Build are reported.
+    /// The VM must be running.
+    Status {
+        /// Instance name (required if multiple instances exist)
+        #[arg(
+            value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
+        /// Agent to report (repeatable; default: every agent)
+        #[arg(long, value_enum)]
+        agent: Vec<Agent>,
     },
 }
 
@@ -1318,25 +1321,11 @@ pub fn run() -> Result<()> {
             no_agents,
         ),
         Commands::Agent {
-            action:
-                AgentAction::Update {
-                    name,
-                    claude,
-                    codex,
-                    grok,
-                    check,
-                    yes,
-                },
-        } => cmd_agent_update(
-            &be,
-            &cfg,
-            name.as_ref(),
-            &AgentUpdateOpts {
-                selection: commands::AgentSelection::from_flags(claude, codex, grok),
-                check,
-                yes,
-            },
-        ),
+            action: AgentAction::Update { name, agent },
+        } => cmd_agent_update(&be, &cfg, name.as_ref(), &AgentSelection::new(agent)),
+        Commands::Agent {
+            action: AgentAction::Status { name, agent },
+        } => cmd_agent_status(&be, &cfg, name.as_ref(), &AgentSelection::new(agent)),
         Commands::Model { name, action } => {
             cmd_model(&be, &cfg, name.as_ref(), action.map(Into::into))
         }
@@ -1867,18 +1856,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_update_parses_name_and_flags() {
-        let cli = parse(&["agent", "update", "myvm", "--codex", "--check"]);
+    fn agent_update_parses_name_and_repeatable_selector() {
+        let cli = parse(&[
+            "agent", "update", "myvm", "--agent", "codex", "--agent", "claude",
+        ]);
         let super::Commands::Agent {
-            action:
-                super::AgentAction::Update {
-                    name,
-                    claude,
-                    codex,
-                    grok,
-                    check,
-                    yes,
-                },
+            action: super::AgentAction::Update { name, agent },
         } = cli.command
         else {
             panic!("expected Agent::Update variant");
@@ -1887,44 +1870,56 @@ mod tests {
             name.as_ref().map(super::config::InstanceName::as_str),
             Some("myvm")
         );
-        assert!(!claude);
-        assert!(codex);
-        assert!(!grok);
-        assert!(check);
-        assert!(!yes);
+        assert_eq!(agent, vec![super::Agent::Codex, super::Agent::Claude]);
     }
 
     #[test]
-    fn agent_update_defaults_are_all_false() {
+    fn agent_update_defaults_to_empty_selector() {
         let cli = parse(&["agent", "update"]);
         let super::Commands::Agent {
-            action:
-                super::AgentAction::Update {
-                    name,
-                    claude,
-                    codex,
-                    grok,
-                    check,
-                    yes,
-                },
+            action: super::AgentAction::Update { name, agent },
         } = cli.command
         else {
             panic!("expected Agent::Update variant");
         };
         assert!(name.is_none());
-        assert!(!claude && !codex && !grok && !check && !yes);
+        assert!(agent.is_empty());
     }
 
     #[test]
-    fn agent_update_yes_short_flag_parses() {
-        let cli = parse(&["agent", "update", "-y"]);
+    fn agent_status_parses_name_and_selector() {
+        let cli = parse(&["agent", "status", "myvm", "--agent", "grok"]);
         let super::Commands::Agent {
-            action: super::AgentAction::Update { yes, .. },
+            action: super::AgentAction::Status { name, agent },
         } = cli.command
         else {
-            panic!("expected Agent::Update variant");
+            panic!("expected Agent::Status variant");
         };
-        assert!(yes);
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
+        assert_eq!(agent, vec![super::Agent::Grok]);
+    }
+
+    #[test]
+    fn agent_update_rejects_removed_flags() {
+        for flag in ["--claude", "--codex", "--grok", "--check", "--yes", "-y"] {
+            let err = parse_err(&["agent", "update", flag]);
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_commands_reject_unknown_selector() {
+        for action in ["update", "status"] {
+            let err = parse_err(&["agent", action, "--agent", "unknown"]);
+            assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{action}");
+        }
     }
 
     #[test]

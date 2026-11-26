@@ -305,13 +305,14 @@ To update directly inside the VM, run `codex update` as the guest user; sudo
 is not required. To update from the host:
 
 ```bash
-coop agent update --codex          # update Codex to the latest release
-coop agent update --check          # report installed vs. latest, change nothing
+coop agent update --agent codex    # update Codex to the latest release
+coop agent status --agent codex    # report installed vs. latest, change nothing
 ```
 
-`coop agent update --codex` re-runs the native installer as the guest user and
-refreshes both compatibility links. It also migrates older direct-binary
-installations without rebuilding the VM or replacing the user's Codex config.
+`coop agent update --agent codex` re-runs the native installer as the guest
+user and refreshes both compatibility links. It also migrates older
+direct-binary installations without rebuilding the VM or replacing the user's
+Codex config.
 A profile-provided Codex pair is preserved during image setup when both
 `/usr/local/bin/codex` and `/usr/local/bin/codex-code-mode-host` are
 executable; an incomplete pair or an explicit update is replaced with the
