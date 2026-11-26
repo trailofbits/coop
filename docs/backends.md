@@ -32,6 +32,7 @@ Coop resolves `limactl` through the shared host-tool validator and uses a fixed 
 The builder VM is deleted after extraction, whether the build succeeds or fails.
 
 The macOS provision script has a 30-minute default timeout, including when `coop up --profile` builds an image automatically. `coop setup --builder-timeout` can override that limit for an explicit setup.
+Provisioning failures report the last setup stage reached and the process exit status. The script's raw output is not printed because custom profile hooks may emit secrets.
 
 ### How instances work
 

@@ -26,6 +26,8 @@ const LIMA_PREFIX: &str = "coop-";
 const BUILDER_NAME: &str = "coop-builder";
 const DEFAULT_BUILDER_PROVISION_TIMEOUT: Duration = Duration::from_secs(1800);
 const LIMA_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
+const PROVISION_STAGE_PREFIX: &str = "COOP_PROVISION_STAGE:";
+const PROVISION_DIAGNOSTIC_TAIL_BYTES: u64 = 8192;
 
 /// Hostname Lima injects into the guest that resolves to the host machine.
 /// Used to rewrite local-model endpoints so the guest can reach a server
@@ -1447,11 +1449,27 @@ fn run_builder_provision_script(
     script_file
         .rewind()
         .context("Failed to rewind Lima provision script")?;
+    let mut diagnostic_file = tempfile::tempfile_in(&cfg.data_dir)
+        .context("Failed to stage Lima provision diagnostics")?;
 
     let mut child = private_limactl()?
-        .args(["shell", BUILDER_NAME, "--", "sudo", "bash", "-s"])
+        .args([
+            "shell",
+            BUILDER_NAME,
+            "--",
+            "sudo",
+            "bash",
+            "-c",
+            // Bash reads the script from a separate descriptor. Commands in
+            // profile hooks may read stdin without consuming later script lines.
+            "bash <(cat) 3>&1 </dev/null >/dev/null 2>/dev/null",
+        ])
         .stdin(Stdio::from(script_file))
-        .stdout(Stdio::null())
+        .stdout(Stdio::from(
+            diagnostic_file
+                .try_clone()
+                .context("Failed to clone Lima provision diagnostic file")?,
+        ))
         .stderr(Stdio::null())
         .spawn()
         .context("Failed to launch provisioning in Lima builder")?;
@@ -1461,12 +1479,16 @@ fn run_builder_provision_script(
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => bail!("Lima builder provisioning failed: {status}"),
+            Ok(Some(status)) => bail!(
+                "Lima builder provisioning failed{}: {status}",
+                provision_stage_detail(&mut diagnostic_file)
+            ),
             Ok(None) if started.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
                 bail!(
-                    "Lima builder provisioning timed out after {}",
+                    "Lima builder provisioning timed out{} after {}",
+                    provision_stage_detail(&mut diagnostic_file),
                     crate::format_duration(timeout)
                 );
             }
@@ -1478,6 +1500,58 @@ fn run_builder_provision_script(
             }
         }
     }
+}
+
+fn provision_stage_detail(file: &mut File) -> String {
+    let Some(length) = file.metadata().ok().map(|metadata| metadata.len()) else {
+        return String::new();
+    };
+    if file
+        .seek(SeekFrom::Start(
+            length.saturating_sub(PROVISION_DIAGNOSTIC_TAIL_BYTES),
+        ))
+        .is_err()
+    {
+        return String::new();
+    }
+    let mut tail = Vec::new();
+    if file
+        .take(PROVISION_DIAGNOSTIC_TAIL_BYTES)
+        .read_to_end(&mut tail)
+        .is_err()
+    {
+        return String::new();
+    }
+    let output = String::from_utf8_lossy(&tail);
+    output
+        .lines()
+        .rev()
+        .filter_map(|line| line.strip_prefix(PROVISION_STAGE_PREFIX))
+        .find_map(provision_stage_label)
+        .map_or_else(
+            || " (no setup stage reported)".to_owned(),
+            |label| format!(" during {label}"),
+        )
+}
+
+fn provision_stage_label(stage: &str) -> Option<&'static str> {
+    match stage {
+        "initialization" => Some("initialization"),
+        "repositories" => Some("repository setup"),
+        "profile-pre" => Some("profile pre-install"),
+        "packages" => Some("package installation"),
+        "profile-post" => Some("profile post-install"),
+        "guest-config" => Some("guest configuration"),
+        "agent-install" => Some("agent installation"),
+        "cleanup" => Some("cleanup"),
+        _ => None,
+    }
+}
+
+fn mark_provision_stage(script: &mut String, stage: &str) {
+    script.push_str("printf 'COOP_PROVISION_STAGE:");
+    script.push_str(stage);
+    script.push_str("\\n' >&3 || true\n");
 }
 
 /// Get an SSH target for the builder VM.
@@ -1937,6 +2011,7 @@ fn compose_provision_script(
     s.push_str("export DEBIAN_FRONTEND=noninteractive\n");
     s.push_str("export DPKG_OPTIONS='--force-confnew'\n");
     s.push_str("APT_OPTS=(-o Dpkg::Options::=--force-confnew)\n\n");
+    mark_provision_stage(&mut s, "initialization");
 
     // Fail before downloads so the integration test exercises the host's
     // provisioning error path without building an otherwise complete image.
@@ -1945,6 +2020,7 @@ fn compose_provision_script(
     }
 
     // Add all third-party repos first (curl/gpg available on cloud image)
+    mark_provision_stage(&mut s, "repositories");
     s.push_str(SCRIPT_GH_REPO);
     s.push('\n');
     s.push_str(SCRIPT_DOCKER_REPO);
@@ -1965,6 +2041,7 @@ fn compose_provision_script(
         .collect();
 
     // Profile pre-scripts (may add repos, e.g. NodeSource)
+    mark_provision_stage(&mut s, "profile-pre");
     for pre in &pre_scripts {
         s.push('\n');
         s.push_str(pre);
@@ -1974,6 +2051,7 @@ fn compose_provision_script(
     }
 
     // Single apt-get update covering all repos
+    mark_provision_stage(&mut s, "packages");
     s.push_str("\necho '  [guest] Updating package lists...'\n");
     s.push_str("apt-get update -qq\n\n");
 
@@ -1995,6 +2073,7 @@ fn compose_provision_script(
     s.push_str(" < /dev/null\n");
 
     // Profile post-install scripts
+    mark_provision_stage(&mut s, "profile-post");
     for post in &post_scripts {
         s.push('\n');
         s.push_str(post);
@@ -2004,8 +2083,10 @@ fn compose_provision_script(
     }
 
     // Guest configuration configures the guest user — must come before claude-code install
+    mark_provision_stage(&mut s, "guest-config");
     s.push_str(&compose_lima_guest_config(ssh_pubkey, guest_user));
     // Claude Code (direct binary download, runs as root, chowns to claude)
+    mark_provision_stage(&mut s, "agent-install");
     s.push_str(SCRIPT_CLAUDE_CODE);
     s.push('\n');
 
@@ -2020,6 +2101,7 @@ fn compose_provision_script(
     s.push('\n');
 
     // Cleanup
+    mark_provision_stage(&mut s, "cleanup");
     s.push_str("\necho '  [guest] Cleaning up...'\n");
     s.push_str("apt-get clean\n");
     s.push_str("rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*\n");
@@ -3991,6 +4073,26 @@ mod tests {
             compose_provision_script("ssh-ed25519 AAAA test@test", &[], &GuestUser::default());
         assert!(provision.contains("apt-get install"));
         assert!(provision.contains("Installing Codex CLI"));
+    }
+
+    #[test]
+    fn provision_stage_detail_reports_only_known_stages() {
+        let mut diagnostics = tempfile::tempfile().unwrap();
+        writeln!(diagnostics, "installer output containing a secret").unwrap();
+        writeln!(diagnostics, "{PROVISION_STAGE_PREFIX}profile-post").unwrap();
+        writeln!(diagnostics, "{PROVISION_STAGE_PREFIX}secret-value").unwrap();
+
+        assert_eq!(
+            provision_stage_detail(&mut diagnostics),
+            " during profile post-install"
+        );
+
+        let mut unknown_only = tempfile::tempfile().unwrap();
+        writeln!(unknown_only, "{PROVISION_STAGE_PREFIX}secret-value").unwrap();
+        assert_eq!(
+            provision_stage_detail(&mut unknown_only),
+            " (no setup stage reported)"
+        );
     }
 
     #[test]
