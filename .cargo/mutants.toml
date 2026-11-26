@@ -474,7 +474,7 @@ exclude_re = [
   # commands/model.rs — stdout writers, the state-save + SSH-apply
   # orchestrators (set_local/set_remote, including set_local's `&&` endpoint
   # guard), the thin stdout wrapper over switch_report_lines (report_switch),
-  # the `&PlatformBackend` handler (apply_to_running), and the TTY prompt.
+  # the `&PlatformBackend` handler (save_and_apply), and the TTY prompt.
   # render_status is file-anchored because github_pat.rs has a *pure* (kept,
   # tested) render_status; a bare \brender_status\b would wrongly scope it out.
   "src/commands/model\\.rs:.*\\brender_status\\b",
@@ -482,7 +482,7 @@ exclude_re = [
   "\\bset_local\\b",
   "\\bset_remote\\b",
   "\\breport_switch\\b",
-  "\\bapply_to_running\\b",
+  "\\bsave_and_apply\\b",
   "\\bprompt_endpoint\\b",
 
   # (model_state.rs's load_or_default stays IN scope: it is tempdir-testable,
@@ -537,6 +537,14 @@ exclude_re = [
   # Startup composition keeps real cleanup/resolution; injected metadata and
   # process boundaries have focused regression and deliberate-mutation tests.
   "src/proxy\\.rs:.*\\bstart_provider_with\\b",
+  "src/proxy\\.rs:.*\\bstop_provider_unlocked\\b",
+  "src/proxy\\.rs:.*\\bstop_provider_checked\\b",
+  "src/proxy\\.rs:.*\\bstop_checked\\b",
+  "src/proxy\\.rs:.*\\block_transition\\b",
+  "src/proxy\\.rs:.*\\bstop_pid_file_checked\\b",
+  "src/proxy\\.rs:.*\\bwrite_process_record\\b",
+  "src/proxy\\.rs:.*\\bprocess_start_identity\\b",
+  "src/proxy\\.rs:.*\\bread_process_record\\b",
   "src/proxy\\.rs:.*\\bstop\\b",
   "src/proxy\\.rs:.*\\bstop_provider\\b",
   "src/proxy\\.rs:.*\\bkill_pid_file\\b",

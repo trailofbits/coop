@@ -311,11 +311,23 @@ do not select a VM by the current directory.
 `coop setup` installs the verified Firecracker/jailer pair under `/var/lib/coop`
 and downloads the kernel (Linux), or configures Lima (macOS), then builds a
 template rootfs image. The template ships with base packages (git, curl,
-build-essential, Docker, and others), the GitHub CLI, Claude Code, and Codex.
+build-essential, Docker, and others), the GitHub CLI, Claude Code, Codex, and Grok Build.
 
 ```
 coop setup
 ```
+
+To install only Codex in a named image, then create a VM from it:
+
+```
+coop setup --image codex-dev --agent codex
+coop up . --image codex-dev
+coop codex
+```
+
+Repeat `--agent` to include more tools. Omit it to keep an existing image's
+agent set; use `--rebuild` when changing that set. See
+[images and profiles](images-and-profiles.md#choose-coding-agents).
 
 Install language toolchains into the template with `--profile`:
 

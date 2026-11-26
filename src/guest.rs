@@ -167,22 +167,37 @@ impl From<GuestUser> for String {
 /// build shell commands or inspect the chroot get path semantics for
 /// free (and the `/usr/bin/docker`/`/usr/bin/gh` entries can't be
 /// mistaken for host paths).
-pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 10] {
-    [
+#[cfg(test)]
+pub fn required_guest_binaries(user: &GuestUser) -> Vec<GuestPath> {
+    required_guest_binaries_for_agents(user, &crate::agents::AgentSet::default())
+}
+
+pub fn required_guest_binaries_for_agents(
+    user: &GuestUser,
+    agents: &crate::agents::AgentSet,
+) -> Vec<GuestPath> {
+    use crate::agents::AgentId;
+    let mut paths = vec![
         GuestPath::new("/usr/bin/docker"),
         GuestPath::new("/usr/bin/gh"),
-        user.claude_bin(),
-        user.grok_bin(),
-        codex_bin(),
-        codex_code_mode_host_bin(),
-        codex_account_bin(),
-        // The Secret Service stack `codex-account` drives. Checking the
-        // wrapper alone proves nothing — the provision script always writes
-        // it — so verify the three tools its BASE_PACKAGES entries install.
-        GuestPath::new("/usr/bin/dbus-run-session"),
-        GuestPath::new("/usr/bin/gnome-keyring-daemon"),
-        GuestPath::new("/usr/bin/secret-tool"),
-    ]
+    ];
+    if agents.contains(AgentId::Claude) {
+        paths.push(user.claude_bin());
+    }
+    if agents.contains(AgentId::Codex) {
+        paths.extend([
+            codex_bin(),
+            codex_code_mode_host_bin(),
+            codex_account_bin(),
+            GuestPath::new("/usr/bin/dbus-run-session"),
+            GuestPath::new("/usr/bin/gnome-keyring-daemon"),
+            GuestPath::new("/usr/bin/secret-tool"),
+        ]);
+    }
+    if agents.contains(AgentId::Grok) {
+        paths.push(user.grok_bin());
+    }
+    paths
 }
 
 /// Verify that every required guest binary is present, bailing with a
@@ -194,19 +209,36 @@ pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 10] {
 /// `source_label` names what produced the image ("install script" vs
 /// "provision script"). `diagnostics` supplies trailing detail, such as a
 /// build-log tail, and is evaluated only when something is missing.
-#[expect(
-    clippy::print_stderr,
-    reason = "verification progress is interactive CLI — stderr is user communication"
-)]
+#[cfg(test)]
 pub fn verify_required_binaries(
     guest_user: &GuestUser,
     source_label: &str,
     probe: impl Fn(&GuestPath) -> Result<bool>,
     diagnostics: impl FnOnce() -> String,
 ) -> Result<()> {
+    verify_required_binaries_for_agents(
+        guest_user,
+        &crate::agents::AgentSet::default(),
+        source_label,
+        probe,
+        diagnostics,
+    )
+}
+
+#[expect(
+    clippy::print_stderr,
+    reason = "verification progress is interactive CLI — stderr is user communication"
+)]
+pub fn verify_required_binaries_for_agents(
+    guest_user: &GuestUser,
+    agents: &crate::agents::AgentSet,
+    source_label: &str,
+    probe: impl Fn(&GuestPath) -> Result<bool>,
+    diagnostics: impl FnOnce() -> String,
+) -> Result<()> {
     eprintln!("  Verifying installed binaries...");
     let mut missing = Vec::new();
-    for path in required_guest_binaries(guest_user) {
+    for path in required_guest_binaries_for_agents(guest_user, agents) {
         if !probe(&path)? {
             missing.push(path.to_string());
         }
@@ -267,6 +299,21 @@ pub const BASE_PACKAGES: &[&str] = &[
     "less",
     "libsecret-tools",
 ];
+
+pub fn base_packages_for_agents(agents: &crate::agents::AgentSet) -> Vec<&'static str> {
+    use crate::agents::AgentId;
+    BASE_PACKAGES
+        .iter()
+        .copied()
+        .filter(|package| {
+            agents.contains(AgentId::Codex)
+                || !matches!(
+                    *package,
+                    "dbus-user-session" | "gnome-keyring" | "libsecret-tools"
+                )
+        })
+        .collect()
+}
 
 pub const GH_PACKAGES: &[&str] = &["gh"];
 
@@ -931,6 +978,24 @@ mod tests {
                 "guest image should verify {tool} for Codex account auth",
             );
         }
+    }
+
+    #[test]
+    fn codex_only_build_plan_keeps_account_support_and_omits_other_binaries() {
+        let agents = crate::agents::AgentSet::new(vec![crate::agents::AgentId::Codex]).unwrap();
+        let binaries = required_guest_binaries_for_agents(&GuestUser::default(), &agents);
+        let paths: Vec<String> = binaries.iter().map(ToString::to_string).collect();
+        assert!(paths.contains(&"/usr/local/bin/codex-account".to_string()));
+        assert!(paths.contains(&"/usr/bin/secret-tool".to_string()));
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.ends_with("/claude") || p.ends_with("/grok"))
+        );
+        let packages = base_packages_for_agents(&agents);
+        assert!(packages.contains(&"gnome-keyring"));
+        let claude = crate::agents::AgentSet::new(vec![crate::agents::AgentId::Claude]).unwrap();
+        assert!(!base_packages_for_agents(&claude).contains(&"gnome-keyring"));
     }
 
     #[test]

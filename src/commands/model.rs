@@ -36,24 +36,35 @@ fn render_status(
     inst: &config::Instance,
 ) -> Result<()> {
     let state = ModelState::load_or_default(inst)?;
+    let agents = inst.agents()?;
     let guest_host = be.guest_host_address(&cfg.network);
     let out = &mut std::io::stdout();
     writeln!(out, "Instance: {}", inst.name)?;
     writeln!(out, "Mode:     {}", state.mode.as_str())?;
-    write_tool_line(
-        out,
-        "Claude",
-        state.mode,
-        state.resolved_claude(&cfg.claude),
-        &guest_host,
-    )?;
-    write_tool_line(
-        out,
-        "Codex",
-        state.mode,
-        state.resolved_codex(&cfg.codex),
-        &guest_host,
-    )?;
+    if crate::model_apply::is_pending(inst)? {
+        writeln!(
+            out,
+            "Apply:    pending (restart to apply saved configuration)"
+        )?;
+    }
+    if agents.contains(crate::agents::AgentId::Claude) {
+        write_tool_line(
+            out,
+            "Claude",
+            state.mode,
+            state.resolved_claude(&cfg.claude),
+            &guest_host,
+        )?;
+    }
+    if agents.contains(crate::agents::AgentId::Codex) {
+        write_tool_line(
+            out,
+            "Codex",
+            state.mode,
+            state.resolved_codex(&cfg.codex),
+            &guest_host,
+        )?;
+    }
     Ok(())
 }
 
@@ -82,6 +93,7 @@ fn set_local(
     cfg: &config::CoopConfig,
     inst: &config::Instance,
 ) -> Result<()> {
+    crate::restore_intent::ensure_contract_ready(inst)?;
     if inst.firecracker_network() == config::FirecrackerNetworkMode::Isolated {
         bail!(
             "Local model routing is unavailable in isolated network mode because the guest has \
@@ -89,6 +101,17 @@ fn set_local(
         );
     }
     let mut state = ModelState::load_or_default(inst)?;
+    let agents = inst.agents()?;
+    if !agents.contains(crate::agents::AgentId::Claude)
+        && !agents.contains(crate::agents::AgentId::Codex)
+    {
+        bail!(
+            "Image '{}' for VM '{}' includes only Grok Build, which has no local-model integration; use `coop model {} remote` or restore a Claude/Codex image",
+            inst.image,
+            inst.name,
+            inst.name
+        );
+    }
     state.mode = ModelMode::Local;
 
     // Offer to configure each tool that doesn't already resolve an
@@ -97,14 +120,24 @@ fn set_local(
     // declining leaves that tool on cloud. Non-interactive stdin declines
     // automatically.
     let (prompt_claude, prompt_codex) = tools_needing_prompt(&state, &cfg.claude, &cfg.codex);
-    if prompt_claude && let Some(ep) = prompt_endpoint("Claude")? {
+    if agents.contains(crate::agents::AgentId::Claude)
+        && prompt_claude
+        && let Some(ep) = prompt_endpoint("Claude")?
+    {
         state.claude_endpoint = Some(ep);
     }
-    if prompt_codex && let Some(ep) = prompt_endpoint("Codex")? {
+    if agents.contains(crate::agents::AgentId::Codex)
+        && prompt_codex
+        && let Some(ep) = prompt_endpoint("Codex")?
+    {
         state.codex_endpoint = Some(ep);
     }
 
-    if state.resolved_claude(&cfg.claude).is_none() && state.resolved_codex(&cfg.codex).is_none() {
+    if (!agents.contains(crate::agents::AgentId::Claude)
+        || state.resolved_claude(&cfg.claude).is_none())
+        && (!agents.contains(crate::agents::AgentId::Codex)
+            || state.resolved_codex(&cfg.codex).is_none())
+    {
         bail!(
             "No local model endpoint configured for '{}'.\n\
              Set [claude.local_model] or [codex.local_model] in config.toml, \
@@ -117,13 +150,35 @@ fn set_local(
     // Remember that coop now owns Codex's config.toml model keys, so a
     // later switch to remote rewrites a clean file even if the configured
     // endpoint is later removed (Claude's settings.json is unconditional).
-    if state.resolved_codex(&cfg.codex).is_some() {
+    if agents.contains(crate::agents::AgentId::Codex) && state.resolved_codex(&cfg.codex).is_some()
+    {
         state.codex_materialized = true;
     }
 
-    state.save(inst)?;
-    let applied = apply_to_running(be, cfg, inst)?;
+    let applied = save_and_apply(be, cfg, inst, &state)?;
     report_switch(inst, cfg, &state, applied)
+}
+
+/// A restored disk must be able to honor the VM's saved local model choice.
+pub(crate) fn validate_restore_target(
+    inst: &config::Instance,
+    cfg: &config::CoopConfig,
+    agents: &crate::agents::AgentSet,
+) -> Result<()> {
+    let state = ModelState::load_or_default(inst)?;
+    if state.mode == ModelMode::Local
+        && !(agents.contains(crate::agents::AgentId::Claude)
+            && state.resolved_claude(&cfg.claude).is_some()
+            || agents.contains(crate::agents::AgentId::Codex)
+                && state.resolved_codex(&cfg.codex).is_some())
+    {
+        bail!(
+            "VM '{}' is set to a local model, but image agents have no configured local endpoint; run `coop model {} remote` while stopped or configure a selected agent's endpoint before restoring",
+            inst.name,
+            inst.name
+        );
+    }
+    Ok(())
 }
 
 fn set_remote(
@@ -135,8 +190,7 @@ fn set_remote(
     // Keep any saved endpoints so a later `local` doesn't re-prompt; only
     // the mode flips, which drops the materialized guest config.
     state.mode = ModelMode::Remote;
-    state.save(inst)?;
-    let applied = apply_to_running(be, cfg, inst)?;
+    let applied = save_and_apply(be, cfg, inst, &state)?;
     report_switch(inst, cfg, &state, applied)
 }
 
@@ -170,16 +224,27 @@ fn report_switch(
     state: &ModelState,
     applied: bool,
 ) -> Result<()> {
+    let agents = inst.agents()?;
     let local = state.mode == ModelMode::Local;
-    let claude_local = local && state.resolved_claude(&cfg.claude).is_some();
-    let codex_local = local && state.resolved_codex(&cfg.codex).is_some();
+    let claude_local = local
+        && agents.contains(crate::agents::AgentId::Claude)
+        && state.resolved_claude(&cfg.claude).is_some();
+    let codex_local = local
+        && agents.contains(crate::agents::AgentId::Codex)
+        && state.resolved_codex(&cfg.codex).is_some();
     let out = &mut std::io::stdout();
-    for line in switch_report_lines(
+    for line in switch_report_lines_for_agents(
         inst.name.as_str(),
         state.mode,
-        claude_local,
-        codex_local,
-        applied,
+        SwitchReport {
+            claude: agents
+                .contains(crate::agents::AgentId::Claude)
+                .then_some(claude_local),
+            codex: agents
+                .contains(crate::agents::AgentId::Codex)
+                .then_some(codex_local),
+            applied,
+        },
     ) {
         writeln!(out, "{line}")?;
     }
@@ -190,6 +255,7 @@ fn report_switch(
 /// in local mode, a warning for any tool left on cloud. Pure so it can be
 /// unit-tested without a backend, TTY, or stdout. In local mode at least
 /// one tool is always local ([`set_local`] bails otherwise).
+#[cfg(test)]
 fn switch_report_lines(
     inst_name: &str,
     mode: ModelMode,
@@ -197,26 +263,69 @@ fn switch_report_lines(
     codex_local: bool,
     applied: bool,
 ) -> Vec<String> {
+    switch_report_lines_for_agents(
+        inst_name,
+        mode,
+        SwitchReport {
+            claude: Some(claude_local),
+            codex: Some(codex_local),
+            applied,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct SwitchReport {
+    claude: Option<bool>,
+    codex: Option<bool>,
+    applied: bool,
+}
+
+fn switch_report_lines_for_agents(
+    inst_name: &str,
+    mode: ModelMode,
+    report: SwitchReport,
+) -> Vec<String> {
+    let claude_local = report.claude == Some(true);
+    let codex_local = report.codex == Some(true);
+    let has_claude = report.claude.is_some();
+    let has_codex = report.codex.is_some();
+    let applied = report.applied;
     let mut lines = Vec::new();
     match mode {
-        ModelMode::Remote => lines.push(format!(
-            "'{inst_name}' now uses cloud models for Claude and Codex."
-        )),
+        ModelMode::Remote => {
+            let mut names = Vec::new();
+            if has_claude {
+                names.push("Claude");
+            }
+            if has_codex {
+                names.push("Codex");
+            }
+            if names.is_empty() {
+                names.push("Grok Build");
+            }
+            lines.push(format!(
+                "'{inst_name}' now uses cloud models for {}.",
+                names.join(" and ")
+            ));
+        }
         ModelMode::Local => {
             let tools = [
-                ("Claude", "claude.local_model", claude_local),
-                ("Codex", "codex.local_model", codex_local),
+                ("Claude", "claude.local_model", claude_local, has_claude),
+                ("Codex", "codex.local_model", codex_local, has_codex),
             ];
             let local: Vec<&str> = tools
                 .iter()
-                .filter_map(|&(label, _, is_local)| is_local.then_some(label))
+                .filter_map(|&(label, _, is_local, selected)| {
+                    (selected && is_local).then_some(label)
+                })
                 .collect();
             lines.push(format!(
                 "'{inst_name}' now uses a local model for {}.",
                 local.join(" and ")
             ));
-            for &(label, key, is_local) in &tools {
-                if !is_local {
+            for &(label, key, is_local, selected) in &tools {
+                if selected && !is_local {
                     lines.push(format!(
                         "  warning: {label} stays on cloud — no local endpoint configured; \
                          set [{key}] in config.toml or re-run `coop model {inst_name} local` \
@@ -227,9 +336,16 @@ fn switch_report_lines(
         }
     }
     lines.push(if applied {
+        let launcher = if has_claude {
+            "claude"
+        } else if has_codex {
+            "codex"
+        } else {
+            "grok"
+        };
         format!(
-            "Applied to the running VM — no restart needed; relaunch claude/codex \
-             (e.g. `coop claude {inst_name}`) to pick it up."
+            "Applied to the running VM — no restart needed; relaunch {launcher} \
+             (e.g. `coop {launcher} {inst_name}`) to pick it up."
         )
     } else {
         "Saved — applies on next start.".to_string()
@@ -240,24 +356,53 @@ fn switch_report_lines(
 /// Re-materialize guest config for the current model state. Returns `true`
 /// when the VM was running and the change was applied live, `false` when
 /// the VM is stopped and the persisted state will apply on next start.
-fn apply_to_running(
+fn save_and_apply(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
+    state: &ModelState,
 ) -> Result<bool> {
-    let Some(running) = be.as_running(cfg, inst.clone())? else {
+    let generation = {
+        let _operation = backend::lock_instance_operation(inst)?;
+        let running = be.as_running(cfg, inst.clone())?.is_some();
+        if running {
+            let generation = crate::model_apply::begin(inst)?;
+            state.save(inst)?;
+            Some(generation)
+        } else {
+            state.save(inst)?;
+            None
+        }
+    };
+    let Some(generation) = generation else {
         return Ok(false);
+    };
+    let Some(running) = be.as_running(cfg, inst.clone())? else {
+        bail!(
+            "VM '{}' stopped while applying its model configuration; restart it to apply the saved change",
+            inst.name
+        );
     };
     let (inst, target) = running.into_parts();
     let session = super::prepare_session_from_target(cfg, &inst, target)?;
     let guest_host = be.guest_host_address(&cfg.network);
-    backend::bootstrap_agents(
-        &session,
-        cfg,
-        &inst,
-        backend::BootMode::Restart,
-        &guest_host,
-    )?;
+    crate::model_apply::with_generation(&inst, generation, || {
+        backend::bootstrap_agents(
+            &session,
+            cfg,
+            &inst,
+            backend::BootMode::Restart,
+            &guest_host,
+        )
+    })?;
+    let _operation = backend::lock_instance_operation(&inst)?;
+    if be.as_running(cfg, inst.clone())?.is_none() {
+        bail!(
+            "VM '{}' stopped while applying its model configuration; restart it to apply the saved change",
+            inst.name
+        );
+    }
+    crate::model_apply::finish(&inst, generation)?;
     Ok(true)
 }
 
@@ -293,7 +438,33 @@ fn prompt_endpoint(tool: &str) -> Result<Option<LocalModel>> {
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
-    use crate::config::{ClaudeConfig, CodexConfig};
+    use crate::config::{
+        ClaudeConfig, CodexConfig, FirecrackerControlMode, ImageName, InstanceIndex, InstanceName,
+    };
+
+    #[test]
+    fn restore_rejects_local_mode_without_target_endpoint() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = config::Instance {
+            name: InstanceName::new("local-target").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: root.path().to_path_buf(),
+            image: ImageName::new("default").unwrap(),
+            firecracker_control: FirecrackerControlMode::Vsock,
+        };
+        ModelState {
+            mode: ModelMode::Local,
+            claude_endpoint: Some(endpoint("http://localhost:11434")),
+            ..Default::default()
+        }
+        .save(&inst)
+        .unwrap();
+        let cfg = config::CoopConfig::default();
+        let codex = crate::agents::AgentSet::new(vec![crate::agents::AgentId::Codex]).unwrap();
+        let claude = crate::agents::AgentSet::new(vec![crate::agents::AgentId::Claude]).unwrap();
+        assert!(validate_restore_target(&inst, &cfg, &codex).is_err());
+        validate_restore_target(&inst, &cfg, &claude).unwrap();
+    }
 
     fn endpoint(url: &str) -> LocalModel {
         LocalModel::new(url::Url::parse(url).unwrap(), "m".to_string(), None).unwrap()

@@ -17,9 +17,8 @@ use crate::cmd::Cmd;
 use crate::config::Instance;
 use crate::config::{CoopConfig, ImageName, InstanceName};
 use crate::guest::{
-    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
-    SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, SCRIPT_GROK,
-    resolve_profiles,
+    DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
+    SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, SCRIPT_GROK, resolve_profiles,
 };
 use crate::setup_tool::SetupTool;
 use crate::sha256_hash::Sha256Hash;
@@ -43,6 +42,7 @@ pub const TEMPLATE_VERSION: u32 = 2;
 pub struct SetupOptions {
     pub skip_confirm: bool,
     pub rebuild: bool,
+    pub agents: Option<crate::agents::AgentSet>,
     pub profiles: Vec<ProfileDef>,
     pub extra_packages: Vec<String>,
     pub post_install: Option<PathBuf>,
@@ -114,6 +114,8 @@ pub(crate) fn validate_explicit_setup_inputs<T>(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateConfig {
     pub version: u32,
+    #[serde(default)]
+    pub(crate) agents: crate::agents::AgentSet,
     pub created: String,
     pub install_script_hash: Sha256Hash,
     pub profiles: Vec<String>,
@@ -188,12 +190,71 @@ impl TemplateConfig {
     }
 }
 
+/// Resolve a setup selector while the image publication lock is held.
+/// A readable legacy record defaults to all agents; a damaged record for an
+/// existing disk cannot safely tell us which agents to preserve.
+pub(crate) fn resolve_image_agents(
+    cfg: &CoopConfig,
+    image: &ImageName,
+    disk_exists: bool,
+    requested: Option<&crate::agents::AgentSet>,
+    rebuild: bool,
+) -> Result<crate::agents::AgentSet> {
+    if !disk_exists {
+        return Ok(requested.cloned().unwrap_or_default());
+    }
+    match TemplateConfig::load_for(cfg, image) {
+        Ok(existing) => {
+            if let Some(requested) = requested {
+                if disk_exists && !rebuild && requested != &existing.agents {
+                    bail!(
+                        "Image '{image}' contains {}; changing its agent set requires \
+                         `coop setup --image {image} --agent {} --rebuild` or a new image name",
+                        existing.agents.names(),
+                        requested.names().replace(',', " --agent "),
+                    );
+                }
+                Ok(requested.clone())
+            } else {
+                Ok(existing.agents)
+            }
+        }
+        Err(error) if disk_exists && !rebuild => {
+            bail!(
+                "Image '{image}' exists but its metadata cannot be read ({error:#}); \
+                 use `coop setup --image {image} --rebuild` to replace it"
+            )
+        }
+        Err(_) => Ok(requested.cloned().unwrap_or_default()),
+    }
+}
+
+/// Early, read-only selection check. The image lock path repeats this check
+/// immediately before any build or publication side effect.
+pub(crate) fn preflight_setup_agent_selection(
+    cfg: &CoopConfig,
+    opts: &SetupOptions,
+) -> Result<crate::agents::AgentSet> {
+    #[cfg(target_os = "macos")]
+    let disk_exists = cfg.lima_base_path(&opts.image).exists();
+    #[cfg(not(target_os = "macos"))]
+    let disk_exists = cfg.template_path_for(&opts.image).exists();
+    resolve_image_agents(
+        cfg,
+        &opts.image,
+        disk_exists,
+        opts.agents.as_ref(),
+        opts.rebuild,
+    )
+}
+
 // ── Public entry points ───────────────────────────────────────
 
 /// Run the full setup: check prerequisites, install Firecracker,
 /// fetch kernel, and build template rootfs.
 #[cfg(target_os = "linux")]
 pub fn run(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
+    preflight_setup_agent_selection(cfg, opts)?;
     execute_setup_phases(
         || preflight_bootstrap(cfg),
         || {
@@ -1156,6 +1217,13 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
     if !opts.rebuild {
         validate_image_publication(cfg, image)?;
     }
+    let agents = resolve_image_agents(
+        cfg,
+        image,
+        template.exists(),
+        opts.agents.as_ref(),
+        opts.rebuild,
+    )?;
     // A legacy checkpoint must not be replaced implicitly, even when its
     // recipe hashes differ from today's setup inputs.
     if template.exists()
@@ -1172,9 +1240,11 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
         );
     }
     let (profiles, extra_packages) = resolve_template_config(cfg, opts)?;
+    report_skipped_claude_profile_plugins(image, &profiles, &agents);
 
     // Compose the install recipe and compute its hashes.
-    let recipe_script = compose_recipe(&profiles, &extra_packages, &opts.guest_user);
+    let recipe_script =
+        compose_recipe_for_agents(&profiles, &extra_packages, &opts.guest_user, &agents);
     let post_install_content = load_post_install(opts.post_install.as_ref())?;
     let recipe = BuildRecipe {
         profiles: &profiles,
@@ -1216,6 +1286,7 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
     // swap. Constructing it once also pins a single `created` timestamp.
     let template_config = TemplateConfig {
         version: TEMPLATE_VERSION,
+        agents: agents.clone(),
         created: utc_timestamp(),
         install_script_hash: recipe.script_hash,
         profiles: profile_names(recipe.profiles),
@@ -1342,7 +1413,7 @@ fn build_template(
         "    3. Create a {} GiB ext4 template image",
         cfg.vm.template_size_gib
     );
-    eprintln!("    4. Install Docker, Claude Code, Codex, Grok Build, and profile packages");
+    eprintln!("    4. Install Docker, selected coding agents, and profile packages");
     eprintln!("  Image: {image}");
     eprintln!("  Output: {}", cfg.template_path_for(image).display());
     eprintln!();
@@ -1369,6 +1440,7 @@ fn build_template(
         output_path,
         &full_script,
         &opts.guest_user,
+        &template_config.agents,
         opts.builder_timeout,
     )?;
     // A root post-install script can replace or disable the control listener.
@@ -1401,7 +1473,7 @@ fn build_template(
 /// If CLI flags provide profiles or packages, use those.
 /// Otherwise, reuse the previous template config (resolving the persisted
 /// profile names against the current builtin/custom set).
-fn resolve_template_config(
+pub(crate) fn resolve_template_config(
     cfg: &CoopConfig,
     opts: &SetupOptions,
 ) -> Result<(Vec<ProfileDef>, Vec<String>)> {
@@ -1415,6 +1487,23 @@ fn resolve_template_config(
     }
 
     Ok((Vec::new(), Vec::new()))
+}
+
+#[expect(
+    clippy::print_stderr,
+    reason = "setup reports skipped profile plugins to the user"
+)]
+pub(crate) fn report_skipped_claude_profile_plugins(
+    image: &ImageName,
+    profiles: &[ProfileDef],
+    agents: &crate::agents::AgentSet,
+) {
+    if agents.contains(crate::agents::AgentId::Claude) {
+        return;
+    }
+    for plugin in profiles.iter().flat_map(|profile| &profile.plugins) {
+        eprintln!("Skipping Claude plugin {plugin}: Claude is not in image '{image}'");
+    }
 }
 
 fn load_post_install(path: Option<&PathBuf>) -> Result<Option<String>> {
@@ -1434,10 +1523,25 @@ fn load_post_install(path: Option<&PathBuf>) -> Result<Option<String>> {
 ///
 /// This portion is hashed for staleness detection.
 /// Does NOT include version marker, post-install script, or cleanup.
+#[cfg(test)]
 fn compose_recipe(
     profiles: &[ProfileDef],
     extra_packages: &[String],
     guest_user: &GuestUser,
+) -> String {
+    compose_recipe_for_agents(
+        profiles,
+        extra_packages,
+        guest_user,
+        &crate::agents::AgentSet::default(),
+    )
+}
+
+fn compose_recipe_for_agents(
+    profiles: &[ProfileDef],
+    extra_packages: &[String],
+    guest_user: &GuestUser,
+    agents: &crate::agents::AgentSet,
 ) -> String {
     // Collect and deduplicate profile + extra apt packages
     let mut extra_apt: Vec<&str> = profiles
@@ -1470,6 +1574,7 @@ fn compose_recipe(
     s.push_str("\nexport GUEST_USER='");
     s.push_str(guest_user.as_str());
     s.push_str("'\n");
+    append_agent_exports(&mut s, agents);
 
     // Install base packages first (provides curl/gpg for repo setup)
     s.push_str("echo '  [guest] Installing core tools...'\n");
@@ -1477,7 +1582,7 @@ fn compose_recipe(
         "apt-get install -y -qq \"${APT_OPTS[@]}\" \
          --no-install-recommends \\\n    ",
     );
-    s.push_str(&BASE_PACKAGES.join(" "));
+    s.push_str(&crate::guest::base_packages_for_agents(agents).join(" "));
     s.push_str(" < /dev/null\n\n");
 
     // Profile pre-install (repo additions like NodeSource)
@@ -1539,14 +1644,35 @@ fn compose_recipe(
     // Guest config configures the guest user — must come before claude-code.
     s.push_str(SCRIPT_GUEST_CONFIG);
     // Direct binary download (runs as root in chroot, installs for guest user).
-    s.push_str(SCRIPT_CLAUDE_CODE);
+    if agents.contains(crate::agents::AgentId::Claude) {
+        s.push_str(SCRIPT_CLAUDE_CODE);
+    }
     // Codex's native installer keeps the full package under the guest user's home.
-    s.push_str(SCRIPT_CODEX);
-    s.push_str(SCRIPT_CODEX_ACCOUNT);
+    if agents.contains(crate::agents::AgentId::Codex) {
+        s.push_str(SCRIPT_CODEX);
+        s.push_str(SCRIPT_CODEX_ACCOUNT);
+    }
     // Grok Build installs under ~/.grok/bin for the guest user.
-    s.push_str(SCRIPT_GROK);
+    if agents.contains(crate::agents::AgentId::Grok) {
+        s.push_str(SCRIPT_GROK);
+    }
 
     s
+}
+
+fn append_agent_exports(script: &mut String, agents: &crate::agents::AgentSet) {
+    use crate::agents::AgentId;
+    for (name, agent) in [
+        ("CLAUDE", AgentId::Claude),
+        ("CODEX", AgentId::Codex),
+        ("GROK", AgentId::Grok),
+    ] {
+        script.push_str("export COOP_HAS_");
+        script.push_str(name);
+        script.push('=');
+        script.push(if agents.contains(agent) { '1' } else { '0' });
+        script.push('\n');
+    }
 }
 
 /// Compose the full chroot script from recipe + marker + post-install + cleanup.
@@ -2528,9 +2654,10 @@ fn install_guest_packages(
     image_path: &Path,
     script: &str,
     guest_user: &GuestUser,
+    agents: &crate::agents::AgentSet,
     builder_timeout: Option<Duration>,
 ) -> Result<()> {
-    eprintln!("  Installing guest packages (Docker, Claude Code, Codex, Grok Build)...");
+    eprintln!("  Installing guest packages (Docker and selected coding agents)...");
     eprintln!("  This requires sudo and may take several minutes.");
 
     let template_str = image_path.display().to_string();
@@ -2553,7 +2680,7 @@ fn install_guest_packages(
         .run_bounded(host_deadline)
         .context("Guest package installation failed")?;
 
-    verify_chroot_binaries(&mount_str, guest_user)?;
+    verify_chroot_binaries(&mount_str, guest_user, agents)?;
 
     guard.finish()
 }
@@ -2569,9 +2696,14 @@ fn chroot_host_deadline(builder_timeout: Option<Duration>) -> Duration {
 /// Runs `test -x` inside the chroot so absolute symlink targets resolve against
 /// the guest root. Checking from the host with either `exists` or `lstat` would
 /// respectively reject valid absolute guest symlinks or accept dangling ones.
-fn verify_chroot_binaries(mount_str: &str, guest_user: &GuestUser) -> Result<()> {
-    crate::guest::verify_required_binaries(
+fn verify_chroot_binaries(
+    mount_str: &str,
+    guest_user: &GuestUser,
+    agents: &crate::agents::AgentSet,
+) -> Result<()> {
+    crate::guest::verify_required_binaries_for_agents(
         guest_user,
+        agents,
         "install script",
         |path| {
             let path = path.to_string();
@@ -2945,6 +3077,7 @@ mod tests {
         SetupOptions {
             skip_confirm: true,
             rebuild: false,
+            agents: None,
             profiles: Vec::new(),
             extra_packages: extra_packages
                 .iter()
@@ -3159,6 +3292,63 @@ mod tests {
     }
 
     #[test]
+    fn codex_only_recipe_excludes_other_installers() {
+        let agents = crate::agents::AgentSet::new(vec![crate::agents::AgentId::Codex]).unwrap();
+        let script = compose_recipe_for_agents(&[], &[], &GuestUser::default(), &agents);
+        assert!(script.contains(SCRIPT_CODEX));
+        assert!(script.contains(SCRIPT_CODEX_ACCOUNT));
+        assert!(!script.contains(SCRIPT_CLAUDE_CODE));
+        assert!(!script.contains(SCRIPT_GROK));
+        assert!(script.contains("COOP_HAS_CLAUDE=0"));
+        assert!(script.contains("COOP_HAS_CODEX=1"));
+        assert!(script.contains("COOP_HAS_GROK=0"));
+    }
+
+    #[test]
+    fn setup_preserves_existing_agent_set_and_rejects_implicit_changes() {
+        use crate::agents::{AgentId, AgentSet};
+
+        let root = crate::test_support::private_tempdir().unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("codex-only").unwrap();
+        crate::fs_util::private_dir(&cfg.image_dir(&image)).unwrap();
+        std::fs::write(cfg.template_path_for(&image), b"disk").unwrap();
+        let mut metadata: TemplateConfig = serde_json::from_value(serde_json::json!({
+            "version": TEMPLATE_VERSION,
+            "created": "2026-01-01T00:00:00Z",
+            "install_script_hash": Sha256Hash::of("fixture"),
+            "profiles": [],
+            "extra_packages": [],
+            "post_install_hash": null,
+        }))
+        .unwrap();
+        metadata.agents = AgentSet::new(vec![AgentId::Codex]).unwrap();
+        metadata.save_for(&cfg, &image).unwrap();
+        assert_eq!(
+            resolve_image_agents(&cfg, &image, true, None, false).unwrap(),
+            metadata.agents
+        );
+
+        let claude = AgentSet::new(vec![AgentId::Claude]).unwrap();
+        let error = resolve_image_agents(&cfg, &image, true, Some(&claude), false).unwrap_err();
+        assert!(error.to_string().contains("--rebuild"));
+        assert_eq!(
+            resolve_image_agents(&cfg, &image, true, Some(&claude), true).unwrap(),
+            claude
+        );
+        assert_eq!(
+            resolve_image_agents(&cfg, &image, false, None, false).unwrap(),
+            AgentSet::default(),
+            "metadata without a disk is not an existing image"
+        );
+        std::fs::remove_file(cfg.template_config_path_for(&image)).unwrap();
+        assert!(resolve_image_agents(&cfg, &image, true, None, false).is_err());
+    }
+
+    #[test]
     fn compose_recipe_exports_guest_user() {
         let user = GuestUser::new("vscode").unwrap();
         let script = compose_recipe(&[], &[], &user);
@@ -3246,6 +3436,7 @@ mod tests {
         let hash = Sha256Hash::of("matching recipe");
         let metadata = TemplateConfig {
             version: TEMPLATE_VERSION,
+            agents: crate::agents::AgentSet::default(),
             created: "2026-01-01T00:00:00Z".to_string(),
             install_script_hash: hash,
             profiles: Vec::new(),

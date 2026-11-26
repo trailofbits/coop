@@ -14,7 +14,7 @@ set -euo pipefail
 #   --profile LIST   Comma-separated profiles to install (default: none)
 #   --name NAME      Instance name prefix (default: test-<pid>)
 #   --full           Run extended tests (workspace sync, multi-instance)
-#   --shard NAME     Run all (default), lifecycle, workspace, config, or features phases.
+#   --shard NAME     Run all (default), lifecycle, workspace, config, features, or selective phases.
 #                    Named shards require --full and separate disposable hosts.
 #
 # Environment variables (override flags):
@@ -65,7 +65,7 @@ done
 
 case "$SHARD" in
     all) ;;
-    lifecycle|workspace|config|features)
+    lifecycle|workspace|config|features|selective)
         [[ "$FULL" == 1 ]] || { echo "--shard requires --full" >&2; exit 1; }
         ;;
     *) echo "Unknown shard: $SHARD" >&2; exit 1 ;;
@@ -781,6 +781,113 @@ PYPAIR
 }
 
 # ── Primary instance lifecycle ────────────────────────────────
+
+test_selective_image() {
+    echo ""
+    echo "=== Phase: selective coding-agent image ==="
+    local image="selective-codex" vm="${INSTANCE}-selective"
+    mkdir -p "$tmpdir/selective-ws"
+
+    if coop setup -y --image "$image" --agent codex --rebuild; then
+        pass "Codex-only image setup"
+    else
+        fail "Codex-only image setup" "$HARNESS_ERR"
+        return
+    fi
+    if coop images --json && printf '%s' "$HARNESS_OUT" | python3 -c '
+import json, sys
+images = json.load(sys.stdin)
+assert next(i for i in images if i["name"] == "selective-codex")["agents"] == ["codex"]
+'; then
+        pass "image JSON records only Codex"
+    else
+        fail "image JSON records only Codex" "$HARNESS_ERR"
+    fi
+    if coop setup -y --image "$image" && coop images --json \
+        && printf '%s' "$HARNESS_OUT" | python3 -c '
+import json, sys
+images = json.load(sys.stdin)
+assert next(i for i in images if i["name"] == "selective-codex")["agents"] == ["codex"]
+'; then
+        pass "omitted setup selector preserves Codex-only image"
+    else
+        fail "omitted setup selector preserves Codex-only image" "$HARNESS_ERR"
+    fi
+    if coop_fails setup -y --image "$image" --agent claude \
+        && [[ "$HARNESS_ERR" == *"--rebuild"* ]]; then
+        pass "selection change requires explicit rebuild"
+    else
+        fail "selection change requires explicit rebuild" "$HARNESS_ERR"
+    fi
+
+    if coop up "$tmpdir/selective-ws" --name "$vm" --image "$image" --no-github --no-prompt; then
+        STARTED_INSTANCES+=("$vm")
+        pass "Codex-only VM boots with agent bootstrap"
+    else
+        fail "Codex-only VM boots with agent bootstrap" "$HARNESS_ERR"
+        return
+    fi
+    GUEST_INSTANCE="$vm"
+    if guest_exec test -x /usr/local/bin/codex \
+        && guest_exec test -x /usr/local/bin/codex-code-mode-host \
+        && guest_exec test -x /usr/local/bin/codex-account \
+        && guest_exec test -x /usr/bin/secret-tool; then
+        pass "Codex CLI, Code Mode host and account support are installed"
+    else
+        fail "Codex CLI, Code Mode host and account support are installed" "$(guest_stderr)"
+    fi
+    if guest_exec test ! -e /usr/local/bin/claude \
+        && guest_exec test ! -e /usr/local/bin/grok \
+        && guest_exec test ! -e /usr/local/bin/claude-yolo \
+        && guest_exec test ! -e /usr/local/bin/grok-yolo; then
+        pass "omitted agents have no managed binaries or shortcuts"
+    else
+        fail "omitted agents have no managed binaries or shortcuts" "$(guest_stderr)"
+    fi
+    if coop status "$vm" --json && printf '%s' "$HARNESS_OUT" | python3 -c '
+import json, sys
+assert json.load(sys.stdin)["agents"] == ["codex"]
+'; then
+        pass "VM status records only Codex"
+    else
+        fail "VM status records only Codex" "$HARNESS_ERR"
+    fi
+    if coop_fails claude "$vm" && [[ "$HARNESS_ERR" == *"does not include"* ]]; then
+        pass "Claude launch rejects unavailable agent"
+    else
+        fail "Claude launch rejects unavailable agent" "$HARNESS_ERR"
+    fi
+    if coop_fails agent update "$vm" --agent claude \
+        && [[ "$HARNESS_ERR" == *"does not include"* ]]; then
+        pass "agent update rejects unavailable agent before updates"
+    else
+        fail "agent update rejects unavailable agent before updates" "$HARNESS_ERR"
+    fi
+    if coop_fails proxy setup --vm "$vm" --anthropic \
+        && [[ "$HARNESS_ERR" == *"does not include"* ]]; then
+        pass "proxy setup rejects unavailable provider before credential prompt"
+    else
+        fail "proxy setup rejects unavailable provider before credential prompt" "$HARNESS_ERR"
+    fi
+    if coop proxy status --vm "$vm" && [[ "$HARNESS_OUT" == *"unavailable in this image"* ]]; then
+        pass "proxy status labels unavailable provider"
+    else
+        fail "proxy status labels unavailable provider" "$HARNESS_ERR"
+    fi
+    if coop stop "$vm" && coop start "$vm" --no-agents \
+        && guest_exec test -x /usr/local/bin/codex \
+        && guest_exec test ! -e /usr/local/bin/claude; then
+        pass "Codex-only VM survives stop and restart"
+    else
+        fail "Codex-only VM survives stop and restart" "$HARNESS_ERR"
+    fi
+    if coop destroy "$vm"; then
+        pass "Codex-only VM cleanup"
+    else
+        fail "Codex-only VM cleanup" "$HARNESS_ERR"
+    fi
+    unset GUEST_INSTANCE
+}
 
 test_up_creates_primary_instance() {
     echo ""
@@ -9762,6 +9869,12 @@ EOF
     run_timed_test test_removed_devcontainer_cli
     run_timed_test test_guest_user_validation
     run_timed_test test_pull_cli_validation
+
+    if [[ "$SHARD" == selective ]]; then
+        run_timed_test test_selective_image
+        summary
+        return
+    fi
 
     # Setup + primary instance
     run_timed_test test_setup

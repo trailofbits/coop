@@ -26,6 +26,7 @@ use std::io::Write as _;
 use anyhow::{Context, Result, bail};
 use semver::Version;
 
+pub(crate) use crate::agents::AgentId as Agent;
 use crate::backend::{self, SshSession};
 use crate::paths::GuestPath;
 use crate::remote_command::RemoteCommand;
@@ -38,36 +39,14 @@ const CODEX_REPO: &str = "openai/codex";
 
 // ── Domain types ──────────────────────────────────────────────
 
-/// A coding agent coop can update inside the guest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
-pub(crate) enum Agent {
-    Claude,
-    Codex,
-    Grok,
-}
-
-impl Agent {
-    const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Grok];
-
-    /// Human-facing label used in reports and errors.
-    fn display(self) -> &'static str {
-        match self {
-            Self::Claude => "Claude Code",
-            Self::Codex => "Codex",
-            Self::Grok => "Grok Build",
-        }
-    }
-
-    /// How this agent's binary is refreshed inside the guest. The
-    /// root-vs-user asymmetry lives here so a caller can't run Claude's
-    /// or Grok's self-update as root or Codex's reinstall without sudo.
-    fn strategy(self) -> UpdateStrategy {
-        match self {
-            Self::Claude | Self::Grok => UpdateStrategy::SelfUpdate,
-            Self::Codex => UpdateStrategy::ReinstallAsRoot {
-                script: guest::SCRIPT_CODEX,
-            },
-        }
+/// Keep update mechanics local to maintenance; image capabilities share only
+/// the agent identity, never a guest command string.
+fn strategy(agent: Agent) -> UpdateStrategy {
+    match agent {
+        Agent::Claude | Agent::Grok => UpdateStrategy::SelfUpdate,
+        Agent::Codex => UpdateStrategy::ReinstallAsRoot {
+            script: guest::SCRIPT_CODEX,
+        },
     }
 }
 
@@ -86,22 +65,43 @@ enum UpdateStrategy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AgentSelection {
     agents: Vec<Agent>,
+    explicit: bool,
 }
 
 impl AgentSelection {
     /// Build a canonical non-empty selection. Omitting `--agent` means all
     /// supported agents; repeated selectors are deduplicated.
     pub(crate) fn new(mut agents: Vec<Agent>) -> Self {
+        let explicit = !agents.is_empty();
         if agents.is_empty() {
             agents.extend(Agent::ALL);
         }
         agents.sort_unstable();
         agents.dedup();
-        Self { agents }
+        Self { agents, explicit }
     }
 
     fn agents(&self) -> &[Agent] {
         &self.agents
+    }
+
+    fn for_instance(&self, inst: &config::Instance) -> Result<Self> {
+        let installed = inst.agents()?;
+        if !self.explicit {
+            return Ok(Self::new(installed.iter().collect()));
+        }
+        for agent in &self.agents {
+            if !installed.contains(*agent) {
+                bail!(
+                    "Image '{}' for VM '{}' does not include {}; choose an installed agent or restore from an image built with `--agent {}`",
+                    inst.image,
+                    inst.name,
+                    agent.display(),
+                    agent.name()
+                );
+            }
+        }
+        Ok(self.clone())
     }
 }
 
@@ -185,8 +185,8 @@ pub(crate) fn cmd_agent_update(
     name: Option<&config::InstanceName>,
     selection: &AgentSelection,
 ) -> Result<()> {
-    let session = agent_session(be, cfg, name)?;
-    run_updates(&session, selection)
+    let (session, selection) = agent_session(be, cfg, name, selection)?;
+    run_updates(&session, &selection)
 }
 
 pub(crate) fn cmd_agent_status(
@@ -195,8 +195,8 @@ pub(crate) fn cmd_agent_status(
     name: Option<&config::InstanceName>,
     selection: &AgentSelection,
 ) -> Result<()> {
-    let session = agent_session(be, cfg, name)?;
-    run_check(&session, selection)
+    let (session, selection) = agent_session(be, cfg, name, selection)?;
+    run_check(&session, &selection)
 }
 
 /// Resolve the running instance once (a stopped/missing one errors with the
@@ -205,10 +205,12 @@ fn agent_session(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     name: Option<&config::InstanceName>,
-) -> Result<SshSession> {
+    selection: &AgentSelection,
+) -> Result<(SshSession, AgentSelection)> {
     let running = resolve_running(be, cfg, name)?;
+    let selection = selection.for_instance(running.instance())?;
     let (inst, target) = running.into_parts();
-    prepare_session_from_target(cfg, &inst, target)
+    Ok((prepare_session_from_target(cfg, &inst, target)?, selection))
 }
 
 // ── Update path ───────────────────────────────────────────────
@@ -246,7 +248,7 @@ fn run_updates(session: &SshSession, selection: &AgentSelection) -> Result<()> {
 /// Update a single agent and verify the result by re-reading its version.
 fn update_one(session: &SshSession, agent: Agent) -> Result<UpdateOutcome> {
     let before = capture_version(session, agent);
-    match agent.strategy() {
+    match strategy(agent) {
         UpdateStrategy::ReinstallAsRoot { script } => reinstall_as_root(session, script)
             .with_context(|| format!("failed to reinstall {}", agent.display()))?,
         UpdateStrategy::SelfUpdate => {
@@ -686,11 +688,11 @@ mod tests {
     #[test]
     fn strategy_matches_agent_asymmetry() {
         assert!(matches!(
-            Agent::Codex.strategy(),
+            strategy(Agent::Codex),
             UpdateStrategy::ReinstallAsRoot { .. }
         ));
         assert!(matches!(
-            Agent::Claude.strategy(),
+            strategy(Agent::Claude),
             UpdateStrategy::SelfUpdate
         ));
     }

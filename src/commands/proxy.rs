@@ -16,7 +16,7 @@
 use std::io::Write as _;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::ProxyAction;
 use crate::config::{
@@ -73,6 +73,25 @@ fn run_setup(
         }
         None => None,
     };
+
+    if let Some(inst) = &inst {
+        let agents = crate::restore_intent::RestoreIntent::load(inst)?
+            .map(|intent| intent.template.agents)
+            .map_or_else(|| inst.agents(), Ok)?;
+        let agent = match provider {
+            Provider::Anthropic => crate::agents::AgentId::Claude,
+            Provider::Openai => crate::agents::AgentId::Codex,
+        };
+        if !agents.contains(agent) {
+            bail!(
+                "Image '{}' for VM '{}' does not include {}; use a VM built with `--agent {}` or configure a global proxy default for other VMs",
+                inst.image,
+                inst.name,
+                agent.display(),
+                agent.name(),
+            );
+        }
+    }
 
     print_setup_guidance(provider, auth);
 
@@ -293,7 +312,7 @@ fn run_status(cfg: &CoopConfig, vm: Option<&str>) -> Result<()> {
             .with_context(|| format!("'{name}' is not a valid instance name"))?;
         let inst = cfg.resolve_instance(Some(&name))?;
         let state = ProxyState::load_or_default(&inst)?;
-        write_vm_status(out, inst.name.as_str(), &state, &cfg.proxy)?;
+        write_vm_status_for_agents(out, inst.name.as_str(), &state, &cfg.proxy, &inst.agents()?)?;
     } else {
         writeln!(out, "Credential proxy — defaults ([proxy] in config.toml):")?;
         for provider in Provider::ALL {
@@ -320,7 +339,13 @@ fn run_status(cfg: &CoopConfig, vm: Option<&str>) -> Result<()> {
         } else {
             writeln!(out, "\nPer-VM overrides:")?;
             for (inst, state) in overrides {
-                write_vm_status(out, inst.name.as_str(), &state, &cfg.proxy)?;
+                write_vm_status_for_agents(
+                    out,
+                    inst.name.as_str(),
+                    &state,
+                    &cfg.proxy,
+                    &inst.agents()?,
+                )?;
             }
         }
     }
@@ -332,16 +357,40 @@ fn run_status(cfg: &CoopConfig, vm: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn write_vm_status(
     out: &mut impl std::io::Write,
     vm: &str,
     state: &ProxyState,
     cfg: &ProxyConfig,
 ) -> Result<()> {
+    write_vm_status_for_agents(out, vm, state, cfg, &crate::agents::AgentSet::default())
+}
+
+fn write_vm_status_for_agents(
+    out: &mut impl std::io::Write,
+    vm: &str,
+    state: &ProxyState,
+    cfg: &ProxyConfig,
+    agents: &crate::agents::AgentSet,
+) -> Result<()> {
     writeln!(out, "  {vm}:")?;
     for provider in Provider::ALL {
         let res = resolve(provider, Some(state), cfg);
-        writeln!(out, "    {:<10} {}", provider.name(), describe(&res))?;
+        let agent = match provider {
+            Provider::Anthropic => crate::agents::AgentId::Claude,
+            Provider::Openai => crate::agents::AgentId::Codex,
+        };
+        if agents.contains(agent) {
+            writeln!(out, "    {:<10} {}", provider.name(), describe(&res))?;
+        } else {
+            writeln!(
+                out,
+                "    {:<10} unavailable in this image (inactive: {})",
+                provider.name(),
+                describe(&res)
+            )?;
+        }
     }
     Ok(())
 }

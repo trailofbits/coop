@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      shard:
+        description: Integration shard to run
+        type: choice
+        options: [all, selective]
+        default: all
 
 permissions:
   contents: read
@@ -25,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [lifecycle, workspace, config, features]
+        shard: ${{ fromJSON(inputs.shard == 'selective' && '["selective"]' || '["lifecycle","workspace","config","features","selective"]') }}
         os: [ubuntu-24.04, ubuntu-26.04]
     defaults:
       run:

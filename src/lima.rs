@@ -9,14 +9,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::agents::{AgentId, AgentSet};
 use anyhow::{Context, Result, bail};
 
 use crate::backend::{Hostname, LogMode, SshTarget, SshUser};
 use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName, MiB};
 use crate::fs_util::{PrivateDir, PrivateEntryType};
 use crate::guest::{
-    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
-    SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, SCRIPT_GROK,
+    DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
+    SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, SCRIPT_GROK,
 };
 use crate::remote_command::RemoteCommand;
 use crate::setup::{SetupOptions, TEMPLATE_VERSION, TemplateConfig, utc_timestamp};
@@ -34,6 +35,7 @@ pub const HOST_GATEWAY: &str = "host.lima.internal";
 
 /// Run first-time setup for Lima backend.
 pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
+    crate::setup::preflight_setup_agent_selection(cfg, opts)?;
     crate::fs_util::private_dir(&cfg.data_dir).context("Failed to create data directory")?;
 
     let image = &opts.image;
@@ -42,13 +44,21 @@ pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         crate::setup::validate_image_publication(cfg, image)?;
     }
 
+    let base_img = cfg.lima_base_path(image);
+    let agents = crate::setup::resolve_image_agents(
+        cfg,
+        image,
+        base_img.exists(),
+        opts.agents.as_ref(),
+        opts.rebuild,
+    )?;
+    let (profiles, _) = crate::setup::resolve_template_config(cfg, opts)?;
+    crate::setup::report_skipped_claude_profile_plugins(image, &profiles, &agents);
     check_requirements()?;
     ensure_ssh_key(cfg)?;
-
-    let base_img = cfg.lima_base_path(image);
     if base_img.exists()
         && !opts.rebuild
-        && !needs_rebuild(cfg, image, &opts.profiles, &opts.guest_user)
+        && !needs_rebuild_for_agents(cfg, image, &profiles, &opts.guest_user, &agents)
     {
         eprintln!(
             "\n=> Golden image '{image}': up to date ({})",
@@ -61,8 +71,9 @@ pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         build_golden_image(
             cfg,
             image,
-            &opts.profiles,
+            &profiles,
             &opts.guest_user,
+            &agents,
             opts.builder_timeout,
         )?;
     }
@@ -147,7 +158,7 @@ pub fn create_and_start(
         .spawn()
         .context("Failed to spawn limactl start")?;
 
-    let guest_user = crate::backend::persisted_guest_user(cfg, &inst.image);
+    let guest_user = crate::backend::persisted_instance_guest_user(cfg, inst)?;
     if let Err(e) = wait_for_lima_ssh(
         &inst.name,
         &mut child,
@@ -228,7 +239,7 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         .spawn()
         .context("Failed to spawn limactl start")?;
 
-    let guest_user = crate::backend::persisted_guest_user(cfg, &inst.image);
+    let guest_user = crate::backend::persisted_instance_guest_user(cfg, inst)?;
     if let Err(e) = wait_for_lima_ssh(
         &inst.name,
         &mut child,
@@ -1037,7 +1048,7 @@ fn ssh_target_from_info(
     let port = u16::try_from(port).context("SSH port out of range")?;
     let port = std::num::NonZeroU16::new(port).context("Lima SSH port is 0")?;
 
-    let guest_user = crate::backend::persisted_guest_user(cfg, &inst.image);
+    let guest_user = crate::backend::persisted_instance_guest_user(cfg, inst)?;
 
     Ok(SshTarget::tcp(
         Hostname::new("127.0.0.1")?,
@@ -1101,14 +1112,24 @@ fn ensure_ssh_key(cfg: &CoopConfig) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn provision_script_hash(
     cfg: &CoopConfig,
     profiles: &[ProfileDef],
     guest_user: &GuestUser,
 ) -> Sha256Hash {
+    provision_script_hash_for_agents(cfg, profiles, guest_user, &AgentSet::default())
+}
+
+fn provision_script_hash_for_agents(
+    cfg: &CoopConfig,
+    profiles: &[ProfileDef],
+    guest_user: &GuestUser,
+    agents: &AgentSet,
+) -> Sha256Hash {
     let pubkey_path = cfg.ssh_key_path().with_extension("pub");
     let pubkey = read_public_key(&pubkey_path).unwrap_or_default();
-    let script = compose_provision_script(pubkey.trim(), profiles, guest_user);
+    let script = compose_provision_script_for_agents(pubkey.trim(), profiles, guest_user, agents);
     Sha256Hash::of(&script)
 }
 
@@ -1127,19 +1148,30 @@ fn read_public_key(path: &Path) -> Result<String> {
 /// image), the provision-script hash has changed, the persisted guest
 /// user differs from the requested one, or the baked marketplace/plugin
 /// lists have changed.
+#[cfg(test)]
 fn needs_rebuild(
     cfg: &CoopConfig,
     image: &ImageName,
     profiles: &[ProfileDef],
     guest_user: &GuestUser,
 ) -> bool {
-    let current_hash = provision_script_hash(cfg, profiles, guest_user);
+    needs_rebuild_for_agents(cfg, image, profiles, guest_user, &AgentSet::default())
+}
+
+fn needs_rebuild_for_agents(
+    cfg: &CoopConfig,
+    image: &ImageName,
+    profiles: &[ProfileDef],
+    guest_user: &GuestUser,
+    agents: &AgentSet,
+) -> bool {
+    let current_hash = provision_script_hash_for_agents(cfg, profiles, guest_user, agents);
     let Ok(existing) = TemplateConfig::load_for(cfg, image) else {
         tracing::info!("Template config missing — treating golden image as stale");
         return true;
     };
 
-    if existing.install_script_hash != current_hash {
+    if existing.install_script_hash != current_hash || &existing.agents != agents {
         return true;
     }
 
@@ -1151,9 +1183,21 @@ fn needs_rebuild(
         return true;
     }
 
-    let (wanted_m, wanted_p) = crate::guest::collect_baked_lists(cfg, profiles);
-    let (wanted_cm, wanted_cp) = crate::guest::collect_codex_baked_lists(cfg);
-    let (wanted_gm, wanted_gp) = crate::guest::collect_grok_baked_lists(cfg);
+    let (wanted_m, wanted_p) = if agents.contains(AgentId::Claude) {
+        crate::guest::collect_baked_lists(cfg, profiles)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let (wanted_cm, wanted_cp) = if agents.contains(AgentId::Codex) {
+        crate::guest::collect_codex_baked_lists(cfg)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let (wanted_gm, wanted_gp) = if agents.contains(AgentId::Grok) {
+        crate::guest::collect_grok_baked_lists(cfg)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     existing.marketplaces != wanted_m
         || existing.plugins != wanted_p
         || existing.codex_marketplaces != wanted_cm
@@ -1167,6 +1211,7 @@ fn build_golden_image(
     image: &ImageName,
     profiles: &[ProfileDef],
     guest_user: &GuestUser,
+    agents: &AgentSet,
     builder_timeout: Option<Duration>,
 ) -> Result<()> {
     eprintln!(
@@ -1209,6 +1254,7 @@ fn build_golden_image(
         pubkey.trim(),
         profiles,
         guest_user,
+        agents,
     )?;
 
     report_builder_inputs(profiles);
@@ -1220,6 +1266,7 @@ fn build_golden_image(
         &staging,
         &builder_template,
         guest_user,
+        agents,
         builder_timeout,
     );
 
@@ -1263,8 +1310,9 @@ fn build_golden_image(
     // Write template config only after image swap succeeds
     let template_config = TemplateConfig {
         version: TEMPLATE_VERSION,
+        agents: agents.clone(),
         created: utc_timestamp(),
-        install_script_hash: provision_script_hash(cfg, profiles, guest_user),
+        install_script_hash: provision_script_hash_for_agents(cfg, profiles, guest_user, agents),
         profiles: profiles.iter().map(|p| p.name.clone()).collect(),
         extra_packages: Vec::new(),
         post_install_hash: None,
@@ -1317,8 +1365,9 @@ fn write_builder_template(
     pubkey: &str,
     profiles: &[ProfileDef],
     guest_user: &GuestUser,
+    agents: &AgentSet,
 ) -> Result<()> {
-    let script = compose_provision_script(pubkey, profiles, guest_user);
+    let script = compose_provision_script_for_agents(pubkey, profiles, guest_user, agents);
     let yaml = compose_template_yaml(cfg, &script)?;
     dir.write_atomic_private(
         path.file_name().context("Builder template has no name")?,
@@ -1336,6 +1385,7 @@ fn run_builder_vm(
     output_path: &std::path::Path,
     builder_template: &std::path::Path,
     guest_user: &GuestUser,
+    agents: &AgentSet,
     builder_timeout: Option<Duration>,
 ) -> Result<BakedLists> {
     eprintln!("  Starting builder VM and installing packages...");
@@ -1366,12 +1416,12 @@ fn run_builder_vm(
     // Verify critical binaries are installed before extracting the
     // image. Cloud-init can report "done" even if individual install
     // steps failed silently (e.g. network timeout during download).
-    verify_builder_binaries(guest_user)?;
+    verify_builder_binaries(guest_user, agents)?;
 
     // Install marketplaces and plugins into the builder VM so they're
     // baked into the golden image. Runs after binary verification
     // (confirms claude CLI is installed) and before cloud-init clean.
-    let baked = install_builder_plugins(cfg, profiles, guest_user)?;
+    let baked = install_builder_plugins(cfg, profiles, guest_user, agents)?;
 
     // Clean cloud-init state so it re-runs on new instances
     eprintln!("  Preparing image for reuse...");
@@ -1485,10 +1535,23 @@ fn install_builder_plugins(
     cfg: &CoopConfig,
     profiles: &[ProfileDef],
     guest_user: &GuestUser,
+    agents: &AgentSet,
 ) -> Result<BakedLists> {
-    let (marketplaces, plugins) = crate::guest::collect_baked_lists(cfg, profiles);
-    let (codex_marketplaces, codex_plugins) = crate::guest::collect_codex_baked_lists(cfg);
-    let (grok_marketplaces, grok_plugins) = crate::guest::collect_grok_baked_lists(cfg);
+    let (marketplaces, plugins) = if agents.contains(AgentId::Claude) {
+        crate::guest::collect_baked_lists(cfg, profiles)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let (codex_marketplaces, codex_plugins) = if agents.contains(AgentId::Codex) {
+        crate::guest::collect_codex_baked_lists(cfg)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let (grok_marketplaces, grok_plugins) = if agents.contains(AgentId::Grok) {
+        crate::guest::collect_grok_baked_lists(cfg)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let baked = BakedLists {
         marketplaces,
         plugins,
@@ -1730,9 +1793,10 @@ fn check_cloud_init_output(exit_code: Option<i32>, stdout: &str) -> Result<()> {
 /// Runs after cloud-init completes but before extracting the disk
 /// image. Catches silent install failures (e.g. network timeouts)
 /// that cloud-init doesn't flag as errors.
-fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
-    crate::guest::verify_required_binaries(
+fn verify_builder_binaries(guest_user: &GuestUser, agents: &AgentSet) -> Result<()> {
+    crate::guest::verify_required_binaries_for_agents(
         guest_user,
+        agents,
         "provision script",
         |path| {
             Ok(private_limactl()?
@@ -1921,10 +1985,20 @@ fn compose_template_yaml(cfg: &CoopConfig, provision_script: &str) -> Result<Str
     ))
 }
 
+#[cfg(test)]
 fn compose_provision_script(
     ssh_pubkey: &str,
     profiles: &[ProfileDef],
     guest_user: &GuestUser,
+) -> String {
+    compose_provision_script_for_agents(ssh_pubkey, profiles, guest_user, &AgentSet::default())
+}
+
+fn compose_provision_script_for_agents(
+    ssh_pubkey: &str,
+    profiles: &[ProfileDef],
+    guest_user: &GuestUser,
+    agents: &AgentSet,
 ) -> String {
     let mut s = String::with_capacity(8192);
 
@@ -1969,7 +2043,7 @@ fn compose_provision_script(
     s.push_str("apt-get update -qq\n\n");
 
     // Combine all packages into a single install
-    let all_packages: Vec<&str> = BASE_PACKAGES
+    let all_packages: Vec<&str> = crate::guest::base_packages_for_agents(agents)
         .iter()
         .chain(GH_PACKAGES)
         .chain(DOCKER_PACKAGES)
@@ -1995,20 +2069,26 @@ fn compose_provision_script(
     }
 
     // Guest configuration configures the guest user — must come before claude-code install
-    s.push_str(&compose_lima_guest_config(ssh_pubkey, guest_user));
+    s.push_str(&compose_lima_guest_config(ssh_pubkey, guest_user, agents));
     // Claude Code (direct binary download, runs as root, chowns to claude)
-    s.push_str(SCRIPT_CLAUDE_CODE);
-    s.push('\n');
+    if agents.contains(AgentId::Claude) {
+        s.push_str(SCRIPT_CLAUDE_CODE);
+        s.push('\n');
+    }
 
     // Codex CLI (native per-user package with a system compatibility link)
-    s.push_str(SCRIPT_CODEX);
-    s.push('\n');
-    s.push_str(SCRIPT_CODEX_ACCOUNT);
-    s.push('\n');
+    if agents.contains(AgentId::Codex) {
+        s.push_str(SCRIPT_CODEX);
+        s.push('\n');
+        s.push_str(SCRIPT_CODEX_ACCOUNT);
+        s.push('\n');
+    }
 
     // Grok Build (official installer, runs as the guest user)
-    s.push_str(SCRIPT_GROK);
-    s.push('\n');
+    if agents.contains(AgentId::Grok) {
+        s.push_str(SCRIPT_GROK);
+        s.push('\n');
+    }
 
     // Test hook: inject a provision failure to exercise error detection.
     // Only activates when COOP_TEST_INJECT_PROVISION_FAILURE is set.
@@ -2026,15 +2106,29 @@ fn compose_provision_script(
     s
 }
 
-fn compose_lima_guest_config(ssh_pubkey: &str, guest_user: &GuestUser) -> String {
+#[expect(
+    clippy::too_many_lines,
+    reason = "generated guest provisioning shell is kept contiguous for audit"
+)]
+fn compose_lima_guest_config(
+    ssh_pubkey: &str,
+    guest_user: &GuestUser,
+    agents: &AgentSet,
+) -> String {
     // GuestUser::new validated the name against POSIX-portable chars, so
     // it's safe to interpolate into the shell script body and a single-
     // quoted export at the top of the recipe.
     let user = guest_user.as_str();
     let home = guest_user.home();
+    let has_claude = u8::from(agents.contains(AgentId::Claude));
+    let has_codex = u8::from(agents.contains(AgentId::Codex));
+    let has_grok = u8::from(agents.contains(AgentId::Grok));
     format!(
         r#"
 export GUEST_USER='{user}'
+COOP_HAS_CLAUDE={has_claude}
+COOP_HAS_CODEX={has_codex}
+COOP_HAS_GROK={has_grok}
 
 echo "  [guest] Ensuring {user} user exists (uid 1000)..."
 if id "{user}" &>/dev/null; then
@@ -2066,7 +2160,7 @@ chown -R "{user}:{user}" "{home}/.ssh"
 chmod 700 "{home}/.ssh"
 chmod 600 "{home}/.ssh/authorized_keys"
 
-echo "  [guest] Adding {user} ~/.grok/bin and ~/.local/bin to /etc/environment PATH..."
+echo "  [guest] Adding selected agent paths to /etc/environment PATH..."
 # pam_env reads /etc/environment for every SSH session — login, non-login,
 # and non-interactive (`ssh host cmd`) alike — so this is the one layer that
 # reaches `coop claude` / `coop grok` (a remote command), their Bash-tool
@@ -2080,7 +2174,7 @@ echo "  [guest] Adding {user} ~/.grok/bin and ~/.local/bin to /etc/environment P
 # sudo keeps Ubuntu's default secure_path (we set no override), so it ignores
 # those dirs, and the guest is a single-user dev VM where that user already
 # has passwordless root — there is no privilege boundary to cross.
-if ! grep -q '^PATH="{home}/.grok/bin:' /etc/environment 2>/dev/null; then
+if [ "$COOP_HAS_GROK" = 1 ] && ! grep -q '^PATH="{home}/.grok/bin:' /etc/environment 2>/dev/null; then
     if grep -q '^PATH="{home}/.local/bin:' /etc/environment 2>/dev/null; then
         sed -i 's|^PATH="{home}/.local/bin:|PATH="{home}/.grok/bin:{home}/.local/bin:|' /etc/environment
     elif grep -q '^PATH="' /etc/environment 2>/dev/null; then
@@ -2089,12 +2183,17 @@ if ! grep -q '^PATH="{home}/.grok/bin:' /etc/environment 2>/dev/null; then
         echo 'PATH="{home}/.grok/bin:{home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games"' >> /etc/environment
     fi
 fi
+if [ "$COOP_HAS_GROK" = 0 ] && ! grep -q '^PATH="{home}/.local/bin:' /etc/environment 2>/dev/null; then
+    if grep -q '^PATH="' /etc/environment 2>/dev/null; then
+        sed -i 's|^PATH="|PATH="{home}/.local/bin:|' /etc/environment
+    else
+        echo 'PATH="{home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games"' >> /etc/environment
+    fi
+fi
 
+if [ "$COOP_HAS_CLAUDE" = 1 ]; then
 echo '  [guest] Symlinking claude into system PATH...'
 ln -sf "{home}/.local/bin/claude" /usr/local/bin/claude
-
-echo '  [guest] Symlinking grok into system PATH...'
-ln -sf "{home}/.grok/bin/grok" /usr/local/bin/grok
 
 echo '  [guest] Installing claude-yolo shortcut...'
 cat > /usr/local/bin/claude-yolo <<'YOLOEOF'
@@ -2102,6 +2201,11 @@ cat > /usr/local/bin/claude-yolo <<'YOLOEOF'
 exec claude --dangerously-skip-permissions "$@"
 YOLOEOF
 chmod 755 /usr/local/bin/claude-yolo
+fi
+
+if [ "$COOP_HAS_GROK" = 1 ]; then
+echo '  [guest] Symlinking grok into system PATH...'
+ln -sf "{home}/.grok/bin/grok" /usr/local/bin/grok
 
 echo '  [guest] Installing grok-yolo shortcut...'
 cat > /usr/local/bin/grok-yolo <<'YOLOEOF'
@@ -2109,13 +2213,16 @@ cat > /usr/local/bin/grok-yolo <<'YOLOEOF'
 exec grok --always-approve --trust --cwd /workspace "$@"
 YOLOEOF
 chmod 755 /usr/local/bin/grok-yolo
+fi
 
+if [ "$COOP_HAS_CODEX" = 1 ]; then
 echo '  [guest] Installing codex-yolo shortcut...'
 cat > /usr/local/bin/codex-yolo <<'YOLOEOF'
 #!/bin/bash
 exec codex-account --dangerously-bypass-approvals-and-sandbox "$@"
 YOLOEOF
 chmod 755 /usr/local/bin/codex-yolo
+fi
 
 echo '  [guest] Preparing workspace directory...'
 mkdir -p /workspace
@@ -3064,6 +3171,7 @@ mod tests {
         PrivateDir::create(&cfg.image_dir(&image)).unwrap();
         let metadata = TemplateConfig {
             version: TEMPLATE_VERSION,
+            agents: crate::agents::AgentSet::default(),
             created: "2026-01-01T00:00:00Z".to_string(),
             install_script_hash: provision_script_hash(&cfg, &[], &user),
             profiles: Vec::new(),
@@ -3096,6 +3204,7 @@ mod tests {
         let opts = SetupOptions {
             skip_confirm: true,
             rebuild: false,
+            agents: None,
             profiles: Vec::new(),
             extra_packages: Vec::new(),
             post_install: None,
@@ -3449,9 +3558,10 @@ mod tests {
             image: ImageName::new("default").unwrap(),
             firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
-        std::fs::create_dir(&inst.dir).unwrap();
+        crate::fs_util::private_dir(&inst.dir).unwrap();
         let metadata = inst.dir.join("instance.json");
-        std::fs::write(&metadata, "metadata sentinel").unwrap();
+        inst.save().unwrap();
+        let metadata_before = std::fs::read(&metadata).unwrap();
         let lima_dir = root.join("lima/coop-test");
         std::fs::create_dir_all(&lima_dir).unwrap();
         std::fs::set_permissions(root.join("lima"), std::fs::Permissions::from_mode(0o700))
@@ -3529,10 +3639,7 @@ mod tests {
             "nonzero" | "malformed" | "missing_status" | "Restarting"
         ) {
             assert!(destroyed.is_err(), "{mode} removed metadata");
-            assert_eq!(
-                std::fs::read_to_string(&metadata).unwrap(),
-                "metadata sentinel"
-            );
+            assert_eq!(std::fs::read(&metadata).unwrap(), metadata_before);
             assert!(disk.exists());
         } else {
             assert!(destroyed.is_ok(), "{mode}: {destroyed:?}");
@@ -3812,6 +3919,24 @@ mod tests {
         assert_eq!(parsed["mounts"].as_array().unwrap().len(), 0);
 
         assert_eq!(parsed["provision"][0]["script"].as_str(), Some(script));
+    }
+
+    #[test]
+    fn codex_only_provision_script_excludes_other_installers() {
+        let agents = AgentSet::new(vec![AgentId::Codex]).unwrap();
+        let script = compose_provision_script_for_agents(
+            "ssh-ed25519 AAAA test@test",
+            &[],
+            &GuestUser::default(),
+            &agents,
+        );
+        assert!(script.contains(SCRIPT_CODEX));
+        assert!(script.contains(SCRIPT_CODEX_ACCOUNT));
+        assert!(!script.contains(SCRIPT_CLAUDE_CODE));
+        assert!(!script.contains(SCRIPT_GROK));
+        assert!(script.contains("COOP_HAS_CLAUDE=0"));
+        assert!(script.contains("COOP_HAS_CODEX=1"));
+        assert!(script.contains("COOP_HAS_GROK=0"));
     }
 
     #[test]
@@ -4197,6 +4322,7 @@ mod tests {
         };
         let metadata = TemplateConfig {
             version: TEMPLATE_VERSION,
+            agents: crate::agents::AgentSet::default(),
             created: utc_timestamp(),
             install_script_hash: Sha256Hash::of("fixture"),
             profiles: Vec::new(),

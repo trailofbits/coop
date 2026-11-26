@@ -115,7 +115,7 @@ echo "  [guest] Adding ${GUEST_USER} ~/.grok/bin and ~/.local/bin to /etc/enviro
 # sudo keeps Ubuntu's default secure_path (we set no override), so it ignores
 # those dirs, and the guest is a single-user dev VM where that user already
 # has passwordless root — there is no privilege boundary to cross.
-if ! grep -q "^PATH=\"${GUEST_HOME}/.grok/bin:" /etc/environment 2>/dev/null; then
+if [[ "${COOP_HAS_GROK:-1}" == 1 ]] && ! grep -q "^PATH=\"${GUEST_HOME}/.grok/bin:" /etc/environment 2>/dev/null; then
     if grep -q "^PATH=\"${GUEST_HOME}/.local/bin:" /etc/environment 2>/dev/null; then
         sed -i "s|^PATH=\"${GUEST_HOME}/.local/bin:|PATH=\"${GUEST_HOME}/.grok/bin:${GUEST_HOME}/.local/bin:|" /etc/environment
     elif grep -q '^PATH="' /etc/environment 2>/dev/null; then
@@ -124,12 +124,17 @@ if ! grep -q "^PATH=\"${GUEST_HOME}/.grok/bin:" /etc/environment 2>/dev/null; th
         echo "PATH=\"${GUEST_HOME}/.grok/bin:${GUEST_HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games\"" >> /etc/environment
     fi
 fi
+if [[ "${COOP_HAS_GROK:-1}" == 0 ]] && ! grep -q "^PATH=\"${GUEST_HOME}/.local/bin:" /etc/environment 2>/dev/null; then
+    if grep -q '^PATH="' /etc/environment 2>/dev/null; then
+        sed -i "s|^PATH=\"|PATH=\"${GUEST_HOME}/.local/bin:|" /etc/environment
+    else
+        echo "PATH=\"${GUEST_HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games\"" >> /etc/environment
+    fi
+fi
 
+if [[ "${COOP_HAS_CLAUDE:-1}" == 1 ]]; then
 echo '  [guest] Symlinking claude into system PATH...'
 ln -sf "${GUEST_HOME}/.local/bin/claude" /usr/local/bin/claude
-
-echo '  [guest] Symlinking grok into system PATH...'
-ln -sf "${GUEST_HOME}/.grok/bin/grok" /usr/local/bin/grok
 
 echo '  [guest] Installing claude-yolo shortcut...'
 cat > /usr/local/bin/claude-yolo <<'YOLOEOF'
@@ -137,6 +142,11 @@ cat > /usr/local/bin/claude-yolo <<'YOLOEOF'
 exec claude --dangerously-skip-permissions "$@"
 YOLOEOF
 chmod 755 /usr/local/bin/claude-yolo
+fi
+
+if [[ "${COOP_HAS_GROK:-1}" == 1 ]]; then
+echo '  [guest] Symlinking grok into system PATH...'
+ln -sf "${GUEST_HOME}/.grok/bin/grok" /usr/local/bin/grok
 
 echo '  [guest] Installing grok-yolo shortcut...'
 cat > /usr/local/bin/grok-yolo <<'YOLOEOF'
@@ -144,13 +154,16 @@ cat > /usr/local/bin/grok-yolo <<'YOLOEOF'
 exec grok --always-approve --trust --cwd /workspace "$@"
 YOLOEOF
 chmod 755 /usr/local/bin/grok-yolo
+fi
 
+if [[ "${COOP_HAS_CODEX:-1}" == 1 ]]; then
 echo '  [guest] Installing codex-yolo shortcut...'
 cat > /usr/local/bin/codex-yolo <<'YOLOEOF'
 #!/bin/bash
 exec codex-account --dangerously-bypass-approvals-and-sandbox "$@"
 YOLOEOF
 chmod 755 /usr/local/bin/codex-yolo
+fi
 
 echo '  [guest] Preparing workspace directory...'
 mkdir -p /workspace

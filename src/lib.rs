@@ -5,6 +5,7 @@
 //! way lets fuzz targets and integration tests depend on `coop` directly
 //! (e.g. `coop::config::CoopConfig`) instead of `#[path]`-including modules.
 
+mod agents;
 mod backend;
 mod cmd;
 mod codex_token;
@@ -28,6 +29,7 @@ mod guest;
 mod guest_env_state;
 pub mod guest_files;
 mod host_tool;
+mod model_apply;
 mod model_state;
 mod naming;
 mod openssh;
@@ -41,6 +43,7 @@ mod process_output;
 mod proxy;
 mod proxy_state;
 mod remote_command;
+mod restore_intent;
 mod secret_store;
 mod sha256_hash;
 // Lima is an interactive CLI workflow — stderr output is intentional user communication.
@@ -241,6 +244,9 @@ enum Commands {
         /// Force rebuild of template rootfs
         #[arg(long)]
         rebuild: bool,
+        /// Coding agents to install (repeatable; default: all on new images).
+        #[arg(long = "agent", value_enum)]
+        agent: Vec<agents::AgentId>,
         /// Install profiles (comma-separated: python,node,c,fuzz,rust,go)
         #[arg(
             long,
@@ -1134,7 +1140,7 @@ pub fn run() -> Result<()> {
             post_start,
             guest_env: _,
         } => {
-            cfg.validate_and_warn()?;
+            cfg.validate_host_only_and_warn()?;
             let transport = match (copy, mount) {
                 (_, true) => ProjectTransport::Mount,
                 (_, false) => ProjectTransport::Copy,
@@ -1181,6 +1187,7 @@ pub fn run() -> Result<()> {
             vcpus,
             mem,
             rebuild,
+            agent,
             profile,
             extra_packages,
             post_install,
@@ -1189,25 +1196,29 @@ pub fn run() -> Result<()> {
             guest_user,
             builder_timeout,
         } => {
-            cfg.validate_and_warn()?;
             apply_vm_overrides(&mut cfg, vcpus, mem, template_size)?;
             // Resolve profile names once at the CLI boundary.
             let resolved_profiles = guest::resolve_profiles(&profile, &cfg.profiles)?;
             let resolved_guest_user = guest_user.unwrap_or_default();
             let _guard = signal::install_handlers();
-            be.setup(
-                &cfg,
-                &setup::SetupOptions {
-                    skip_confirm: yes,
-                    rebuild,
-                    profiles: resolved_profiles,
-                    extra_packages,
-                    post_install: post_install.map(PathBuf::from),
-                    image,
-                    guest_user: resolved_guest_user,
-                    builder_timeout,
+            let setup_options = setup::SetupOptions {
+                skip_confirm: yes,
+                rebuild,
+                agents: if agent.is_empty() {
+                    None
+                } else {
+                    Some(agents::AgentSet::new(agent)?)
                 },
-            )
+                profiles: resolved_profiles,
+                extra_packages,
+                post_install: post_install.map(PathBuf::from),
+                image,
+                guest_user: resolved_guest_user,
+                builder_timeout,
+            };
+            let effective_agents = setup::preflight_setup_agent_selection(&cfg, &setup_options)?;
+            cfg.validate_and_warn_for_agents(&effective_agents)?;
+            be.setup(&cfg, &setup_options)
         }
         Commands::Start {
             name,
@@ -1219,7 +1230,7 @@ pub fn run() -> Result<()> {
             guest_env: _,
             forward_port: forward_ports,
         } => {
-            cfg.validate_and_warn()?;
+            cfg.validate_host_only_and_warn()?;
             if raw_args_use_deprecated_no_claude(&raw_args) {
                 tracing::warn!(
                     "--no-claude is deprecated and will be removed in a future release; use --no-agents"
