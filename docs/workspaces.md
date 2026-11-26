@@ -18,9 +18,9 @@ another VM. The default transport is copy/sync into `/workspace`; `--mount`
 uses mount transport for the project directory. On macOS/Lima this is live
 filesystem sharing; on Linux/Firecracker it is a one-time sync. Use
 `--extra-mount HOST:GUEST` for additional mounted data directories when
-creating the project instance. If the instance already exists, destroy it
-first to change creation-time choices such as transport, image, disk size, or
-extra mounts.
+creating the project instance. Changing transport or extra mounts requires a new
+instance. To grow an existing disk, stop the instance and run
+`coop resize NAME --size +20` to add 20 GiB.
 
 `coop up` in copy mode copies the project into `/workspace` inside the guest
 using rsync over SSH, without deleting existing guest files. After a successful
@@ -75,7 +75,9 @@ coop shell
 # then use git clone, scp, or any other tool inside the guest
 ```
 
-No workspace state is recorded. `push` and `pull` will not work without a `workspace.json`.
+Manual transfers do not update the saved workspace mapping. If the VM has no
+`workspace.json`, pass `--dir` to `push` or `pull` to select the host
+directory. Both commands use `/workspace` on the guest in this case.
 
 ## State file: `workspace.json`
 

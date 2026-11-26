@@ -475,7 +475,7 @@ coop setup --guest-user vscode
 
 The name is validated against the POSIX-portable pattern `[a-z_][a-z0-9_-]{0,31}`; `root` is rejected because coop assumes an unprivileged uid-1000 account.
 
-The guest user is **baked into the image at setup time and immutable for the image's lifetime** — it is persisted in the image's `template_config.json`, and `up` / `start` / `shell` / `exec` read it back from there. To change it, destroy and recreate the image: `coop destroy && coop setup --guest-user <name>`.
+Coop records the username in the image’s `template-config.json` and reads it when connecting to instances created from that image. To use another account while keeping existing VMs accessible, build a separately named image with `coop setup --image vscode-dev --guest-user vscode` and select it when creating a new instance.
 
 ## Guest PATH
 

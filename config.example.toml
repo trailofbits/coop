@@ -19,7 +19,7 @@
 # Run `coop github setup-pat --repo owner/name` to populate it via wizard.
 # Select an existing entry for a VM with:
 #   coop github assign-pat --vm projects --repo owner/name
-# The VM stores only the entry key; it overrides workspace-based selection.
+# The VM stores the entry key. A workspace Git origin can suggest a binding.
 # Form B `mode = "pat"` is equivalent to form A `github = "pat"`.
 #
 # [github]
@@ -40,7 +40,7 @@
 # destination = "~/.gitconfig"
 
 # [setup]
-# prompt_for_pat = true           # auto-prompt to set up a PAT at `coop start`
+# prompt_for_pat = true           # offer to bind a PAT on interactive VM startup
 
 # [vm]
 # firecracker_control = "legacy_tcp" # Linux only: "legacy_tcp" or opt-in "vsock" for new instances

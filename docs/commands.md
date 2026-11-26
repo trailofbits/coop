@@ -17,17 +17,17 @@ saved recipe.
 
 | Flag | Description |
 |------|-------------|
-| `--config <path>` | Path to config file (default: `~/.coop/config.toml`) |
+| `--config <path>` | Place before the subcommand. Path to config file (default: `~/.coop/config.toml`) |
 | `-v`, `--verbose` | Increase log verbosity. Once for debug, twice for trace. |
 | `--version` | Print version and exit. |
 
 ## Instance Name Resolution
 
-Most commands accept an optional instance name. coop resolves the target instance with three rules:
-
-- **Zero instances exist.** The command fails and tells you to run `coop up`.
-- **One instance exists.** The name is optional. coop selects it automatically.
-- **Multiple instances exist.** The name is required. coop lists available instances on error.
+Commands that operate on a running VM, including `shell`, `exec`, and the
+agent launchers, select it automatically when exactly one VM is running.
+`start` selects the only stopped VM. Commands such as `stop`, `destroy`,
+and `resize` select from all registered instances. Pass a name when the
+selection is ambiguous. Bare `list` and `status` show the whole inventory.
 
 ## Commands
 
@@ -108,8 +108,9 @@ derives an image name from the sorted profile list, runs the same stale-image
 check as `coop setup`, and builds or rebuilds that image if needed. Explicit
 named images are unchanged: use `coop setup --image <name> --profile ...`
 followed by `coop up --image <name>` when you want to choose the image name
-yourself. If a matching project instance already exists, destroy it first to
-recreate it with different creation options. Runtime startup options such as
+yourself. To grow the disk or change memory or vCPUs on a stopped instance,
+use [`coop resize`](#resize). A different project transport or set of extra
+mounts requires a new instance. Runtime startup options such as
 `--forward-port`, `--post-start`, and `--env` can be used when `up` creates or
 restarts an instance; if the matching instance is already running, stop it
 first so those options can take effect.

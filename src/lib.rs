@@ -224,7 +224,7 @@ enum Commands {
         #[arg(long = "env", value_name = "KEY=VALUE")]
         guest_env: Vec<String>,
     },
-    /// Check prerequisites, install Firecracker, fetch kernel and build template rootfs
+    /// Check prerequisites and prepare a VM image for this platform
     Setup {
         /// Skip confirmation prompts (accept all)
         #[arg(short = 'y', long)]
@@ -645,7 +645,7 @@ enum Commands {
         #[command(subcommand)]
         action: GithubAction,
     },
-    /// Manage the credential-injecting proxy (issue #411)
+    /// Manage the credential-injecting proxy
     Proxy {
         #[command(subcommand)]
         action: ProxyAction,

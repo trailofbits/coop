@@ -78,7 +78,9 @@ coop setup --profile python,node,rust
 | `rust` | Rust toolchain via post-install script (not apt). Installs plugin: `rust-analyzer-lsp@claude-plugins-official` |
 | `go` | `golang` |
 
-Plugins listed above are baked into the golden image during `coop setup` and do not need to be listed separately in config.
+On Lima, setup installs the profile plugins into the image. On Firecracker,
+agent bootstrap installs them on the instance’s first boot. Selecting the
+profile supplies the plugin list on either backend.
 
 ## Custom profiles
 
@@ -171,8 +173,8 @@ By default, coop builds an image called `default`. Build multiple images with di
 coop setup --profile python --image py-dev
 coop setup --profile python,node,rust --image polyglot
 
-coop up . --image py-dev
-coop up . --image polyglot
+coop up ./my-project --image py-dev
+coop up ./my-project --new-instance --name polyglot-vm --image polyglot
 ```
 
 Each named image lives in its own directory under `~/.coop/images/<name>/` with independent versioning and staleness tracking.
@@ -224,7 +226,7 @@ The `coop start` in that recipe does not re-sync `/workspace` or reinstall plugi
 
 coop records what went into each template in a `template-config.json` file alongside the image. This config contains:
 
-- **Version number**: a monotonic counter that increments when base install logic changes. A newer coop version triggers a rebuild.
+- **Version number**: a monotonic counter that increments when base install logic changes. A change to this template version triggers a rebuild for ordinary base images.
 - **Install script hash**: SHA-256 of the composed install recipe (base + profile + Linux/Firecracker extra packages). Changing profiles or extra packages changes this hash.
 - **Post-install script hash**: SHA-256 of the Linux/Firecracker post-install script content, if one was provided.
 - **Profile list and extra packages**: the exact inputs used to build the template; explicit extra packages are Linux/Firecracker only.
