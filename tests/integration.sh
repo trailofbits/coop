@@ -6594,6 +6594,8 @@ test_custom_profiles() {
 [profiles.test-custom]
 apt_packages = ["cowsay"]
 post_install = '''
+# A profile may read stdin; that must not consume later provision commands.
+read -r ignored || true
 echo 'custom-profile-marker' > /etc/custom-profile-installed
 printf '#!/bin/sh\necho codex-cli 9.9.9-profile\n' > /usr/local/bin/codex
 chmod 0755 /usr/local/bin/codex
@@ -9441,8 +9443,8 @@ test_provision_failure() {
     # Error message should mention the failure clearly (check stderr
     # separately — stdout can be enormous with apt output, and piping
     # the combined string through echo+grep can lose content)
-    if [[ "$(uname -s)" == Darwin ]] && [[ "$err" == *"Lima builder provisioning failed"* ]]; then
-        pass "error message identifies the failed Lima provision script"
+    if [[ "$(uname -s)" == Darwin ]] && [[ "$err" == *"Lima builder provisioning failed during initialization"* ]]; then
+        pass "error message identifies the failed Lima provision stage"
     elif [[ "$(uname -s)" != Darwin ]] && grep -qi "provision.*fail\|failed\|error" "$tmpdir/pf-stderr"; then
         pass "error message mentions failure"
     else
