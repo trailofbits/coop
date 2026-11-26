@@ -23,7 +23,13 @@ use crate::setup::{SetupOptions, TEMPLATE_VERSION, TemplateConfig, utc_timestamp
 use crate::sha256_hash::Sha256Hash;
 
 const LIMA_PREFIX: &str = "coop-";
-const BUILDER_NAME: &str = "coop-builder";
+// Deliberately disjoint from the `coop-<instance>` namespace. In particular,
+// do not reuse the historical `coop-builder` name: it may belong to an older
+// or concurrently installed coop binary.
+const BUILDER_PREFIX: &str = "cb-";
+const BUILDER_IDENTITY_FILE: &str = ".lima-builder.json";
+const BUILDER_TOKEN_BYTES: usize = 16;
+const BUILDER_NAME_TOKEN_CHARS: usize = 9;
 
 /// Hostname Lima injects into the guest that resolves to the host machine.
 /// Used to rewrite local-model endpoints so the guest can reach a server
@@ -44,6 +50,7 @@ pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
 
     check_requirements()?;
     ensure_ssh_key(cfg)?;
+    recover_interrupted_builder(cfg, image)?;
 
     let base_img = cfg.lima_base_path(image);
     if base_img.exists()
@@ -1178,13 +1185,6 @@ fn build_golden_image(
     let pubkey = read_public_key(&pubkey_path)
         .with_context(|| format!("Failed to read SSH public key at {}", pubkey_path.display()))?;
 
-    // Clean up any leftover builder instance from a previous failed build
-    if let Err(e) = private_limactl()
-        .and_then(|mut command| command.args(["delete", "--force", BUILDER_NAME]).output())
-    {
-        tracing::debug!("Failed to clean up leftover builder (non-fatal): {e}");
-    }
-
     // Clean up leftover staging image from a previous failed build
     let base_img = cfg.lima_base_path(image);
     let staging = base_img.with_extension("img.new");
@@ -1196,15 +1196,18 @@ fn build_golden_image(
         tracing::debug!("Failed to remove stale staging image (non-fatal): {e}");
     }
 
-    // Generate builder template with full provisioning
-    let builder_template = cfg.data_dir.join("lima-builder.yaml");
-    let data_dir = PrivateDir::open_existing(&cfg.data_dir)?;
-    let builder_template_name = builder_template
-        .file_name()
-        .context("Builder template has no name")?;
+    // Persist the random identity before Lima can create anything. The image
+    // publication lock held by setup serializes this record with recovery.
+    let identity = allocate_builder_identity()?;
+    persist_builder_identity(&image_dir, &identity)?;
+
+    // Generate a per-build template in the same image-scoped private
+    // directory as its identity record.
+    let builder_template = cfg.image_dir(image).join(identity.template());
     write_builder_template(
-        &data_dir,
+        &image_dir,
         &builder_template,
+        &identity,
         cfg,
         pubkey.trim(),
         profiles,
@@ -1221,9 +1224,15 @@ fn build_golden_image(
         &builder_template,
         guest_user,
         builder_timeout,
+        &identity,
     );
 
-    cleanup_builder(&data_dir, builder_template_name);
+    if let Err(error) = cleanup_builder(&image_dir, &identity) {
+        tracing::warn!(
+            "Failed to clean up builder VM '{}' (will retry during the next setup): {error:#}",
+            identity.name()
+        );
+    }
 
     let baked = match result {
         Ok(lists) => lists,
@@ -1298,28 +1307,245 @@ fn report_builder_inputs(profiles: &[ProfileDef]) {
     }
 }
 
-fn cleanup_builder(data_dir: &PrivateDir, template_name: &OsStr) {
-    eprintln!("  Cleaning up builder VM...");
-    if let Err(error) = private_limactl()
-        .and_then(|mut command| command.args(["delete", "--force", BUILDER_NAME]).status())
-    {
-        tracing::warn!("Failed to delete builder VM (non-fatal): {error}");
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+struct BuilderIdentity {
+    token: String,
+    lima_home: PathBuf,
+}
+
+impl BuilderIdentity {
+    fn from_token(token: &[u8; BUILDER_TOKEN_BYTES], lima_home: PathBuf) -> Self {
+        Self {
+            token: hex::encode(token),
+            lima_home,
+        }
     }
-    if let Err(error) = data_dir.remove_child(template_name) {
-        tracing::debug!("Failed to remove builder template (non-fatal): {error}");
+
+    fn name(&self) -> String {
+        format!(
+            "{BUILDER_PREFIX}{}",
+            &self.token[..BUILDER_NAME_TOKEN_CHARS]
+        )
+    }
+
+    fn template(&self) -> String {
+        format!("lima-builder-{}.yaml", self.token)
+    }
+
+    fn ownership_marker(&self) -> String {
+        format!("# coop-builder-owner:{}", self.token)
+    }
+
+    fn limactl(&self) -> io::Result<Command> {
+        let mut command = private_limactl()?;
+        command.env("LIMA_HOME", &self.lima_home);
+        Ok(command)
+    }
+
+    fn headless_create(&self) -> io::Result<Command> {
+        let mut command = self.limactl()?;
+        command.args(["create", "--tty=false", "--set", ".video.display=\"none\""]);
+        Ok(command)
+    }
+
+    fn headless_start(&self) -> io::Result<Command> {
+        let mut command = self.limactl()?;
+        command.args(["start", "--tty=false", "--set", ".video.display=\"none\""]);
+        Ok(command)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.token.len() != BUILDER_TOKEN_BYTES * 2
+            || !self
+                .token
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("Invalid persisted Lima builder token");
+        }
+        if !self.lima_home.is_absolute() {
+            bail!("Persisted Lima builder home is not absolute");
+        }
+        Ok(())
+    }
+}
+
+fn allocate_builder_identity() -> Result<BuilderIdentity> {
+    const ATTEMPTS: usize = 16;
+    let home = std::path::absolute(lima_home()?)?;
+    for _ in 0..ATTEMPTS {
+        let mut token = [0_u8; BUILDER_TOKEN_BYTES];
+        getrandom::fill(&mut token).context("Cannot obtain Lima builder randomness")?;
+        let identity = BuilderIdentity::from_token(&token, home.clone());
+        let name = identity.name();
+        if !lima_builder_name_exists(&home, &name)? {
+            return Ok(identity);
+        }
+    }
+    bail!("Could not allocate an unused Lima builder name after {ATTEMPTS} attempts")
+}
+
+fn lima_builder_name_exists(home: &Path, name: &str) -> Result<bool> {
+    if home
+        .join(name)
+        .try_exists()
+        .with_context(|| format!("Failed to inspect Lima builder directory '{name}'"))?
+    {
+        return Ok(true);
+    }
+    Ok(limactl_list_entry_from_output(&limactl_list_output_at(home)?, name)?.is_some())
+}
+
+fn persist_builder_identity(image_dir: &PrivateDir, identity: &BuilderIdentity) -> Result<()> {
+    identity.validate()?;
+    let serialized =
+        serde_json::to_vec(identity).context("Failed to serialize builder identity")?;
+    image_dir
+        .write_atomic_private(OsStr::new(BUILDER_IDENTITY_FILE), &serialized, 0o600)
+        .context("Failed to persist Lima builder identity")
+}
+
+fn load_builder_identity(image_dir: &PrivateDir) -> Result<Option<BuilderIdentity>> {
+    let serialized = match image_dir.read_to_string(OsStr::new(BUILDER_IDENTITY_FILE)) {
+        Ok(serialized) => serialized,
+        Err(error)
+            if error
+                .root_cause()
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error).context("Failed to read Lima builder identity"),
+    };
+    let identity: BuilderIdentity =
+        serde_json::from_str(&serialized).context("Failed to parse Lima builder identity")?;
+    identity.validate()?;
+    Ok(Some(identity))
+}
+
+fn recover_interrupted_builder(cfg: &CoopConfig, image: &ImageName) -> Result<()> {
+    let path = cfg.image_dir(image);
+    let image_dir = match PrivateDir::open_existing(&path) {
+        Ok(image_dir) => image_dir,
+        Err(error)
+            if error
+                .root_cause()
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(identity) = load_builder_identity(&image_dir)? else {
+        return Ok(());
+    };
+    tracing::info!(
+        "Recovering interrupted Lima image builder '{}' for image '{image}'",
+        identity.name()
+    );
+    cleanup_builder(&image_dir, &identity).with_context(|| {
+        format!(
+            "Failed to recover interrupted Lima builder '{}' for image '{image}'",
+            identity.name()
+        )
+    })
+}
+
+fn cleanup_builder(image_dir: &PrivateDir, identity: &BuilderIdentity) -> Result<()> {
+    eprintln!("  Cleaning up builder VM...");
+    cleanup_builder_with(image_dir, identity, delete_builder_vm)
+}
+
+fn cleanup_builder_with(
+    image_dir: &PrivateDir,
+    identity: &BuilderIdentity,
+    mut delete: impl FnMut(&BuilderIdentity) -> Result<()>,
+) -> Result<()> {
+    identity.validate()?;
+    delete(identity)?;
+    remove_private_child_if_exists(image_dir, OsStr::new(&identity.template()))?;
+    remove_private_child_if_exists(image_dir, OsStr::new(BUILDER_IDENTITY_FILE))
+}
+
+fn delete_builder_vm(identity: &BuilderIdentity) -> Result<()> {
+    identity.validate()?;
+    let name = identity.name();
+    let directory = identity.lima_home.join(&name);
+    let registered =
+        limactl_list_entry_from_output(&limactl_list_output_at(&identity.lima_home)?, &name)?
+            .is_some();
+    let directory_exists = directory
+        .try_exists()
+        .with_context(|| format!("Failed to inspect Lima builder directory '{name}'"))?;
+    if !registered && !directory_exists {
+        return Ok(());
+    }
+    if !directory_exists {
+        bail!("Lima reports builder '{name}', but its recorded directory is absent");
+    }
+    let _yaml = verify_builder_ownership(identity)?;
+    seal_instance_storage(&directory)?;
+    let status = identity
+        .limactl()?
+        .args(["delete", "--force", &name])
+        .status()
+        .with_context(|| format!("Failed to delete Lima builder '{name}'"))?;
+    if !status.success() {
+        bail!("limactl delete failed for builder '{name}'");
+    }
+    Ok(())
+}
+
+fn verify_builder_ownership(identity: &BuilderIdentity) -> Result<String> {
+    let name = identity.name();
+    let lima_home = PrivateDir::open_existing(&identity.lima_home)?;
+    let yaml = lima_home
+        .read_owned_child_regular_without_mutation(OsStr::new(&name), yaml_name())
+        .with_context(|| format!("Failed to verify ownership of Lima builder '{name}'"))?;
+    let ownership_marker = identity.ownership_marker();
+    if yaml.lines().next() != Some(ownership_marker.as_str()) {
+        bail!(
+            "Lima instance '{name}' does not have this build's ownership marker; refusing to \
+             delete it. Leave the VM intact; after verifying the journal's recorded Lima home \
+             and name, move only the image-side builder journal and generated YAML aside before \
+             retrying setup"
+        );
+    }
+    Ok(yaml)
+}
+
+fn remove_private_child_if_exists(dir: &PrivateDir, name: &OsStr) -> Result<()> {
+    match dir.remove_child(name) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error
+                .root_cause()
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
 fn write_builder_template(
     dir: &PrivateDir,
     path: &Path,
+    identity: &BuilderIdentity,
     cfg: &CoopConfig,
     pubkey: &str,
     profiles: &[ProfileDef],
     guest_user: &GuestUser,
 ) -> Result<()> {
     let script = compose_provision_script(pubkey, profiles, guest_user);
-    let yaml = compose_template_yaml(cfg, &script)?;
+    let yaml = format!(
+        "{}\n{}",
+        identity.ownership_marker(),
+        compose_template_yaml(cfg, &script)?
+    );
     dir.write_atomic_private(
         path.file_name().context("Builder template has no name")?,
         yaml.as_bytes(),
@@ -1337,48 +1563,71 @@ fn run_builder_vm(
     builder_template: &std::path::Path,
     guest_user: &GuestUser,
     builder_timeout: Option<Duration>,
+    identity: &BuilderIdentity,
 ) -> Result<BakedLists> {
-    eprintln!("  Starting builder VM and installing packages...");
+    let builder_name = identity.name();
+    eprintln!("  Creating builder VM...");
     check_writable_mounts(cfg, &[])?;
-    let mut command = headless_limactl_start()?;
+    let create_status = identity
+        .headless_create()?
+        .arg(builder_template)
+        .arg(format!("--name={builder_name}"))
+        .status()
+        .context("Failed to run limactl create for builder")?;
+    if !create_status.success() {
+        bail!("Failed to create golden-image builder VM");
+    }
+
+    let lima_dir = identity.lima_home.join(&builder_name);
+    let saved_yaml = verify_builder_ownership(identity)?;
+    let protected = protected_mount_paths(cfg, &identity.lima_home)?;
+    let saved_mounts = mount_sources_from_yaml(&saved_yaml, &protected, true)?;
+    reject_overlapping_sources(&saved_mounts)?;
+    if !saved_mounts.is_empty() {
+        bail!("Lima builder has unexpected writable host mounts; refusing to start it");
+    }
+    seal_instance_storage(&lima_dir)?;
+
+    eprintln!("  Starting builder VM and installing packages...");
+    let mut command = identity.headless_start()?;
+    command.arg(&builder_name);
     if let Some(timeout) = builder_timeout {
         command
             .arg("--timeout")
             .arg(crate::format_duration(timeout));
     }
     let status = command
-        .arg(builder_template)
-        .arg(format!("--name={BUILDER_NAME}"))
         .status()
         .context("Failed to run limactl start for builder")?;
 
-    seal_instance_storage(&lima_home()?.join(BUILDER_NAME))?;
+    seal_instance_storage(&lima_dir)?;
     if !status.success() {
-        dump_builder_logs();
+        dump_builder_logs(identity);
         bail!("Failed to build golden image — limactl start failed.");
     }
 
     // limactl start returns exit 0 even when the provision script
     // fails — it only waits for SSH, not cloud-init completion.
     // Verify cloud-init finished successfully before proceeding.
-    verify_cloud_init_status(builder_timeout)?;
+    verify_cloud_init_status(identity, builder_timeout)?;
 
     // Verify critical binaries are installed before extracting the
     // image. Cloud-init can report "done" even if individual install
     // steps failed silently (e.g. network timeout during download).
-    verify_builder_binaries(guest_user)?;
+    verify_builder_binaries(identity, guest_user)?;
 
     // Install marketplaces and plugins into the builder VM so they're
     // baked into the golden image. Runs after binary verification
     // (confirms claude CLI is installed) and before cloud-init clean.
-    let baked = install_builder_plugins(cfg, profiles, guest_user)?;
+    let baked = install_builder_plugins(cfg, profiles, guest_user, identity)?;
 
     // Clean cloud-init state so it re-runs on new instances
     eprintln!("  Preparing image for reuse...");
-    let ci_status = private_limactl()?
+    let ci_status = identity
+        .limactl()?
         .args([
             "shell",
-            BUILDER_NAME,
+            &builder_name,
             "--",
             "sudo",
             "cloud-init",
@@ -1397,8 +1646,9 @@ fn run_builder_vm(
 
     // Stop the builder VM
     eprintln!("  Stopping builder VM...");
-    let status = private_limactl()?
-        .args(["stop", BUILDER_NAME])
+    let status = identity
+        .limactl()?
+        .args(["stop", &builder_name])
         .status()
         .context("Failed to stop builder VM")?;
 
@@ -1409,7 +1659,6 @@ fn run_builder_vm(
     // Extract the disk image.
     // Lima v2.1.0 renamed "diffdisk" to "disk"; try new name first.
     eprintln!("  Extracting disk image...");
-    let lima_dir = lima_home()?.join(BUILDER_NAME);
     let lima_dir_handle = PrivateDir::open_existing(&lima_dir)?;
     let disk_name = disk_name_at(&lima_dir_handle, &lima_dir)?;
     let src_disk = lima_dir.join(disk_name);
@@ -1440,8 +1689,12 @@ fn run_builder_vm(
 }
 
 /// Get an SSH target for the builder VM.
-fn builder_ssh_target(cfg: &CoopConfig, guest_user: &GuestUser) -> Result<SshTarget> {
-    let info = limactl_list_entry(BUILDER_NAME)?;
+fn builder_ssh_target(
+    cfg: &CoopConfig,
+    guest_user: &GuestUser,
+    identity: &BuilderIdentity,
+) -> Result<SshTarget> {
+    let info = limactl_list_entry_at(&identity.lima_home, &identity.name())?;
     let port = info["sshLocalPort"]
         .as_u64()
         .context("Builder VM has no sshLocalPort")?;
@@ -1485,6 +1738,7 @@ fn install_builder_plugins(
     cfg: &CoopConfig,
     profiles: &[ProfileDef],
     guest_user: &GuestUser,
+    identity: &BuilderIdentity,
 ) -> Result<BakedLists> {
     let (marketplaces, plugins) = crate::guest::collect_baked_lists(cfg, profiles);
     let (codex_marketplaces, codex_plugins) = crate::guest::collect_codex_baked_lists(cfg);
@@ -1503,7 +1757,7 @@ fn install_builder_plugins(
     }
 
     eprintln!("  Installing marketplaces and plugins...");
-    let target = builder_ssh_target(cfg, guest_user)?;
+    let target = builder_ssh_target(cfg, guest_user, identity)?;
 
     // Minimal env forwarding: GITHUB_TOKEN for private repo access
     let mut env = crate::backend::EnvForward::default();
@@ -1548,13 +1802,14 @@ fn install_builder_plugins(
 ///
 /// Tries two sources: the Lima serial log on the host filesystem,
 /// and (if SSH is still reachable) cloud-init-output.log inside the guest.
-fn dump_builder_logs() {
+fn dump_builder_logs(identity: &BuilderIdentity) {
+    let builder_name = identity.name();
     eprintln!("\n  --- Builder VM diagnostic logs ---");
 
     // 1. Host-side: Lima serial log
-    if let Ok(lima_home) = lima_home() {
-        let serial = lima_home.join(BUILDER_NAME).join("serial.log");
-        let content = PrivateDir::open_existing(&lima_home.join(BUILDER_NAME))
+    {
+        let serial = identity.lima_home.join(&builder_name).join("serial.log");
+        let content = PrivateDir::open_existing(&identity.lima_home.join(&builder_name))
             .and_then(|dir| dir.read_to_string(OsStr::new("serial.log")));
         if let Ok(content) = content {
             let lines: Vec<&str> = content.lines().collect();
@@ -1576,11 +1831,11 @@ fn dump_builder_logs() {
     }
 
     // 2. Guest-side: try to grab cloud-init-output.log via SSH
-    if let Ok(output) = private_limactl().and_then(|mut command| {
+    if let Ok(output) = identity.limactl().and_then(|mut command| {
         command
             .args([
                 "shell",
-                BUILDER_NAME,
+                &builder_name,
                 "--",
                 "sudo",
                 "tail",
@@ -1607,13 +1862,13 @@ fn dump_builder_logs() {
 /// `limactl start` returns exit 0 as soon as SSH is reachable, even
 /// if the provision script failed. `cloud-init status --wait` blocks
 /// until cloud-init finishes and returns exit 1 on error.
-fn verify_cloud_init_status(builder_timeout: Option<Duration>) -> Result<()> {
+fn verify_cloud_init_status(
+    identity: &BuilderIdentity,
+    builder_timeout: Option<Duration>,
+) -> Result<()> {
+    let builder_name = identity.name();
     eprintln!("  Verifying provision script completed...");
-    let mut args = vec![
-        "shell".to_string(),
-        BUILDER_NAME.to_string(),
-        "--".to_string(),
-    ];
+    let mut args = vec!["shell".to_string(), builder_name.clone(), "--".to_string()];
     if let Some(timeout) = builder_timeout {
         args.push("timeout".to_string());
         args.push(crate::format_duration(timeout));
@@ -1624,7 +1879,8 @@ fn verify_cloud_init_status(builder_timeout: Option<Duration>) -> Result<()> {
         "--wait".to_string(),
     ]);
 
-    let output = private_limactl()?
+    let output = identity
+        .limactl()?
         .args(args)
         .output()
         .context("Failed to check cloud-init status in builder VM")?;
@@ -1647,13 +1903,14 @@ fn verify_cloud_init_status(builder_timeout: Option<Duration>) -> Result<()> {
     if let Err(e) = cloud_init_result {
         // Grab diagnostics from both cloud-init logs
         let grab_log = |path: &str| -> String {
-            private_limactl()
+            identity
+                .limactl()
                 .ok()
                 .and_then(|mut command| {
                     command
                         .args([
                             "shell",
-                            BUILDER_NAME,
+                            &builder_name,
                             "--",
                             "sudo",
                             "tail",
@@ -1730,15 +1987,17 @@ fn check_cloud_init_output(exit_code: Option<i32>, stdout: &str) -> Result<()> {
 /// Runs after cloud-init completes but before extracting the disk
 /// image. Catches silent install failures (e.g. network timeouts)
 /// that cloud-init doesn't flag as errors.
-fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
+fn verify_builder_binaries(identity: &BuilderIdentity, guest_user: &GuestUser) -> Result<()> {
+    let builder_name = identity.name();
     crate::guest::verify_required_binaries(
         guest_user,
         "provision script",
         |path| {
-            Ok(private_limactl()?
+            Ok(identity
+                .limactl()?
                 .args([
                     "shell",
-                    BUILDER_NAME,
+                    &builder_name,
                     "--",
                     "bash",
                     "-c",
@@ -1749,20 +2008,22 @@ fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
                 .status()
                 .is_ok_and(|s| s.success()))
         },
-        builder_log_tail,
+        || builder_log_tail(identity),
     )
 }
 
 /// Tail of the builder's cloud-init log, formatted as a trailing section for
 /// the missing-binaries error. Empty when the log is unavailable or blank.
-fn builder_log_tail() -> String {
-    let log_tail = private_limactl()
+fn builder_log_tail(identity: &BuilderIdentity) -> String {
+    let builder_name = identity.name();
+    let log_tail = identity
+        .limactl()
         .ok()
         .and_then(|mut command| {
             command
                 .args([
                     "shell",
-                    BUILDER_NAME,
+                    &builder_name,
                     "--",
                     "sudo",
                     "tail",
@@ -2324,6 +2585,10 @@ fn lima_name_for(name: &InstanceName) -> String {
     format!("{LIMA_PREFIX}{name}")
 }
 
+fn is_user_lima_name(name: &OsStr) -> bool {
+    name.to_string_lossy().starts_with(LIMA_PREFIX)
+}
+
 /// Restrict files created by Lima, including disks and transient builder state.
 #[cfg_attr(
     test,
@@ -2412,9 +2677,16 @@ fn headless_limactl_start() -> io::Result<Command> {
 #[cfg(target_os = "macos")]
 pub(crate) fn prepare_private_storage() -> Result<()> {
     let home = lima_home()?;
-    let home_dir = PrivateDir::create(&home)?;
+    prepare_private_storage_at(&home)
+}
+
+fn prepare_private_storage_at(home: &Path) -> Result<()> {
+    let home_dir = PrivateDir::create(home)?;
     for name in home_dir.entries()? {
-        if !name.to_string_lossy().starts_with(LIMA_PREFIX) {
+        // Builders are sealed explicitly after ownership verification and
+        // before start, disk access, and deletion. Do not claim unrelated
+        // `cb-` Lima VMs merely because their names resemble our namespace.
+        if !is_user_lima_name(&name) {
             continue;
         }
         let path = home.join(&name);
@@ -2578,9 +2850,11 @@ fn check_saved_mounts(
             sources.extend(mount_sources_from_yaml(&yaml, protected, false)?);
         }
     }
-    // Inspect every coop-managed specification, including stopped VMs. A
+    // Inspect every user-instance specification, including stopped VMs. A
     // stopped VM must not be restarted with a mount that can expose state;
     // an existing live exposure makes that state untrustworthy right now.
+    // Builders are created from coop's fixed `mounts: []` template, verified
+    // before their one start, and recovered by deletion rather than restart.
     let entries = match std::fs::read_dir(control) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(sources),
@@ -2588,7 +2862,7 @@ fn check_saved_mounts(
     };
     for entry in entries {
         let entry = entry.context("Cannot inspect Lima control directory entry")?;
-        if !entry.file_name().to_string_lossy().starts_with(LIMA_PREFIX) {
+        if !is_user_lima_name(&entry.file_name()) {
             continue;
         }
         if !entry.file_type()?.is_dir() {
@@ -2724,15 +2998,27 @@ fn limactl_info(name: &InstanceName) -> Result<serde_json::Value> {
 }
 
 /// Find a `limactl list --json` entry by its Lima VM name (the
-/// `coop-<instance>` form, or the special `coop-builder`).
+/// `coop-<instance>` form, or an image-scoped random builder name).
 fn limactl_list_entry(lima_name: &str) -> Result<serde_json::Value> {
     limactl_list_entry_optional(lima_name)?
         .with_context(|| format!("Lima instance '{lima_name}' not found in limactl list"))
 }
 
+fn limactl_list_entry_at(home: &Path, lima_name: &str) -> Result<serde_json::Value> {
+    seal_instance_storage(&home.join(lima_name))?;
+    limactl_list_entry_from_output(&limactl_list_output_at(home)?, lima_name)?
+        .with_context(|| format!("Lima instance '{lima_name}' not found in limactl list"))
+}
+
 fn limactl_list_entry_optional(lima_name: &str) -> Result<Option<serde_json::Value>> {
     seal_instance_storage(&lima_home()?.join(lima_name))?;
-    let stdout = limactl_list_output()?;
+    limactl_list_entry_from_output(&limactl_list_output()?, lima_name)
+}
+
+fn limactl_list_entry_from_output(
+    stdout: &str,
+    lima_name: &str,
+) -> Result<Option<serde_json::Value>> {
     // limactl list --json outputs one JSON object per line (NDJSON)
     for line in stdout.lines() {
         let line = line.trim();
@@ -2754,7 +3040,17 @@ fn limactl_list_entry_optional(lima_name: &str) -> Result<Option<serde_json::Val
 }
 
 fn limactl_list_output() -> Result<String> {
-    let output = private_limactl()?
+    limactl_list_output_with_command(private_limactl()?)
+}
+
+fn limactl_list_output_at(home: &Path) -> Result<String> {
+    let mut command = private_limactl()?;
+    command.env("LIMA_HOME", home);
+    limactl_list_output_with_command(command)
+}
+
+fn limactl_list_output_with_command(mut command: Command) -> Result<String> {
+    let output = command
         .args(["list", "--json"])
         .output()
         .context("Failed to run limactl list")?;
@@ -3124,6 +3420,194 @@ mod tests {
         assert_eq!(
             args,
             ["start", "--tty=false", "--set", ".video.display=\"none\""]
+        );
+    }
+
+    #[test]
+    fn lima_builder_create_is_headless() {
+        let identity = BuilderIdentity::from_token(
+            &[0x33; BUILDER_TOKEN_BYTES],
+            PathBuf::from("/private/tmp/lima-test"),
+        );
+        let command = identity.headless_create().unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            ["create", "--tty=false", "--set", ".video.display=\"none\""]
+        );
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "LIMA_HOME" && value == Some(OsStr::new("/private/tmp/lima-test"))
+        }));
+    }
+
+    #[test]
+    fn builder_identities_are_per_build_and_outside_instance_namespace() {
+        let home = PathBuf::from("/private/tmp/lima-test");
+        let first = BuilderIdentity::from_token(&[0x11; BUILDER_TOKEN_BYTES], home.clone());
+        let second = BuilderIdentity::from_token(&[0x22; BUILDER_TOKEN_BYTES], home);
+
+        assert_ne!(first, second);
+        for identity in [&first, &second] {
+            identity.validate().unwrap();
+            assert!(identity.name().starts_with(BUILDER_PREFIX));
+            assert!(!identity.name().starts_with(LIMA_PREFIX));
+            assert_ne!(identity.name(), "coop-builder");
+            assert_eq!(identity.name().len(), "coop-builder".len());
+            assert!(identity.template().starts_with("lima-builder-"));
+        }
+        assert_ne!(first.template(), second.template());
+
+        let legacy = BuilderIdentity {
+            token: "builder".to_string(),
+            lima_home: PathBuf::from("/private/tmp/lima-test"),
+        };
+        assert!(legacy.validate().is_err());
+        assert!(is_user_lima_name(OsStr::new("coop-project")));
+        assert!(!is_user_lima_name(OsStr::new(&first.name())));
+        assert!(!is_user_lima_name(OsStr::new("cb-personal")));
+        assert!(!is_user_lima_name(OsStr::new("other-vm")));
+    }
+
+    #[test]
+    fn storage_scan_does_not_claim_unrelated_cb_prefixed_vm() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = crate::test_support::private_tempdir().unwrap();
+        let sentinel = root.path().join("cb-personal");
+        fs::create_dir(&sentinel).unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o755)).unwrap();
+        let disk = sentinel.join("disk");
+        fs::write(&disk, b"sentinel").unwrap();
+        fs::set_permissions(&disk, fs::Permissions::from_mode(0o644)).unwrap();
+
+        prepare_private_storage_at(root.path()).unwrap();
+
+        assert_eq!(
+            fs::metadata(&sentinel).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(&disk).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(fs::read_to_string(disk).unwrap(), "sentinel");
+    }
+
+    #[test]
+    fn builder_cleanup_failure_retains_identity_for_exact_retry() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let image_dir = PrivateDir::open_existing(root.path()).unwrap();
+        let identity =
+            BuilderIdentity::from_token(&[0x44; BUILDER_TOKEN_BYTES], root.path().join("lima"));
+        let name = identity.name();
+        let template = identity.template();
+        persist_builder_identity(&image_dir, &identity).unwrap();
+        assert_eq!(
+            load_builder_identity(&image_dir).unwrap(),
+            Some(identity.clone())
+        );
+        image_dir
+            .write_atomic_private(OsStr::new(&template), b"canary", 0o600)
+            .unwrap();
+
+        let first_deleted = std::cell::RefCell::new(Vec::new());
+        let error = cleanup_builder_with(&image_dir, &identity, |deleted| {
+            first_deleted.borrow_mut().push(deleted.name());
+            anyhow::bail!("injected delete failure")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected delete failure"));
+        let first_deleted = first_deleted.into_inner();
+        assert_eq!(first_deleted.len(), 1);
+        assert_eq!(first_deleted[0], name);
+        assert!(root.path().join(BUILDER_IDENTITY_FILE).exists());
+        assert!(root.path().join(&template).exists());
+
+        let retry_deleted = std::cell::RefCell::new(Vec::new());
+        cleanup_builder_with(&image_dir, &identity, |deleted| {
+            retry_deleted.borrow_mut().push(deleted.name());
+            Ok(())
+        })
+        .unwrap();
+        let retry_deleted = retry_deleted.into_inner();
+        assert_eq!(retry_deleted.len(), 1);
+        assert_eq!(retry_deleted[0], name);
+        assert!(!root.path().join(BUILDER_IDENTITY_FILE).exists());
+        assert!(!root.path().join(&template).exists());
+        assert_ne!(name, "coop-builder");
+    }
+
+    #[test]
+    fn builder_cleanup_requires_matching_yaml_ownership_marker() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = crate::test_support::private_tempdir().unwrap();
+        let identity =
+            BuilderIdentity::from_token(&[0x55; BUILDER_TOKEN_BYTES], root.path().to_path_buf());
+        let instance = root.path().join(identity.name());
+        let instance_dir = PrivateDir::create(&instance).unwrap();
+        let unrelated = "# manually-created VM\nvmType: vz\n";
+        instance_dir
+            .write_atomic_private(yaml_name(), unrelated.as_bytes(), 0o600)
+            .unwrap();
+        fs::set_permissions(&instance, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            instance.join(yaml_name()),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let error = verify_builder_ownership(&identity).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to delete"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::metadata(&instance).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(instance.join(yaml_name()))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::read_to_string(instance.join(yaml_name())).unwrap(),
+            unrelated
+        );
+
+        let owned = format!("{}\nvmType: vz\n", identity.ownership_marker());
+        instance_dir
+            .write_atomic_private(yaml_name(), owned.as_bytes(), 0o600)
+            .unwrap();
+        fs::set_permissions(
+            instance.join(yaml_name()),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        verify_builder_ownership(&identity).unwrap();
+        assert_eq!(
+            fs::metadata(&instance).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(instance.join(yaml_name()))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        seal_instance_storage(&instance).unwrap();
+        assert_eq!(
+            fs::metadata(&instance).unwrap().permissions().mode() & 0o777,
+            0o700
         );
     }
 

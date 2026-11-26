@@ -23,13 +23,15 @@ Coop resolves `limactl` through the shared host-tool validator and uses a fixed 
 `coop setup` builds a golden disk image that all instances clone from:
 
 1. Generates an ed25519 SSH key pair, stored in the coop data directory.
-2. Creates a temporary builder VM from an Ubuntu 24.04 cloud image. The Lima YAML template includes a cloud-init provision script.
+2. Creates a temporary builder VM from an Ubuntu 24.04 cloud image. Its short random `cb-<suffix>` Lima name is outside the `coop-<instance>` namespace, and its image-scoped YAML template includes a cloud-init provision script.
 3. The provision script installs all packages (Docker, GitHub CLI, Claude Code, Codex, Grok Build, and any profile packages), creates the `ubuntu` user with SSH access, and enables services.
 4. After provisioning completes, cleans cloud-init state so it re-runs on cloned instances.
 5. Stops the builder VM and extracts its disk as the golden image.
 6. Generates a fast-start Lima template that references the golden image directly. No cloud-init provisioning runs on instance start.
 
-The builder VM is deleted after extraction, whether the build succeeds or fails.
+The builder VM is deleted after extraction, whether the build succeeds or fails. Under the image lock, coop journals the full random token and absolute Lima home; interrupted cleanup retries only the derived name in that original home. Deletion also requires the token marker in the instance's `lima.yaml`, so coop neither adopts a reused name nor deletes the historical `coop-builder` VM. The 12-character name is no longer than that legacy name, and Lima retains its own Unix-socket path validation.
+
+If recovery reports an ownership-marker mismatch, leave that Lima VM intact. Inspect `<data-dir>/images/<image>/.lima-builder.json` to confirm the recorded home and derived name (`cb-` plus the token's first nine characters), then move that journal and its `lima-builder-<token>.yaml` sibling aside before retrying setup. This abandons only image-side coop state; it does not delete or modify the unrelated VM. Keep the journal in place for ambiguous inventory, I/O, or deletion errors so coop can retry the exact cleanup safely.
 
 ### How instances work
 
