@@ -807,6 +807,10 @@ fn escape_untrusted_pull_path(path: &[u8]) -> String {
     escaped
 }
 
+fn escaped_pull_path(path: &Path) -> String {
+    escape_untrusted_pull_path(path.as_os_str().as_bytes())
+}
+
 fn rsync_list_paths(output: &[u8]) -> impl Iterator<Item = &[u8]> {
     output
         .split(|&byte| byte == b'\n')
@@ -940,21 +944,27 @@ fn skip_embedded_git_repositories(source: &Path, dest: &Path) -> Result<StagedPu
             .with_context(|| {
                 format!(
                     "Failed to inspect staged pull directory {}",
-                    source_dir.display()
+                    escaped_pull_path(&source_dir)
                 )
             })?
             .collect::<std::io::Result<Vec<_>>>()?;
         let dest_entries = match fs::metadata(&dest_dir) {
             Ok(metadata) if metadata.is_dir() => fs::read_dir(&dest_dir)
                 .with_context(|| {
-                    format!("Failed to inspect pull destination {}", dest_dir.display())
+                    format!(
+                        "Failed to inspect pull destination {}",
+                        escaped_pull_path(&dest_dir)
+                    )
                 })?
                 .collect::<std::io::Result<Vec<_>>>()?,
             Ok(_) => Vec::new(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => {
                 return Err(error).with_context(|| {
-                    format!("Failed to inspect pull destination {}", dest_dir.display())
+                    format!(
+                        "Failed to inspect pull destination {}",
+                        escaped_pull_path(&dest_dir)
+                    )
                 });
             }
         };
@@ -986,10 +996,10 @@ fn skip_embedded_git_repositories(source: &Path, dest: &Path) -> Result<StagedPu
             remove_staging_directory(&source_dir).with_context(|| {
                 format!(
                     "Failed to skip embedded Git directory {}",
-                    source_dir.display()
+                    escaped_pull_path(&source_dir)
                 )
             })?;
-            tracing::warn!(path = %escape_untrusted_pull_path(relative.as_os_str().as_bytes()), "Skipped embedded Git repository from pull");
+            tracing::warn!(path = %escaped_pull_path(relative), "Skipped embedded Git repository from pull");
             continue;
         }
 
@@ -1151,15 +1161,16 @@ fn remove_staging_directory(path: &Path) -> Result<()> {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("Failed to inspect staging path {}", path.display()));
+            return Err(error).with_context(|| {
+                format!("Failed to inspect staging path {}", escaped_pull_path(path))
+            });
         }
     };
 
     if metadata.file_type().is_dir() {
         let permissions = make_staging_directories_traversable(path);
         let removal = fs::remove_dir_all(path)
-            .with_context(|| format!("Failed to remove staging path {}", path.display()));
+            .with_context(|| format!("Failed to remove staging path {}", escaped_pull_path(path)));
         match (permissions, removal) {
             (_, Ok(())) => Ok(()),
             (Ok(()), Err(error)) => Err(error),
@@ -1172,7 +1183,7 @@ fn remove_staging_directory(path: &Path) -> Result<()> {
         fs::remove_file(path).with_context(|| {
             format!(
                 "Failed to remove non-directory staging path {}",
-                path.display()
+                escaped_pull_path(path)
             )
         })
     }
@@ -1181,8 +1192,12 @@ fn remove_staging_directory(path: &Path) -> Result<()> {
 fn make_staging_directories_traversable(path: &Path) -> Result<()> {
     let mut pending = vec![path.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        let metadata = fs::symlink_metadata(&directory)
-            .with_context(|| format!("Failed to inspect staged path {}", directory.display()))?;
+        let metadata = fs::symlink_metadata(&directory).with_context(|| {
+            format!(
+                "Failed to inspect staged path {}",
+                escaped_pull_path(&directory)
+            )
+        })?;
         if !metadata.file_type().is_dir() {
             continue;
         }
@@ -1192,20 +1207,20 @@ fn make_staging_directories_traversable(path: &Path) -> Result<()> {
             || {
                 format!(
                     "Failed to restore owner permissions on staged directory {}",
-                    directory.display()
+                    escaped_pull_path(&directory)
                 )
             },
         )?;
         for entry in fs::read_dir(&directory).with_context(|| {
             format!(
                 "Failed to traverse staged directory {}",
-                directory.display()
+                escaped_pull_path(&directory)
             )
         })? {
             let entry = entry.with_context(|| {
                 format!(
                     "Failed to inspect entry in staged directory {}",
-                    directory.display()
+                    escaped_pull_path(&directory)
                 )
             })?;
             pending.push(entry.path());
@@ -3387,6 +3402,25 @@ Host coop-other\n\
         install_staged_pull(&fake_ssh_target(), &staging, &dest, &operation).unwrap();
         assert!(!dest.join("safe.txt").exists());
         assert!(!dest.join("objects").exists());
+    }
+
+    #[test]
+    fn staged_pull_escapes_guest_names_in_destination_errors() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let staging = temp.path().join("staging");
+        let dest = temp.path().join("dest");
+        let name = "guest\nname";
+        fs::create_dir_all(staging.join(name)).unwrap();
+        fs::create_dir(&dest).unwrap();
+        // A self-referential destination link makes metadata fail even when run as root.
+        std::os::unix::fs::symlink(name, dest.join(name)).unwrap();
+
+        let operation = test_pull_operation(temp.path());
+        let error =
+            install_staged_pull(&fake_ssh_target(), &staging, &dest, &operation).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(r"guest\x0Aname"), "{message:?}");
+        assert!(!message.contains(name), "{message:?}");
     }
 
     #[test]
