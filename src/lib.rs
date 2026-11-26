@@ -355,7 +355,7 @@ enum Commands {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Prompt for permissions instead of skipping them
