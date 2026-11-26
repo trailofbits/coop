@@ -203,37 +203,6 @@ impl PrivateDir {
         Ok(contents)
     }
 
-    /// Read one owned regular file in an owned child directory without
-    /// changing the child directory or file's permissions or ACLs. This
-    /// handle pins the already-checked parent; both candidate entries are
-    /// opened relative to it without following symlinks.
-    #[cfg_attr(
-        all(not(target_os = "macos"), not(test)),
-        expect(dead_code, reason = "Lima builder ownership checks")
-    )]
-    pub(crate) fn read_owned_child_regular_without_mutation(
-        &self,
-        child: &OsStr,
-        name: &OsStr,
-    ) -> Result<String> {
-        let directory = open_directory_at(&self.file, &child_name(child)?, SymlinkPolicy::Reject)?;
-        let metadata = directory.metadata()?;
-        // SAFETY: geteuid has no preconditions.
-        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-            bail!("Owned application storage requires an owned directory");
-        }
-        check_ancestor(&directory)?;
-        let mut file = open_file_at(
-            &directory,
-            &child_name(name)?,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-        )?;
-        check_user_regular(&file)?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
-        Ok(contents)
-    }
-
     /// Open or create a stable lock inode without truncating it.
     pub fn open_or_create_lock(&self, name: &OsStr) -> Result<File> {
         let name = child_name(name)?;
