@@ -419,10 +419,7 @@ fn check_line(row: &CheckRow) -> String {
                 "update available — run: coop agent update --codex".to_string(),
             )
         }
-        CheckStatus::AutoUpdates => (
-            installed,
-            "up to date (auto-updates in background)".to_string(),
-        ),
+        CheckStatus::AutoUpdates => (installed, "auto-updates in background".to_string()),
         CheckStatus::Unknown => (installed, "could not determine latest version".to_string()),
     };
     let label = row.agent.display();
@@ -668,6 +665,7 @@ mod tests {
         assert!(line.contains("Claude Code"), "{line}");
         assert!(line.contains("1.2.3"), "{line}");
         assert!(line.contains("auto-updates in background"), "{line}");
+        assert!(!line.contains("up to date"), "{line}");
     }
 
     #[test]
@@ -682,6 +680,7 @@ mod tests {
         assert!(line.contains("Grok Build"), "{line}");
         assert!(line.contains("1.0.24"), "{line}");
         assert!(line.contains("auto-updates in background"), "{line}");
+        assert!(!line.contains("up to date"), "{line}");
     }
 
     #[test]

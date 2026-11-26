@@ -494,9 +494,9 @@ release on GitHub, changing nothing:
 
 ```
 $ coop agent update my-project --check
-Claude Code  1.2.3            up to date (auto-updates in background)
+Claude Code  1.2.3            auto-updates in background
 Codex        0.4.1 → 0.5.0    update available — run: coop agent update --codex
-Grok Build   1.0.24           up to date (auto-updates in background)
+Grok Build   1.0.24           auto-updates in background
 ```
 
 ```
