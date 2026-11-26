@@ -679,7 +679,7 @@ test_setup() {
     echo "=== Phase: setup ==="
 
     local args=(setup -y)
-    # The full suite exercises `agent update --codex`; force the initial image
+    # The full suite exercises `agent update --agent codex`; force the initial image
     # build so that test cannot silently reuse a pre-fix local template.
     if [[ "$FULL" == "1" ]]; then
         args+=(--rebuild)
@@ -2458,7 +2458,7 @@ check_codex_self_update() {
 }
 
 # `coop agent update` refreshes the in-guest agent binaries (issue #402).
-# `--check` is cheap and network-tolerant (the Codex latest-version lookup
+# `agent status` is cheap and network-tolerant (the Codex latest-version lookup
 # degrades to "unknown" on failure, so the command still exits 0). The actual
 # Codex reinstall downloads the release inside the guest, so it is gated behind
 # --full.
@@ -2466,16 +2466,16 @@ test_agent_update() {
     echo ""
     echo "=== Phase: agent update ==="
 
-    if coop agent update "$INSTANCE" --check; then
+    if coop agent status "$INSTANCE"; then
         if echo "$HARNESS_OUT" | grep -q "Claude Code" \
             && echo "$HARNESS_OUT" | grep -q "Codex" \
             && echo "$HARNESS_OUT" | grep -q "Grok Build"; then
-            pass "agent update --check reports all agents"
+            pass "agent status reports all agents"
         else
-            fail "agent update --check reports all agents" "out: $HARNESS_OUT"
+            fail "agent status reports all agents" "out: $HARNESS_OUT"
         fi
     else
-        fail "agent update --check exits 0" "exit: $? stderr: $HARNESS_ERR"
+        fail "agent status exits 0" "exit: $? stderr: $HARNESS_ERR"
     fi
 
     if [[ "$FULL" == "1" ]]; then
@@ -2484,10 +2484,10 @@ test_agent_update() {
             return
         fi
 
-        if coop agent update "$INSTANCE" --codex -y; then
-            pass "agent update --codex exits 0"
+        if coop agent update "$INSTANCE" --agent codex; then
+            pass "agent update --agent codex exits 0"
         else
-            fail "agent update --codex exits 0" "exit: $? stderr: $HARNESS_ERR"
+            fail "agent update --agent codex exits 0" "exit: $? stderr: $HARNESS_ERR"
         fi
 
         # The reinstall must leave an executable, correctly versioned binary.
@@ -2531,25 +2531,25 @@ test_agent_update() {
         # shellcheck disable=SC2016 # Expand HOME in the guest.
         guest_exec sh -c 'rm -f "$HOME/.codex/coop-update-config.expected"'
     else
-        skip "agent update --codex" "use --full; downloads the release in-guest"
+        skip "agent update --agent codex" "use --full; downloads the release in-guest"
     fi
 }
 
-# `coop agent update` requires a running VM; against a stopped instance it must
+# `coop agent status` requires a running VM; against a stopped instance it must
 # fail with the shared "not running" guidance and a non-zero exit (issue #402).
-test_agent_update_stopped() {
+test_agent_status_stopped() {
     echo ""
-    echo "=== Phase: agent update (stopped instance) ==="
+    echo "=== Phase: agent status (stopped instance) ==="
 
-    if coop_fails agent update "$INSTANCE" --check; then
+    if coop_fails agent status "$INSTANCE"; then
         if echo "$HARNESS_ERR" | grep -qi "not running"; then
-            pass "agent update on a stopped instance fails with 'not running'"
+            pass "agent status on a stopped instance fails with 'not running'"
         else
-            fail "agent update on a stopped instance fails with 'not running'" \
+            fail "agent status on a stopped instance fails with 'not running'" \
                 "stderr: $HARNESS_ERR"
         fi
     else
-        fail "agent update on a stopped instance exits non-zero" "out: $HARNESS_OUT"
+        fail "agent status on a stopped instance exits non-zero" "out: $HARNESS_OUT"
     fi
 }
 
@@ -6650,7 +6650,7 @@ CFGEOF
             "stderr: $(guest_stderr)"
     fi
     if seed_codex_update_config; then
-        if coop agent update "$inst_name" --codex -y; then
+        if coop agent update "$inst_name" --agent codex; then
             pass "agent update migrates the profile's system Codex installation"
         else
             fail "agent update migrates the profile's system Codex installation" \
@@ -9632,10 +9632,10 @@ test_guest_user_alt() {
     fi
 
     check_native_codex
-    if coop agent update "$inst_name" --codex -y; then
-        pass "agent update --codex uses the configured guest user"
+    if coop agent update "$inst_name" --agent codex; then
+        pass "agent update --agent codex uses the configured guest user"
     else
-        fail "agent update --codex uses the configured guest user" "stderr: $HARNESS_ERR"
+        fail "agent update --agent codex uses the configured guest user" "stderr: $HARNESS_ERR"
     fi
     check_native_codex
 
@@ -9815,7 +9815,7 @@ EOF
         run_timed_test test_stop_idempotency
         run_timed_test test_auto_resolve_stopped
         run_timed_test test_status_stopped
-        run_timed_test test_agent_update_stopped
+        run_timed_test test_agent_status_stopped
         run_timed_test test_list_stopped
         run_timed_test test_stopped_vm_completions
         run_timed_test test_resize_disk_size
