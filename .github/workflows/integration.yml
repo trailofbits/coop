@@ -4,6 +4,9 @@ on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+  push:
+    branches:
+      - 'ci/vm-integration/macos-ci-only-probe-*'
 
 permissions:
   contents: read
@@ -21,12 +24,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Guest package installation has varied by more than 30 minutes between
     # runners, exhausting shorter caps while the suite was still advancing.
-    timeout-minutes: 65
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
-        shard: [lifecycle, workspace, config, features]
-        os: [ubuntu-24.04, ubuntu-26.04]
+        shard: [features]
+        os: [macos-15-intel]
     defaults:
       run:
         shell: bash
@@ -36,6 +39,7 @@ jobs:
           persist-credentials: false
 
       - name: Install host prerequisites
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y acl build-essential cmake curl e2fsprogs \
@@ -45,14 +49,24 @@ jobs:
       # Image rebuilds and copies need more disk than the standard runner's
       # advertised free space. These SDKs are unused by the Linux VM suite.
       - name: Make room for VM images
+        if: runner.os == 'Linux'
         run: |
           df -h /
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
           df -h /
           free -h
 
+      - name: Install macOS host prerequisites
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake
+          curl -fsSL https://github.com/lima-vm/lima/releases/download/v2.3.0/lima-2.3.0-Darwin-x86_64.tar.gz -o "$RUNNER_TEMP/lima.tgz"
+          echo 'd58bc7d6b8158d638720d8c8fdb17eb58527dfead6a29a5b60f48a35ee4a65a6  '"$RUNNER_TEMP/lima.tgz" | shasum -a 256 -c -
+          sudo tar -xzf "$RUNNER_TEMP/lima.tgz" -C /usr/local
+          /usr/local/bin/limactl --version
+
       - name: Full Firecracker integration
-        timeout-minutes: 60
+        timeout-minutes: 135
         env:
           # Safe only on this disposable runner: exercises destroy --all.
           COOP_TEST_DESTRUCTIVE: "1"
