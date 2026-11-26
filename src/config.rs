@@ -4349,6 +4349,59 @@ mod tests {
         assert!(err.to_string().contains("already exists"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allocate_for_provisioning_does_not_publish_when_lock_cannot_open() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let cfg = test_config(&tmp);
+        let name = iname("lock-failure");
+        crate::fs_util::private_dir(&cfg.instances_dir()).unwrap();
+        let lock_path = cfg
+            .instances_dir()
+            .join(format!("..{name}.provisioning.operation.lock"));
+        std::os::unix::fs::symlink(cfg.instances_dir(), lock_path).unwrap();
+
+        let Err(error) = cfg.allocate_for_provisioning(Some(&name), &default_img(), None) else {
+            panic!("invalid provisioning lock unexpectedly allowed allocation");
+        };
+
+        assert!(
+            format!("{error:#}").contains("Failed to open operation lock"),
+            "{error:#}"
+        );
+        assert!(!cfg.instances_dir().join(name.as_str()).exists());
+    }
+
+    #[test]
+    fn allocate_for_provisioning_rejects_held_name_without_blocking_other_names() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let cfg = test_config(&tmp);
+        let busy_name = iname("busy");
+        let (busy, _provisioning) = cfg
+            .allocate_for_provisioning(Some(&busy_name), &default_img(), None)
+            .unwrap();
+        fs::remove_dir_all(&busy.dir).unwrap();
+
+        let started = std::time::Instant::now();
+        let Err(error) = cfg.allocate_for_provisioning(Some(&busy_name), &default_img(), None)
+        else {
+            panic!("held provisioning lock unexpectedly allowed allocation");
+        };
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "held provisioning lock did not reject immediately"
+        );
+        assert!(error.to_string().contains("Timed out waiting"), "{error:#}");
+        assert!(!busy.dir.exists());
+
+        let other_name = iname("other");
+        let (other, _other_provisioning) = cfg
+            .allocate_for_provisioning(Some(&other_name), &default_img(), None)
+            .unwrap();
+        assert!(other.dir.is_dir());
+    }
+
     #[test]
     fn instance_directory_probe_classifies_every_result() {
         let name = iname("probe");

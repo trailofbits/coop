@@ -3662,38 +3662,6 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn fresh_creation_does_not_publish_when_provisioning_lock_cannot_open() {
-        let root = private_test_root();
-        let mut cfg = cfg_with_data_dir(root.path().join("data"));
-        let image = super::config::ImageName::new("legacy").unwrap();
-        let name = super::config::InstanceName::new("lock-failure").unwrap();
-        write_legacy_firecracker_image(&cfg, &image);
-
-        crate::fs_util::private_dir(&cfg.instances_dir()).unwrap();
-        let lock_path = cfg
-            .instances_dir()
-            .join(format!("..{name}.provisioning.operation.lock"));
-        std::os::unix::fs::symlink(cfg.instances_dir(), &lock_path).unwrap();
-
-        let config_path = root.path().join("config.toml");
-        let opts = start_opts(Vec::new(), &config_path);
-        let error = super::allocate_and_start(
-            &super::backend::FirecrackerBackend::new(),
-            &mut cfg,
-            Some(&name),
-            &image,
-            None,
-            &opts,
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("Failed to open operation lock"), "{error}");
-        assert!(!cfg.instances_dir().join(name.as_str()).exists());
-    }
-
-    #[cfg(target_os = "linux")]
     fn vsock_instance_with_disk(
         cfg: &mut super::config::CoopConfig,
         name: &super::config::InstanceName,
