@@ -18,9 +18,9 @@ modules. Two workarounds are applied when provisioning the guest image
    installed, so DNS fails silently. Fix: replace the symlink with a static file
    pointing to `8.8.8.8` / `8.8.4.4`.
 
-Both would be resolved by building a custom Firecracker kernel with the needed
-netfilter modules enabled, rather than using the minimal CI kernel. The Lima
-backend uses a full kernel and needs neither.
+A kernel with nftables support addresses the first issue. The DNS workaround
+depends on which resolver the guest image provides. Lima uses its Ubuntu
+image’s kernel and resolver.
 
 ## Docker networking in the guest
 

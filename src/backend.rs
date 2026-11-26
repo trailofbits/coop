@@ -2654,7 +2654,7 @@ pub fn ensure_codex_account_guest_support(target: &SshTarget) -> Result<()> {
 }
 
 /// Load the persisted guest user for an image, falling back to the
-/// default `ubuntu` when no `template_config.json` exists yet (e.g.
+/// default `ubuntu` when no `template-config.json` exists yet (e.g.
 /// the SSH target is being requested before setup has written the
 /// config). Returning the default keeps pre-existing call sites
 /// working unchanged on legacy images.

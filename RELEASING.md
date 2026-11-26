@@ -36,8 +36,9 @@ push succeeds and ships something correct.
 | Mutation testing (`--mutants`) | | opt-in | when logic changed |
 | Fuzzing (`--fuzz`) | | opt-in | when a parser changed |
 
-CI can't run the full VM integration suite or the mutation/fuzzing checks;
-those remain the preflight's job.
+The scheduled and manually dispatched Firecracker workflow runs the full Linux
+suite. Release preflight checks the release candidate on both Firecracker and
+Lima. Mutation testing and fuzzing run when selected during preflight.
 
 ## Release checklist
 

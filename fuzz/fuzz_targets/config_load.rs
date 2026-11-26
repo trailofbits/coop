@@ -3,16 +3,10 @@
 //! Fuzz target for the config loader: `toml::from_str` into
 //! [`coop::config::CoopConfig`] followed by [`CoopConfig::validate`].
 //!
-//! `config.toml` is user-editable input that crosses a trust boundary. The
-//! deserialize path runs the custom `Deserialize`/`visit_map` impls
-//! (`SubnetMask`, `HostInterface`, `PortForward`, …) and `validate` then
-//! checks the assembled config. There is no correctness oracle for arbitrary
-//! input, so the only property is **never panics, only returns `Err`**:
-//! libFuzzer reports any panic, abort, hang, or OOM as a crash.
-//!
-//! This deliberately exercises `from_str` + `validate` rather than
-//! `CoopConfig::load`, which touches the filesystem (tilde expansion, reading
-//! the file) and so is not a pure parser.
+//! Deserialization exercises custom field parsers, including `SubnetMask`,
+//! `HostInterface`, and `PortForward`. Validation also checks configured
+//! paths against the local filesystem. Both valid and invalid inputs must
+//! complete without panicking.
 //!
 //! [`CoopConfig::validate`]: coop::config::CoopConfig::validate
 

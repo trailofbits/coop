@@ -62,8 +62,7 @@ coop/
 │   └── commands/           # one module per command domain (see below)
 ├── coop-proxy/             # separate binary crate: credential injection, policy, TLS, jail
 ├── scripts/guest/          # guest-image provisioning scripts (embedded at build)
-├── guest/init.sh           # guest first-boot init
-├── tests/                  # integration test scripts (see AGENTS.md "Before committing")
+├── tests/                  # integration test scripts (see docs/testing.md)
 ├── fuzz/                   # cargo-fuzz targets (own workspace)
 └── docs/                   # this tree
 ```
@@ -203,7 +202,7 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
    allowlisted config files and a managed `settings.json`, and on first boot
    install the *delta* of marketplaces/plugins/MCP servers not already baked
    into the golden image.
-6. **Workspace** — `--workspace` copies via rsync; `--git-repo` clones inside
+6. **Workspace** — `coop up DIR` copies via rsync by default; `--git-repo` clones inside
    the guest; mounts are live on Lima and rsync'd on Firecracker. Persist
    `WorkspaceState`.
 7. **Creation hooks** — select a recipe before first boot and persist it in

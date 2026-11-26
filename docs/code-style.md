@@ -132,7 +132,7 @@ Before reviewing, sync to latest remote (`git fetch origin`).
    CLI's intentional output. Tracing goes to **stderr**.
 8. **Cross-platform.** Touching backend-shared code? Confirm the abstraction
    still holds for both Firecracker and Lima. Integration tests must run on both
-   platforms (see [`AGENTS.md`](../AGENTS.md) "Before committing").
+   platforms (see [validation before ready review](../AGENTS.md#validation-before-ready-review)).
 
 ## Authoring checklist
 
