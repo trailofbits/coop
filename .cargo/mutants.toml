@@ -145,6 +145,7 @@ exclude_re = [
   # PAT prompt adapters inspect ambient terminal state, write user guidance,
   # invoke the interactive wizard, or update the config file. Keep the pure
   # prompt-decision logic in mutation scope.
+  "src/pat_prompt\\.rs:.*<impl PromptIo for SystemPromptIo>",
   "src/pat_prompt\\.rs:.*\\bmaybe_prompt\\b",
   "src/pat_prompt\\.rs:.*\\bfinish_choice\\b",
   "src/pat_prompt\\.rs:.*\\bbind_after_wizard\\b",
