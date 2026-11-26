@@ -342,7 +342,7 @@ exclude_re = [
   # Linux allocation tests pin the isolated comparison; the macOS test pins
   # that Lima ignores the Firecracker network default. A Darwin mutation run
   # cannot observe this operator even though cargo-mutants discovers it.
-  "src/config\\.rs:.*replace == with != in CoopConfig::allocate_instance",
+  "src/config\\.rs:.*replace == with != in CoopConfig::allocate_for_provisioning",
 
   # ---- src/commands/ and the lib.rs/main.rs shims ----
   # The #321-#327 refactor split every command handler out of lib.rs into

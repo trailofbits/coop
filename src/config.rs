@@ -2638,6 +2638,16 @@ impl CoopConfig {
         image: &ImageName,
         workspace_path: Option<&Path>,
     ) -> Result<Instance> {
+        self.allocate_for_provisioning(name, image, workspace_path)
+            .map(|(inst, _lock)| inst)
+    }
+
+    pub(crate) fn allocate_for_provisioning(
+        &self,
+        name: Option<&InstanceName>,
+        image: &ImageName,
+        workspace_path: Option<&Path>,
+    ) -> Result<(Instance, crate::fs_util::FileLock)> {
         let _lock = lock_dir(&self.instances_dir())?;
 
         // A directory with unreadable metadata may own any index. Keep it
@@ -2709,8 +2719,11 @@ impl CoopConfig {
             image: image.clone(),
             firecracker_control,
         };
+        // Reserve provisioning before the name becomes visible. A stale or
+        // busy lock must not leave a VM registration that needs teardown.
+        let provisioning = crate::creation_hooks::try_lock_new_instance(&instance)?;
         instance.save()?;
-        Ok(instance)
+        Ok((instance, provisioning))
     }
 
     fn format_instance_list_or_none(&self) -> String {

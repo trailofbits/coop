@@ -150,8 +150,8 @@ shared SSH consumer continues through the same vsock target.
 An instance operation lock is held from the stopped-state probe through disk
 resize, commit, or restore. Start, stop, and destroy acquire the same bounded
 lock. Its file is a sibling of the instance directory, so directory removal
-does not replace the lock inode. Allocation releases its directory lock before
-any instance operation lock is acquired.
+does not replace the lock inode. Allocation reserves the new name’s provisioning lock without waiting before
+publishing the instance. It releases its directory lock before boot.
 
 ## Command dispatch
 

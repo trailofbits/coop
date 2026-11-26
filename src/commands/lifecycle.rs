@@ -733,18 +733,13 @@ fn allocate_and_start(
         // necessarily contain the guest listener required by vsock control.
         be.validate_image_control(cfg, image, cfg.vm.firecracker_control)?;
     }
-    let inst = cfg.allocate_instance(name, image, workspace_path)?;
+    let (inst, _provisioning) = cfg.allocate_for_provisioning(name, image, workspace_path)?;
     tracing::info!("Starting instance '{}' (index {})", inst.name, inst.index);
 
     let _guard = signal::install_handlers();
-    // Keep the global lock order consistent with reprovisioning: an instance's
-    // provisioning lock is always acquired before its image publication lock.
-    // Re-lock and revalidate the image immediately before the backend consumes
-    // it, since a commit could have replaced it after the pre-allocation check.
-    let result = (|| {
-        let _provisioning = crate::creation_hooks::lock_provisioning(&inst)?;
-        start_instance(be, &mut *cfg, &inst, opts, Some(image))
-    })();
+    // Revalidate under the image lock before consuming the image. A commit
+    // could have replaced it after the pre-allocation check.
+    let result = start_instance(be, &mut *cfg, &inst, opts, Some(image));
 
     if let Err(error) = &result
         && error.is::<crate::creation_hooks::CreationIncomplete>()
@@ -3656,7 +3651,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn fresh_creation_cleans_up_when_provisioning_lock_cannot_open() {
+    fn fresh_creation_does_not_publish_when_provisioning_lock_cannot_open() {
         let root = private_test_root();
         let mut cfg = cfg_with_data_dir(root.path().join("data"));
         let image = super::config::ImageName::new("legacy").unwrap();
