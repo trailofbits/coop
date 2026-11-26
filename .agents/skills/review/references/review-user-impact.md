@@ -13,8 +13,9 @@ For each affected user task, inspect the normal path and failure/recovery on
 both VM backends where applicable. Check steps, prompts, latency, existing
 configuration and scripts, actionable errors, and whether users can still
 complete or recover the task. For security changes, identify the protected
-boundary and compare concrete alternatives that meet the same objective with
-less friction. Do not propose weakening a required control to improve UX.
+boundary and compare concrete alternatives that meet the same security and
+failure objective. Assess friction, reliability, recovery, and operational cost
+together. Do not propose weakening a required control to improve UX.
 
 Flag a credible, material downside that is unexamined, misstated, or needs a
 requester decision. Provide evidence, the affected task, the benefit, and a

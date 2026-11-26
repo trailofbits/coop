@@ -145,6 +145,7 @@ exclude_re = [
   # PAT prompt adapters inspect ambient terminal state, write user guidance,
   # invoke the interactive wizard, or update the config file. Keep the pure
   # prompt-decision logic in mutation scope.
+  "src/pat_prompt\\.rs:.*<impl PromptIo for SystemPromptIo>",
   "src/pat_prompt\\.rs:.*\\bmaybe_prompt\\b",
   "src/pat_prompt\\.rs:.*\\bfinish_choice\\b",
   "src/pat_prompt\\.rs:.*\\bbind_after_wizard\\b",
@@ -504,13 +505,14 @@ exclude_re = [
 
   # ---- coop agent update (#402): in-guest agent refresh ----
   # The pure logic is extracted and unit-tested in scope: AgentSelection
-  # (from_flags / agents), Agent (display / strategy), AgentVersion::parse
-  # (+ from_token), check_status, check_report / check_line, outcome_line,
-  # and selection_phrase. What is excluded below drives SSH into the guest,
-  # hits the GitHub release API, writes stdout, or resolves a guest binary
-  # path from a live session — none observable from a `--lib` test.
-  # (cmd_agent_update itself is covered by the module-wide `\bcmd_[a-z_]+\b`.)
-  # tests/integration.sh exercises the end-to-end update/check on both backends.
+  # (new / agents), Agent (display / strategy), AgentVersion::parse (+
+  # from_token), check_status, check_report / check_line, and outcome_line.
+  # What is excluded below drives SSH into the guest, hits the GitHub release
+  # API, writes stdout, or resolves a guest binary path from a live session —
+  # none observable from a `--lib` test. (The command entry points themselves
+  # are covered by the module-wide `\bcmd_[a-z_]+\b`.) tests/integration.sh
+  # exercises the end-to-end update/status paths on both backends.
+  "\\bagent_session\\b",
   "\\brun_updates\\b",
   "\\brun_check\\b",
   "\\bupdate_one\\b",

@@ -1,10 +1,10 @@
-//! `coop agent update` — refresh the coding-agent binaries inside a running VM.
+//! `coop agent update` / `status` — maintain coding agents inside a running VM.
 //!
 //! The three agents are installed "latest at build time" during `coop setup`, so
 //! they go stale in long-running VMs and in VMs created from an old image.
-//! This command updates them in place against a *running* instance, without
-//! rebuilding the golden image (`coop setup --rebuild` remains the path for
-//! refreshing the image itself).
+//! `agent update` refreshes them in place against a *running* instance without
+//! rebuilding the golden image; `agent status` only reports their versions.
+//! `coop setup --rebuild` remains the path for refreshing the image itself.
 //!
 //! The agents differ in how they update, and the difference is encoded in
 //! [`UpdateStrategy`] so no caller can run the wrong one:
@@ -14,11 +14,11 @@
 //!   to refresh the package or migrate an older direct-binary installation.
 //!   The guest user can also run `codex update` directly.
 //! - **Claude Code** lives in the guest user's `~/.local/bin` and already
-//!   auto-updates in the background. `coop agent update --claude` just runs
+//!   auto-updates in the background. `coop agent update --agent claude` just runs
 //!   `claude update` synchronously as the guest user — a convenience, not a
 //!   fix.
 //! - **Grok Build** lives in the guest user's `~/.grok/bin` and already
-//!   auto-updates in the background. `coop agent update --grok` runs
+//!   auto-updates in the background. `coop agent update --agent grok` runs
 //!   `grok update` synchronously as the guest user.
 
 use std::io::Write as _;
@@ -29,16 +29,9 @@ use semver::Version;
 use crate::backend::{self, SshSession};
 use crate::paths::GuestPath;
 use crate::remote_command::RemoteCommand;
-use crate::{config, guest, prompt, update};
+use crate::{config, guest, update};
 
 use super::{prepare_session_from_target, resolve_running};
-
-/// Options for `coop agent update`, parsed from the CLI flags.
-pub(crate) struct AgentUpdateOpts {
-    pub selection: AgentSelection,
-    pub check: bool,
-    pub yes: bool,
-}
 
 /// The `openai/codex` release feed coop compares the guest binary against.
 const CODEX_REPO: &str = "openai/codex";
@@ -46,15 +39,17 @@ const CODEX_REPO: &str = "openai/codex";
 // ── Domain types ──────────────────────────────────────────────
 
 /// A coding agent coop can update inside the guest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Agent {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+pub(crate) enum Agent {
     Claude,
     Codex,
     Grok,
 }
 
 impl Agent {
-    /// Human-facing label used in prompts, reports, and errors.
+    const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Grok];
+
+    /// Human-facing label used in reports and errors.
     fn display(self) -> &'static str {
         match self {
             Self::Claude => "Claude Code",
@@ -85,35 +80,28 @@ enum UpdateStrategy {
     SelfUpdate,
 }
 
-/// Which agents a single `coop agent update` invocation targets. No
+/// Which agents a single `coop agent` invocation targets. No
 /// construction can represent "update nothing", so [`agents`](Self::agents)
 /// is always non-empty.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AgentSelection {
-    agents: &'static [Agent],
+    agents: Vec<Agent>,
 }
 
 impl AgentSelection {
-    /// Map the CLI booleans to a selection. Selection is additive: no
-    /// flag, or every flag, means every agent.
-    pub(crate) fn from_flags(claude: bool, codex: bool, grok: bool) -> Self {
-        Self {
-            agents: match (claude, codex, grok) {
-                (false, false, false) | (true, true, true) => {
-                    &[Agent::Claude, Agent::Codex, Agent::Grok]
-                }
-                (true, false, false) => &[Agent::Claude],
-                (false, true, false) => &[Agent::Codex],
-                (false, false, true) => &[Agent::Grok],
-                (true, true, false) => &[Agent::Claude, Agent::Codex],
-                (true, false, true) => &[Agent::Claude, Agent::Grok],
-                (false, true, true) => &[Agent::Codex, Agent::Grok],
-            },
+    /// Build a canonical non-empty selection. Omitting `--agent` means all
+    /// supported agents; repeated selectors are deduplicated.
+    pub(crate) fn new(mut agents: Vec<Agent>) -> Self {
+        if agents.is_empty() {
+            agents.extend(Agent::ALL);
         }
+        agents.sort_unstable();
+        agents.dedup();
+        Self { agents }
     }
 
-    fn agents(self) -> &'static [Agent] {
-        self.agents
+    fn agents(&self) -> &[Agent] {
+        &self.agents
     }
 }
 
@@ -169,7 +157,7 @@ enum UpdateOutcome {
     },
 }
 
-/// Version-comparison result for `--check`, never a sentinel.
+/// Version-comparison result for the status report, never a sentinel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CheckStatus {
     UpToDate,
@@ -181,7 +169,7 @@ enum CheckStatus {
     Unknown,
 }
 
-/// One row of the `--check` report.
+/// One row of the status report.
 struct CheckRow {
     agent: Agent,
     installed: Option<AgentVersion>,
@@ -195,43 +183,32 @@ pub(crate) fn cmd_agent_update(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     name: Option<&config::InstanceName>,
-    opts: &AgentUpdateOpts,
+    selection: &AgentSelection,
 ) -> Result<()> {
-    // Resolve the running instance once (a stopped/missing one errors here
-    // with the shared "not running" guidance), then build the SSH session
-    // from it — this mirrors `open_ssh_session` but keeps the instance name
-    // for the confirmation prompt and messages without a second lookup.
-    let running = resolve_running(be, cfg, name)?;
-    let inst_name = running.instance().name.to_string();
-    let (inst, target) = running.into_parts();
-    let session = prepare_session_from_target(cfg, &inst, target)?;
-
-    if opts.check {
-        return run_check(&session, opts.selection);
-    }
-
-    if !opts.yes
-        && !prompt::confirm(&format!(
-            "Update {} in '{inst_name}' to the latest version?",
-            selection_phrase(opts.selection),
-        ))?
-    {
-        tracing::info!("Update cancelled");
-        return Ok(());
-    }
-
-    run_updates(&session, opts.selection)
+    let session = agent_session(be, cfg, name)?;
+    run_updates(&session, selection)
 }
 
-/// Comma/and-joined agent names for the confirmation prompt.
-fn selection_phrase(selection: AgentSelection) -> String {
-    let labels: Vec<&str> = selection.agents().iter().map(|a| a.display()).collect();
-    match labels.as_slice() {
-        [] => unreachable!("AgentSelection is never empty"),
-        [one] => (*one).to_string(),
-        [a, b] => format!("{a} and {b}"),
-        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
-    }
+pub(crate) fn cmd_agent_status(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    name: Option<&config::InstanceName>,
+    selection: &AgentSelection,
+) -> Result<()> {
+    let session = agent_session(be, cfg, name)?;
+    run_check(&session, selection)
+}
+
+/// Resolve the running instance once (a stopped/missing one errors with the
+/// shared "not running" guidance), then prepare its SSH session.
+fn agent_session(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    name: Option<&config::InstanceName>,
+) -> Result<SshSession> {
+    let running = resolve_running(be, cfg, name)?;
+    let (inst, target) = running.into_parts();
+    prepare_session_from_target(cfg, &inst, target)
 }
 
 // ── Update path ───────────────────────────────────────────────
@@ -239,7 +216,7 @@ fn selection_phrase(selection: AgentSelection) -> String {
 /// Update every selected agent, printing each result. Continues past a
 /// per-agent failure and returns an error only after all have run, so a
 /// multi-agent update reports every outcome even when one fails.
-fn run_updates(session: &SshSession, selection: AgentSelection) -> Result<()> {
+fn run_updates(session: &SshSession, selection: &AgentSelection) -> Result<()> {
     let out = &mut std::io::stdout();
     let mut failed = false;
     for &agent in selection.agents() {
@@ -317,11 +294,11 @@ fn self_update(session: &SshSession, agent: Agent) -> Result<()> {
         .exec(RemoteCommand::new().arg(bin).literal(" update"))
 }
 
-// ── Check path ────────────────────────────────────────────────
+// ── Status path ───────────────────────────────────────────────
 
 /// Report installed-vs-latest versions for the selected agents. Mutates
 /// nothing; degrades to `Unknown` when a version can't be determined.
-fn run_check(session: &SshSession, selection: AgentSelection) -> Result<()> {
+fn run_check(session: &SshSession, selection: &AgentSelection) -> Result<()> {
     let rows: Vec<CheckRow> = selection
         .agents()
         .iter()
@@ -351,7 +328,7 @@ fn check_row(session: &SshSession, agent: Agent) -> CheckRow {
 }
 
 /// Best-effort lookup of the newest Codex release tag. Network failures
-/// degrade to `None` (reported as `Unknown`) rather than aborting the check.
+/// degrade to `None` (reported as `Unknown`) rather than aborting the status report.
 fn codex_latest() -> Option<AgentVersion> {
     match update::latest_release_tag(CODEX_REPO) {
         Ok(tag) => AgentVersion::parse(&tag).ok(),
@@ -397,7 +374,7 @@ fn outcome_line(agent: Agent, outcome: &UpdateOutcome) -> String {
     }
 }
 
-/// Build the `--check` report lines: one aligned row per agent.
+/// Build the `agent status` report lines: one aligned row per agent.
 fn check_report(rows: &[CheckRow]) -> Vec<String> {
     rows.iter().map(check_line).collect()
 }
@@ -416,7 +393,7 @@ fn check_line(row: &CheckRow) -> String {
                 .map_or_else(|| "?".to_string(), AgentVersion::to_string);
             (
                 format!("{installed} → {latest}"),
-                "update available — run: coop agent update --codex".to_string(),
+                "update available — run: coop agent update --agent codex".to_string(),
             )
         }
         CheckStatus::AutoUpdates => (
@@ -462,79 +439,26 @@ mod tests {
     // ── selection ──────────────────────────────────────────────
 
     #[test]
-    fn from_flags_maps_every_combination() {
+    fn empty_selection_defaults_to_every_agent() {
         assert_eq!(
-            AgentSelection::from_flags(true, false, false).agents(),
-            &[Agent::Claude]
-        );
-        assert_eq!(
-            AgentSelection::from_flags(false, true, false).agents(),
-            &[Agent::Codex]
-        );
-        assert_eq!(
-            AgentSelection::from_flags(false, false, true).agents(),
-            &[Agent::Grok]
-        );
-        assert_eq!(
-            AgentSelection::from_flags(false, false, false).agents(),
+            AgentSelection::new(Vec::new()).agents(),
             &[Agent::Claude, Agent::Codex, Agent::Grok]
         );
+    }
+
+    #[test]
+    fn selection_is_sorted_and_deduplicated() {
         assert_eq!(
-            AgentSelection::from_flags(true, true, true).agents(),
-            &[Agent::Claude, Agent::Codex, Agent::Grok]
-        );
-        assert_eq!(
-            AgentSelection::from_flags(true, true, false).agents(),
-            &[Agent::Claude, Agent::Codex]
-        );
-        assert_eq!(
-            AgentSelection::from_flags(true, false, true).agents(),
-            &[Agent::Claude, Agent::Grok]
-        );
-        assert_eq!(
-            AgentSelection::from_flags(false, true, true).agents(),
+            AgentSelection::new(vec![Agent::Grok, Agent::Codex, Agent::Grok]).agents(),
             &[Agent::Codex, Agent::Grok]
         );
     }
 
     #[test]
-    fn agents_is_never_empty_and_pairs_list_two() {
-        assert!(
-            !AgentSelection::from_flags(false, false, false)
-                .agents()
-                .is_empty()
-        );
+    fn explicit_single_selection_is_preserved() {
         assert_eq!(
-            AgentSelection::from_flags(true, false, false).agents(),
+            AgentSelection::new(vec![Agent::Claude]).agents(),
             &[Agent::Claude]
-        );
-        assert_eq!(
-            AgentSelection::from_flags(false, true, false).agents(),
-            &[Agent::Codex]
-        );
-        assert_eq!(
-            AgentSelection::from_flags(true, true, false).agents().len(),
-            2
-        );
-    }
-
-    #[test]
-    fn selection_phrase_joins_with_and() {
-        assert_eq!(
-            selection_phrase(AgentSelection::from_flags(true, false, false)),
-            "Claude Code"
-        );
-        assert_eq!(
-            selection_phrase(AgentSelection::from_flags(false, true, false)),
-            "Codex"
-        );
-        assert_eq!(
-            selection_phrase(AgentSelection::from_flags(true, true, false)),
-            "Claude Code and Codex"
-        );
-        assert_eq!(
-            selection_phrase(AgentSelection::from_flags(false, false, false)),
-            "Claude Code, Codex, and Grok Build"
         );
     }
 
@@ -639,7 +563,7 @@ mod tests {
         };
         let line = check_line(&row);
         assert!(line.contains("0.4.1 → 0.5.0"), "{line}");
-        assert!(line.contains("coop agent update --codex"), "{line}");
+        assert!(line.contains("coop agent update --agent codex"), "{line}");
     }
 
     #[test]

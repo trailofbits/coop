@@ -4,6 +4,11 @@
 
 ### Changed
 
+- Simplify agent maintenance commands. Select agents with repeatable
+  `--agent <claude|codex|grok>` arguments, use `coop agent status` for the
+  former `agent update --check` report, and run `coop agent update`
+  immediately without a confirmation prompt. Remove the `--claude`, `--codex`,
+  `--grok`, `--check`, and `--yes` update flags.
 - Remove `coop quickstart`. Run `coop setup` once, then `coop up` from the
   project directory and launch an agent with `coop codex`, `coop claude`, or
   `coop grok` (pass the VM name when several are running). For a scratch VM,
