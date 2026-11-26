@@ -6,7 +6,9 @@ use std::fmt;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CoopConfig, CustomProfile};
+#[cfg(any(target_os = "macos", test))]
+use crate::config::CoopConfig;
+use crate::config::CustomProfile;
 use crate::paths::GuestPath;
 
 /// Default guest username.
@@ -443,6 +445,7 @@ pub fn lookup_profile(name: &str, custom: &HashMap<String, CustomProfile>) -> Re
 
 /// Collect combined marketplace and plugin lists from global config
 /// and all active profiles. Results are sorted and deduplicated.
+#[cfg(any(target_os = "macos", test))]
 pub fn collect_baked_lists(
     cfg: &CoopConfig,
     profiles: &[ProfileDef],
@@ -467,6 +470,7 @@ pub fn collect_baked_lists(
 /// Results are sorted and deduplicated. Unlike [`collect_baked_lists`],
 /// profiles contribute nothing here: profile plugin lists are
 /// Claude-only, so Codex plugins come solely from `[codex]`.
+#[cfg(any(target_os = "macos", test))]
 pub fn collect_codex_baked_lists(cfg: &CoopConfig) -> (Vec<String>, Vec<String>) {
     let mut marketplaces = cfg.codex.marketplaces.clone();
     let mut plugins = cfg.codex.plugins.clone();
@@ -482,6 +486,7 @@ pub fn collect_codex_baked_lists(cfg: &CoopConfig) -> (Vec<String>, Vec<String>)
 /// Collect Grok Build marketplace and plugin lists from global config.
 /// Results are sorted and deduplicated. Profiles contribute nothing here:
 /// profile plugin lists are Claude-only.
+#[cfg(any(target_os = "macos", test))]
 pub fn collect_grok_baked_lists(cfg: &CoopConfig) -> (Vec<String>, Vec<String>) {
     let mut marketplaces = cfg.grok.marketplaces.clone();
     let mut plugins = cfg.grok.plugins.clone();

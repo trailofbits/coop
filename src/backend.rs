@@ -255,8 +255,10 @@ pub(crate) fn lock_instance_operation(inst: &Instance) -> Result<FileLock> {
 
 // ── SSH target ────────────────────────────────────────────────
 
+#[cfg(any(target_os = "macos", test))]
 const MAX_HOSTNAME_LEN: usize = 253;
 
+#[cfg(any(target_os = "macos", test))]
 fn validate_hostname(name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("Hostname must not be empty");
@@ -284,6 +286,7 @@ fn validate_hostname(name: &str) -> Result<()> {
 pub struct Hostname(String);
 
 impl Hostname {
+    #[cfg(any(target_os = "macos", test))]
     pub fn new(name: impl Into<String>) -> Result<Self> {
         let name = name.into();
         validate_hostname(&name)?;
