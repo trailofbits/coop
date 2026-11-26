@@ -56,41 +56,31 @@ Omit generated files such as `Cargo.lock`, completions, and snapshots from the
 verbatim packet, but record their names and sizes and inspect them where a
 cross-file invariant depends on them.
 
-## 3. Assess the problem and solution
+## 3. Check solution fit before implementation detail
 
-Before inspecting local code quality, reconstruct what users do today, the
-observed failure or security boundary, and the outcome the change must preserve
-on success and failure. Check the PR's account against the linked issue,
-existing code and tests, and relevant user documentation. If evidence is
-missing, name the uncertainty; do not silently adopt the proposed
-implementation as the requirement.
+Reconstruct the user task or security invariant, observed failure, and required
+success and recovery behavior from the evidence packet. Treat the PR's account
+as a hypothesis. Read the design and user-impact lens files in full, then run
+them first; the design lens contains the detailed alternative and design checks.
+For a security-sensitive choice, read the trust model and trace enough of the
+boundary to assess it.
 
-For a substantive behavior change, seek at least one concrete alternative,
-including an existing coop or platform mechanism when one fits. Compare each
-candidate against the same failure and security contract: normal use, partial
-failure, timeout, cleanup, recovery, compatibility, and both backends where
-relevant. Check new state, migrations, dependencies, and operational costs.
-Fewer lines or less user friction alone do not make an alternative safer or
-more reliable. If no credible alternative exists, say why.
-For a mechanical or docs-only change, a short statement of the task and why
-the approach fits is enough.
+If the proposed solution demonstrably cannot meet a core requirement, or a
+missing requirement prevents judging whether it can, stop the detailed review.
+Report the evidence, alternative or missing decision, and a **design blocked**
+verdict. Name the lenses not run and require a full review after the design is
+resolved. Do not treat a partial review as approval. Continue when uncertainty
+does not prevent evaluating the approach, and report that uncertainty.
 
-Record a brief assessment and recommendation with evidence: whether the
-solution addresses the problem, whether a material choice remains for the
-requester, and which assumptions need validation. If the approach fits, assess
-its design separately: where authority is checked, which states can exist, how
-failures are diagnosed, and whether resources and recovery remain bounded.
-Keep this assessment separate from diff-anchored findings; an unresolved
-solution choice need not be invented as an inline code defect.
-
-## 4. Run independent lenses
+## 4. Run the remaining lenses
 
 The detailed lens prompts live in [`references/`](references/). Read every
-selected lens file in full before starting it; the summaries below select the
-lenses but do not replace their project-specific checks.
+remaining selected lens file in full before starting it; the summaries below
+select the lenses but do not replace their project-specific checks.
 
-If parallel subagents are available, delegate the applicable lenses
-concurrently and pass the same packet to each. Otherwise run them sequentially.
+After the solution gate passes, delegate the remaining applicable lenses
+concurrently if parallel subagents are available, passing the same packet to
+each. Otherwise run them sequentially.
 Each reviewer starts from fresh eyes and treats the coordinator's problem
 account as a hypothesis. Findings must be diff-introduced issues (or a latent
 issue made reachable by the diff), with file, changed line, severity, finding,
@@ -98,17 +88,20 @@ and concrete evidence. The design lens also returns its independent solution
 assessment. Touched symbols locate changed code but do not limit inspection of
 relevant callers, consumers, workflows, or existing mechanisms.
 
-Always run:
+Run at the solution gate:
 
-- **Correctness:** conditions, boundaries, error propagation, process/resource
-  lifetime, partial failure, retry, timeout, stale state, and both VM backends.
 - **Design:** solution fit against the stated failure contract, simpler existing
   primitives, dead indirection, impossible states, phantom features, and
   independently supported structural concerns.
-- **Conventions:** project Rust idioms, rename completeness, shared constants,
-  mutation scope, cross-file synchronization, and diff noise.
 - **User impact:** follow [`docs/user-impact.md`](../../../docs/user-impact.md)
   for affected user tasks and material trade-offs.
+
+Always run after the gate passes:
+
+- **Correctness:** conditions, boundaries, error propagation, process/resource
+  lifetime, partial failure, retry, timeout, stale state, and both VM backends.
+- **Conventions:** project Rust idioms, rename completeness, shared constants,
+  mutation scope, cross-file synchronization, and diff noise.
 
 Run when triggered:
 
@@ -128,9 +121,9 @@ Run when triggered:
 - **Comments:** keep non-obvious durable rationale; flag narration, history,
   stale claims, and comments that merely restate code.
 
-Docs-only diffs need conventions and docs. For the always-run user-impact lens,
-record when a docs-only change affects no user task. Skip comments only when no
-code comment or adjacent behavior changed. Record every skipped lens and why.
+Docs-only diffs need conventions and docs after the solution gate; record when
+they affect no user task. Skip comments only when no code comment or adjacent
+behavior changed. Record every skipped lens and why.
 
 ## 5. Apply the learned adversarial checks
 
@@ -249,11 +242,14 @@ it wrong. For external API claims, cite the primary versioned source.
 
 ## 7. Report or post
 
-Lead with findings ordered by severity, each with a precise file and line.
-Include a concise evidence paragraph and avoid speculative wording. Then give
-the problem, alternatives considered where applicable, the solution and design
-assessment, and any unverified assumption or material requester decision. State
-the assessment even when no diff-anchored finding survives. Then state:
+If the solution gate blocked the full review, lead with **design blocked**, the
+problem and evidence, the alternative or decision needed, and the lenses not
+run. State that implementation has not received a complete review. Otherwise
+lead with findings ordered by severity, each with a precise file and line and
+concise evidence. Then give the problem, applicable alternatives, solution and
+design assessment, and any unverified assumption or material requester
+decision. State the assessment even when no diff-anchored finding survives.
+Avoid speculative wording. Then state:
 
 - lenses run and skipped;
 - commands/reproductions performed;

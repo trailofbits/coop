@@ -37,6 +37,9 @@ look for invalid states or redundant layers, and follow failure diagnosis and
 cleanup through the complete lifecycle. State whether the solution fits, the
 design supports it, and what remains unverified or needs a requester decision.
 This assessment is required even if there is no diff-anchored finding.
+If a core requirement is unknown or the approach cannot meet it, return that
+assessment and any confirmed structural finding without spending time on local
+implementation nits. The coordinator will report a partial, blocked review.
 
 ## What to flag
 
