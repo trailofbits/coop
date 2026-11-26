@@ -788,7 +788,9 @@ test_selective_image() {
     local image="selective-codex" vm="${INSTANCE}-selective"
     mkdir -p "$tmpdir/selective-ws"
 
+    local setup_started=$SECONDS
     if coop setup -y --image "$image" --agent codex --rebuild; then
+        printf 'TIMING setup:codex-only %ds\n' "$((SECONDS - setup_started))"
         pass "Codex-only image setup"
     else
         fail "Codex-only image setup" "$HARNESS_ERR"
@@ -798,6 +800,7 @@ test_selective_image() {
 import json, sys
 images = json.load(sys.stdin)
 assert next(i for i in images if i["name"] == "selective-codex")["agents"] == ["codex"]
+print("IMAGE_SIZE codex-only", next(i for i in images if i["name"] == "selective-codex")["size_bytes"])
 '; then
         pass "image JSON records only Codex"
     else

@@ -263,17 +263,13 @@ pub const SCRIPT_CODEX: &str = include_str!("../scripts/guest/codex.sh");
 pub const SCRIPT_CODEX_ACCOUNT: &str = include_str!("../scripts/guest/codex-account.sh");
 pub const SCRIPT_GROK: &str = include_str!("../scripts/guest/grok.sh");
 
-/// Packages installed into every golden image.
+/// Candidate base packages for golden images.
 ///
 /// `dbus-user-session`, `gnome-keyring`, and `libsecret-tools` back the
 /// Secret Service that `codex-account` needs under `[codex] auth =
-/// "chatgpt"`. They are unconditional rather than gated on that config field
-/// on purpose: the golden image is built once by `coop setup` and reused
-/// across configs, so gating them would let a later `auth = "chatgpt"` edit
-/// meet an image that cannot serve it — a silent skew that surfaces only at
-/// `coop codex` time. The cost is the same for everyone (see
-/// `docs/images-and-profiles.md`); the wrapper stays a no-op passthrough
-/// unless the guest Codex config actually asks for the keyring.
+/// "chatgpt"`. Images containing Codex include them regardless of that
+/// config field because the image can be reused after an auth-mode change.
+/// [`base_packages_for_agents`] removes them when Codex is absent.
 pub const BASE_PACKAGES: &[&str] = &[
     "openssh-server",
     "dbus-user-session",

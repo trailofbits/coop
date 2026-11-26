@@ -1641,7 +1641,7 @@ fn compose_recipe_for_agents(
         s.push_str("exit 1\n");
     }
 
-    // Guest config configures the guest user — must come before claude-code.
+    // Guest config sets the user and shortcuts before selected installers run.
     s.push_str(SCRIPT_GUEST_CONFIG);
     // Direct binary download (runs as root in chroot, installs for guest user).
     if agents.contains(crate::agents::AgentId::Claude) {

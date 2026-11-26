@@ -90,6 +90,10 @@ mod tests {
         let set = AgentSet::new(vec![AgentId::Grok, AgentId::Codex, AgentId::Grok]).unwrap();
         assert_eq!(set.as_slice(), &[AgentId::Codex, AgentId::Grok]);
         assert_eq!(serde_json::to_string(&set).unwrap(), r#"["codex","grok"]"#);
+        assert_eq!(set.names(), "codex,grok");
+        assert_eq!(AgentId::Claude.display(), "Claude Code");
+        assert_eq!(AgentId::Codex.display(), "Codex");
+        assert_eq!(AgentId::Grok.display(), "Grok Build");
         assert!(serde_json::from_str::<AgentSet>("[]").is_err());
         assert!(serde_json::from_str::<AgentSet>(r#"["unknown"]"#).is_err());
     }

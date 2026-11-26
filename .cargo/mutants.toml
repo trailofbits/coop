@@ -544,6 +544,7 @@ exclude_re = [
   "src/proxy\\.rs:.*\\bstop_pid_file_checked\\b",
   "src/proxy\\.rs:.*\\bwrite_process_record\\b",
   "src/proxy\\.rs:.*\\bprocess_start_identity\\b",
+  "src/proxy\\.rs:.*\\bsignal_managed_process\\b",
   "src/proxy\\.rs:.*\\bread_process_record\\b",
   "src/proxy\\.rs:.*\\bstop\\b",
   "src/proxy\\.rs:.*\\bstop_provider\\b",

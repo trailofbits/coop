@@ -75,9 +75,13 @@ fn run_setup(
     };
 
     if let Some(inst) = &inst {
-        let agents = crate::restore_intent::RestoreIntent::load(inst)?
-            .map(|intent| intent.template.agents)
-            .map_or_else(|| inst.agents(), Ok)?;
+        let intent = crate::restore_intent::RestoreIntent::load(inst)?;
+        let agents = if let Some(intent) = &intent {
+            intent.template.agents.clone()
+        } else {
+            inst.agents()?
+        };
+        let image = intent.as_ref().map_or(&inst.image, |intent| &intent.image);
         let agent = match provider {
             Provider::Anthropic => crate::agents::AgentId::Claude,
             Provider::Openai => crate::agents::AgentId::Codex,
@@ -85,7 +89,7 @@ fn run_setup(
         if !agents.contains(agent) {
             bail!(
                 "Image '{}' for VM '{}' does not include {}; use a VM built with `--agent {}` or configure a global proxy default for other VMs",
-                inst.image,
+                image,
                 inst.name,
                 agent.display(),
                 agent.name(),

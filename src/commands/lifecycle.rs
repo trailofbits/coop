@@ -2012,8 +2012,7 @@ pub(crate) fn prepare_session_from_target(
     // mode it is the per-instance capability token (the raw key stays on
     // the host). Claude's token rides in settings.json instead. The two
     // modes are mutually exclusive (mode is Local or Remote).
-    if !isolated
-        && model.mode == model_state::ModelMode::Local
+    if codex_local_key_enabled(&agents, isolated, model.mode)
         && let Some(ep) = model.resolved_codex(&cfg.codex)
     {
         env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default())?;
@@ -2023,6 +2022,14 @@ pub(crate) fn prepare_session_from_target(
         env.set(model_state::CODEX_LOCAL_ENV_KEY, token)?;
     }
     Ok(backend::SshSession { target, env })
+}
+
+fn codex_local_key_enabled(
+    agents: &crate::agents::AgentSet,
+    isolated: bool,
+    mode: model_state::ModelMode,
+) -> bool {
+    agents.contains(AgentKind::Codex) && !isolated && mode == model_state::ModelMode::Local
 }
 
 pub(crate) fn cmd_stop(
@@ -3293,6 +3300,35 @@ mod proofs {
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
     use crate::backend::VmBackend as _;
+
+    #[test]
+    fn codex_local_key_requires_codex_in_an_open_network_image() {
+        use crate::agents::{AgentId, AgentSet};
+        use crate::model_state::ModelMode;
+
+        let claude = AgentSet::new(vec![AgentId::Claude]).unwrap();
+        let codex = AgentSet::new(vec![AgentId::Codex]).unwrap();
+        assert!(!super::codex_local_key_enabled(
+            &claude,
+            false,
+            ModelMode::Local
+        ));
+        assert!(!super::codex_local_key_enabled(
+            &codex,
+            true,
+            ModelMode::Local
+        ));
+        assert!(!super::codex_local_key_enabled(
+            &codex,
+            false,
+            ModelMode::Remote
+        ));
+        assert!(super::codex_local_key_enabled(
+            &codex,
+            false,
+            ModelMode::Local
+        ));
+    }
 
     #[test]
     fn instance_list_groups_running_before_stopped() {

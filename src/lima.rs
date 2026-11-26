@@ -2068,7 +2068,7 @@ fn compose_provision_script_for_agents(
         }
     }
 
-    // Guest configuration configures the guest user — must come before claude-code install
+    // Guest configuration sets the user before selected installers run.
     s.push_str(&compose_lima_guest_config(ssh_pubkey, guest_user, agents));
     // Claude Code (direct binary download, runs as root, chowns to claude)
     if agents.contains(AgentId::Claude) {

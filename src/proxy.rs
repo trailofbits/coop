@@ -545,6 +545,59 @@ fn read_process_record(path: &Path) -> Result<Option<ProcessRecord>> {
     Ok(Some(record))
 }
 
+#[cfg(target_os = "linux")]
+fn signal_managed_process(pid: i32, start_identity: u64) -> Result<()> {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+
+    // Pin the process before checking identity. A PID reused after the check
+    // cannot redirect pidfd_send_signal to a different process.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(error).context("Failed to pin managed process for teardown");
+    }
+    // SAFETY: pidfd_open returned a new owned file descriptor.
+    let fd = unsafe { OwnedFd::from_raw_fd(i32::try_from(raw)?) };
+    anyhow::ensure!(
+        process_start_identity(pid)? == Some(start_identity),
+        "Managed process PID {pid} changed identity before teardown"
+    );
+    let sent = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            std::os::fd::AsRawFd::as_raw_fd(&fd),
+            libc::SIGTERM,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if sent < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).context("Failed to signal pinned managed process");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn signal_managed_process(pid: i32, start_identity: u64) -> Result<()> {
+    anyhow::ensure!(
+        process_start_identity(pid)? == Some(start_identity),
+        "Managed process PID {pid} changed identity before teardown"
+    );
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).context("Failed to signal managed process");
+        }
+    }
+    Ok(())
+}
+
 fn stop_pid_file_checked(path: &Path, label: &str) -> Result<()> {
     let Some(record) = read_process_record(path)? else {
         return Ok(());
@@ -567,14 +620,7 @@ fn stop_pid_file_checked(path: &Path, label: &str) -> Result<()> {
             "{label} PID {pid} at {} now belongs to a different process; inspect the host before retrying",
             path.display()
         );
-        // SAFETY: identity was checked immediately before signalling. A rare
-        // concurrent PID reuse is still bounded by the checked post-signal wait.
-        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error).context("Failed to signal managed process");
-            }
-        }
+        signal_managed_process(pid, recorded_start)?;
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             // Reap a direct child when this CLI still owns it; ECHILD is normal
@@ -1743,6 +1789,30 @@ mod tests {
         stop_provider_checked(&inst, Provider::Openai).unwrap();
         assert!(!path.exists());
         assert!(!token_path(&inst, "openai").exists());
+    }
+
+    #[test]
+    fn mismatched_managed_pid_record_never_signals_process() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut inst = inst_with_index(0);
+        inst.dir = tmp.path().to_path_buf();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let path = pid_path(&inst, "openai");
+        let identity = process_start_identity(i32::try_from(child.id()).unwrap())
+            .unwrap()
+            .unwrap();
+        let record = ManagedProcessRecord {
+            pid: i32::try_from(child.id()).unwrap(),
+            start_identity: identity + 1,
+        };
+        fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+
+        let error = stop_provider_checked(&inst, Provider::Openai).unwrap_err();
+        assert!(error.to_string().contains("different process"));
+        assert!(path.exists());
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

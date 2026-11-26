@@ -522,7 +522,8 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   A VM's copied image contract records which agents coop installed. Boot and
   session preparation resolve credentials and start proxies only for those
   agents. Proxy teardown checks a recorded process start identity before
-  signaling a PID; a live legacy PID-only record is retained for manual
+  signaling; Linux also pins the process with pidfd. macOS still has a narrow
+  identity-check-to-signal PID reuse window. A live legacy PID-only record is retained for manual
   inspection rather than signaling a possibly reused process. A pending model
   apply blocks agent launch until a successful bootstrap or restart, and a
   stopped VM cancels the generation before proxy cleanup.

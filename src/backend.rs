@@ -2054,7 +2054,14 @@ pub(crate) struct CredentialForwardingPolicy {
     openai_proxy_active: bool,
     codex_account_auth: bool,
     network: crate::config::FirecrackerNetworkMode,
-    selected: [bool; 3],
+    selected: SelectedAgents,
+}
+
+#[derive(Clone, Copy)]
+struct SelectedAgents {
+    claude: bool,
+    codex: bool,
+    grok: bool,
 }
 
 impl CredentialForwardingPolicy {
@@ -2069,17 +2076,21 @@ impl CredentialForwardingPolicy {
             openai_proxy_active,
             codex_account_auth: cfg.codex.auth.uses_chatgpt_account(),
             network,
-            selected: [true; 3],
+            selected: SelectedAgents {
+                claude: true,
+                codex: true,
+                grok: true,
+            },
         }
     }
 
     pub(crate) fn with_agents(mut self, agents: &crate::agents::AgentSet) -> Self {
         use crate::agents::AgentId;
-        self.selected = [
-            agents.contains(AgentId::Claude),
-            agents.contains(AgentId::Codex),
-            agents.contains(AgentId::Grok),
-        ];
+        self.selected = SelectedAgents {
+            claude: agents.contains(AgentId::Claude),
+            codex: agents.contains(AgentId::Codex),
+            grok: agents.contains(AgentId::Grok),
+        };
         self
     }
 
@@ -2126,32 +2137,33 @@ fn populate_builtin_credentials(
     policy: CredentialForwardingPolicy,
     env: &mut EnvForward,
 ) -> Result<()> {
-    if policy
-        .suppression_reason("ANTHROPIC_API_KEY", ForwardingSource::Configured)
-        .is_some()
-    {
-        tracing::debug!("proxy mode: not forwarding ANTHROPIC_API_KEY into the guest");
-    } else if !policy.selected[0] {
-        // An omitted agent's credential source is never resolved.
-    } else if let Some(key) = &cfg.claude.api_key {
-        let resolved = crate::config::resolve_cmd_value(key.expose())
-            .context("Failed to resolve claude.api_key")?;
-        env.set("ANTHROPIC_API_KEY", resolved)?;
-    } else if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        env.set("ANTHROPIC_API_KEY", key)?;
+    if policy.selected.claude {
+        if policy
+            .suppression_reason("ANTHROPIC_API_KEY", ForwardingSource::Configured)
+            .is_some()
+        {
+            tracing::debug!("proxy mode: not forwarding ANTHROPIC_API_KEY into the guest");
+        } else if let Some(key) = &cfg.claude.api_key {
+            let resolved = crate::config::resolve_cmd_value(key.expose())
+                .context("Failed to resolve claude.api_key")?;
+            env.set("ANTHROPIC_API_KEY", resolved)?;
+        } else if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            env.set("ANTHROPIC_API_KEY", key)?;
+        }
     }
 
-    if let Some(reason) = policy.suppression_reason("OPENAI_API_KEY", ForwardingSource::Configured)
-    {
-        tracing::debug!("{}: not forwarding OPENAI_API_KEY into the guest", reason);
-    } else if !policy.selected[1] {
-        // An omitted agent's credential source is never resolved.
-    } else if let Some(key) = &cfg.codex.api_key {
-        let resolved = crate::config::resolve_cmd_value(key.expose())
-            .context("Failed to resolve codex.api_key")?;
-        env.set("OPENAI_API_KEY", resolved)?;
-    } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        env.set("OPENAI_API_KEY", key)?;
+    if policy.selected.codex {
+        if let Some(reason) =
+            policy.suppression_reason("OPENAI_API_KEY", ForwardingSource::Configured)
+        {
+            tracing::debug!("{}: not forwarding OPENAI_API_KEY into the guest", reason);
+        } else if let Some(key) = &cfg.codex.api_key {
+            let resolved = crate::config::resolve_cmd_value(key.expose())
+                .context("Failed to resolve codex.api_key")?;
+            env.set("OPENAI_API_KEY", resolved)?;
+        } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            env.set("OPENAI_API_KEY", key)?;
+        }
     }
 
     if policy
@@ -2161,14 +2173,14 @@ fn populate_builtin_credentials(
         tracing::debug!("isolated network mode: not resolving or forwarding XAI_API_KEY");
         tracing::debug!("isolated network mode: not resolving or forwarding GITHUB_TOKEN");
     } else {
-        if !policy.selected[2] {
-            // An omitted agent's credential source is never resolved.
-        } else if let Some(key) = &cfg.grok.api_key {
-            let resolved = crate::config::resolve_cmd_value(key.expose())
-                .context("Failed to resolve grok.api_key")?;
-            env.set("XAI_API_KEY", resolved)?;
-        } else if let Ok(key) = std::env::var("XAI_API_KEY") {
-            env.set("XAI_API_KEY", key)?;
+        if policy.selected.grok {
+            if let Some(key) = &cfg.grok.api_key {
+                let resolved = crate::config::resolve_cmd_value(key.expose())
+                    .context("Failed to resolve grok.api_key")?;
+                env.set("XAI_API_KEY", resolved)?;
+            } else if let Ok(key) = std::env::var("XAI_API_KEY") {
+                env.set("XAI_API_KEY", key)?;
+            }
         }
         if let Some(token) =
             resolve_github_token(cfg.github.as_ref(), selection, &HostGitHubTokenSources)?
@@ -2195,7 +2207,7 @@ pub(crate) fn prepare_env_forwarding_for_network(
     // User-specified env_forward vars from process environment, plus
     // host names referenced by Grok stdio MCP `env` mappings (those
     // become `${NAME}` in the guest config and must exist there).
-    let grok_mcp_env_names = if policy.selected[2] {
+    let grok_mcp_env_names = if policy.selected.grok {
         grok.stdio_env_host_names()
     } else {
         Vec::new()
@@ -2203,9 +2215,9 @@ pub(crate) fn prepare_env_forwarding_for_network(
     for name in claude
         .env_forward
         .iter()
-        .filter(|_| policy.selected[0])
-        .chain(codex.env_forward.iter().filter(|_| policy.selected[1]))
-        .chain(grok.env_forward.iter().filter(|_| policy.selected[2]))
+        .filter(|_| policy.selected.claude)
+        .chain(codex.env_forward.iter().filter(|_| policy.selected.codex))
+        .chain(grok.env_forward.iter().filter(|_| policy.selected.grok))
         .chain(grok_mcp_env_names.iter())
     {
         if let Some(reason) = policy.suppression_reason(name.as_str(), ForwardingSource::Configured)
@@ -8435,6 +8447,45 @@ url = "https://example.com/m"
         assert!(
             forwarded.contains("ANTHROPIC_API_KEY"),
             "non-proxy mode should still forward the configured key"
+        );
+    }
+
+    #[test]
+    fn absent_agents_never_resolve_builtin_credential_commands() {
+        use crate::agents::{AgentId, AgentSet};
+
+        let mut cfg = CoopConfig {
+            github: None,
+            ..CoopConfig::default()
+        };
+        cfg.claude.api_key = Some(crate::config::Secret::new("cmd:exit 23".to_string()));
+        cfg.grok.api_key = Some(crate::config::Secret::new("cmd:exit 23".to_string()));
+        let codex = AgentSet::new(vec![AgentId::Codex]).unwrap();
+        let policy = CredentialForwardingPolicy::new(
+            &cfg,
+            false,
+            false,
+            crate::config::FirecrackerNetworkMode::Open,
+        )
+        .with_agents(&codex);
+        let env = prepare_env_forwarding_for_network(
+            &cfg,
+            &crate::github_assignment::GitHubSelection::Off,
+            policy,
+        )
+        .unwrap();
+        assert!(!env.contains("ANTHROPIC_API_KEY"));
+        assert!(!env.contains("XAI_API_KEY"));
+
+        cfg.codex.api_key = Some(crate::config::Secret::new("cmd:exit 23".to_string()));
+        assert!(
+            prepare_env_forwarding_for_network(
+                &cfg,
+                &crate::github_assignment::GitHubSelection::Off,
+                policy,
+            )
+            .is_err(),
+            "the installed agent's resolver must still run and fail"
         );
     }
 

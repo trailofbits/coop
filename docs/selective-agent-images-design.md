@@ -244,8 +244,9 @@ dispatch. On every boot and live `model` reconfiguration:
    retain the process identity and PID files until both the proxy and tunnel
    are confirmed gone, remove the token, and fail closed if exit is uncertain.
    Verify the stored process identity before signalling to avoid PID reuse;
-   use a platform-appropriate process identity/start-time check. Use checked,
-   bounded cleanup in **all** new stop/destroy paths too. If teardown is
+   use Linux pidfd to pin the process through signalling. macOS has no pidfd
+   equivalent here, so its start-time check retains a narrow PID reuse race.
+   Use checked, bounded cleanup in **all** new stop/destroy paths too. If teardown is
    uncertain, retain the instance directory and process records, permit VM
    shutdown for recovery, and return a cleanup error so retry can finish;
    do not unlink the only identity record or claim complete cleanup.
