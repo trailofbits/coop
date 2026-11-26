@@ -67,6 +67,7 @@ mod setup;
 mod setup_tool;
 mod shell;
 mod ssh;
+pub use ssh::SshExit;
 #[cfg(test)]
 mod test_support;
 mod update;

@@ -1425,7 +1425,7 @@ pub(crate) fn cmd_shell(
     if command.is_empty() {
         ssh::run_interactive(&session, &[])
     } else {
-        ssh::run_command(&session, command)
+        ssh::run_command(&session, command, std::process::Stdio::inherit())
     }
 }
 
@@ -1515,7 +1515,7 @@ pub(crate) fn cmd_exec(
     command: &[String],
 ) -> Result<()> {
     let session = open_ssh_session(be, cfg, name)?;
-    ssh::exec_command(&session, command)
+    ssh::run_command(&session, command, std::process::Stdio::null())
 }
 
 /// Resolve a running instance and prepare an SSH session with env

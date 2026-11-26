@@ -1617,14 +1617,16 @@ test_exec() {
         fail "exec captures stdout" "got: $output"
     fi
 
-    # Verify non-zero exit code propagates
-    local rc=0
-    coop_exec false || rc=$?
-    if [[ $rc -ne 0 ]]; then
-        pass "exec propagates non-zero exit code"
-    else
-        fail "exec propagates non-zero exit code" "expected non-zero, got 0"
-    fi
+    local runner rc
+    for runner in coop_exec guest_exec; do
+        rc=0
+        "$runner" sh -c 'exit 42' || rc=$?
+        if [[ $rc -eq 42 ]]; then
+            pass "$runner preserves guest exit status"
+        else
+            fail "$runner preserves guest exit status" "expected 42, got $rc"
+        fi
+    done
 }
 
 test_claude_bin_path() {
