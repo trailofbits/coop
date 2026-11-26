@@ -382,8 +382,8 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// Also remove template, kernel, and Firecracker binary
-        #[arg(long)]
+        /// Destroy every instance and remove shared images, SSH keys, and backend data
+        #[arg(long, conflicts_with = "name")]
         all: bool,
     },
     /// List instances by name, state, and network mode
@@ -1568,6 +1568,33 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected parse failure"),
         }
+    }
+
+    #[test]
+    fn destroy_all_conflicts_with_a_named_instance() {
+        for args in [
+            ["destroy", "example", "--all"],
+            ["destroy", "--all", "example"],
+        ] {
+            assert_eq!(
+                parse_err(&args).kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
+        }
+        assert!(matches!(
+            parse(&["destroy", "--all"]).command,
+            super::Commands::Destroy {
+                name: None,
+                all: true
+            }
+        ));
+        assert!(matches!(
+            parse(&["destroy", "example"]).command,
+            super::Commands::Destroy {
+                name: Some(_),
+                all: false
+            }
+        ));
     }
 
     #[test]
