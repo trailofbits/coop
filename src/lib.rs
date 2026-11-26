@@ -44,10 +44,7 @@ mod remote_command;
 mod secret_store;
 mod sha256_hash;
 // Lima is an interactive CLI workflow — stderr output is intentional user communication.
-#[cfg_attr(
-    all(not(target_os = "macos"), not(test)),
-    expect(dead_code, reason = "Lima-only")
-)]
+#[cfg(any(target_os = "macos", test))]
 #[expect(
     clippy::print_stderr,
     reason = "lima setup is interactive CLI — stderr is user communication"
@@ -2707,6 +2704,25 @@ mod tests {
             Some("worker-2")
         );
         assert!(new_instance);
+    }
+
+    #[test]
+    fn up_rejects_option_shaped_instance_name() {
+        let err = parse_err(&["up", "--name=--all"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("must not start with '-'"));
+    }
+
+    #[test]
+    fn up_accepts_leading_underscore_instance_name() {
+        let cli = parse(&["up", "--name", "_worker"]);
+        let super::Commands::Up { name, .. } = cli.command else {
+            panic!("expected Up variant");
+        };
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("_worker")
+        );
     }
 
     #[test]
