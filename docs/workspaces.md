@@ -139,6 +139,10 @@ tools (such as Git and Visual Studio Code) and embedded repositories before
 installing files on the host. This filtering is best effort. Treat pulled files
 as untrusted. Pull applies these exclusions to every transfer.
 
+A successful pull can install zero files. This happens when the guest workspace
+is empty or every file is excluded. If the workspace root resembles Git
+metadata, pull warns that it skipped all files and exits successfully.
+
 Pull reports skipped embedded repository paths. It also compares a bounded
 rsync dry run with the filtered transfer and groups omitted paths under the
 first skipped directory. Pull shows up to ten entries per group and twenty
