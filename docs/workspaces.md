@@ -184,12 +184,13 @@ includes Git history and allows tool settings subject to `.gitignore`.
 
 If your VM needs specific tool settings without a copy of the host's Git
 history, use `--exclude-local-config` and copy those settings separately.
-For example, from the project directory for a running instance named
-`my-project`:
+After reviewing `.claude`, run these commands from the project directory to
+copy it to a running instance named `my-project`. Rsync skips symbolic links,
+including `.claude` itself if it is a link.
 
 ```bash
 coop ssh-config my-project
-scp -r .claude coop-my-project:/workspace/
+rsync -r --no-links -- .claude coop-my-project:/workspace/
 ```
 
 ## .gitignore integration
