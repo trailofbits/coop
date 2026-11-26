@@ -14,7 +14,8 @@ set -euo pipefail
 #   --profile LIST   Comma-separated profiles to install (default: none)
 #   --name NAME      Instance name prefix (default: test-<pid>)
 #   --full           Run extended tests (workspace sync, multi-instance)
-#   --shard NAME     Run all (default), lifecycle, workspace, config, or features phases.
+#   --shard NAME     Run all (default), lifecycle, workspace, config, features,
+#                    or a narrower macOS CI shard (see the dispatch below).
 #                    Named shards require --full and separate disposable hosts.
 #
 # Environment variables (override flags):
@@ -26,6 +27,7 @@ set -euo pipefail
 #                            Off by default because it wipes every coop-managed
 #                            instance on the host, including ones not owned by
 #                            this test run. Enable only on clean/CI hosts.
+#   COOP_TEST_BUILDER_TIMEOUT — Pass a longer --builder-timeout to setup on slow hosts.
 
 # ── Defaults ──────────────────────────────────────────────────
 
@@ -35,6 +37,10 @@ INSTANCE="${TEST_INSTANCE:-test-$$}"
 FULL="${TEST_FULL:-0}"
 SHARD=all
 SUITE_CONFIG=""
+SETUP_TIMEOUT_ARGS=()
+if [[ -n "${COOP_TEST_BUILDER_TIMEOUT:-}" ]]; then
+    SETUP_TIMEOUT_ARGS=(--builder-timeout "$COOP_TEST_BUILDER_TIMEOUT")
+fi
 
 # Track all instances we create for cleanup
 STARTED_INSTANCES=()
@@ -65,14 +71,14 @@ done
 
 case "$SHARD" in
     all) ;;
-    lifecycle|workspace|config|features)
+    lifecycle|lifecycle-early|lifecycle-late|workspace|config|features|workspace-early-project|workspace-early-mount|workspace-multi|workspace-sync|workspace-profiles|workspace-hooks|config-users|config-github|config-proxy|config-setup|features-restore|features-guest)
         [[ "$FULL" == 1 ]] || { echo "--shard requires --full" >&2; exit 1; }
         ;;
     *) echo "Unknown shard: $SHARD" >&2; exit 1 ;;
 esac
 
-if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 && "$SHARD" != all && "$SHARD" != config ]]; then
-    echo "--require-proxy requires the all or config shard" >&2
+if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 && "$SHARD" != all && "$SHARD" != config && "$SHARD" != config-proxy ]]; then
+    echo "--require-proxy requires the all, config, or config-proxy shard" >&2
     exit 1
 fi
 
@@ -678,7 +684,7 @@ test_setup() {
     echo ""
     echo "=== Phase: setup ==="
 
-    local args=(setup -y)
+    local args=(setup -y "${SETUP_TIMEOUT_ARGS[@]}")
     # The full suite exercises `agent update --codex`; force the initial image
     # build so that test cannot silently reuse a pre-fix local template.
     if [[ "$FULL" == "1" ]]; then
@@ -1946,9 +1952,8 @@ test_claude_onboarding_seed() {
     # Negative env gate: restart without the token. The early return in
     # seed_claude_onboarding must make this a complete no-op — ~/.claude.json
     # must NOT be created, or credential-less guests would lose the interactive
-    # login flow. Remove the file first: an earlier phase ran `claude --version`,
-    # which can leave a ~/.claude.json behind, so the assertion must test "the
-    # seed did not (re)create it" rather than "the file never existed."
+    # login flow. Remove the file first because agent invocations can leave a
+    # ~/.claude.json behind; assert that the seed did not (re)create it.
     if ! coop_exec sh -c 'rm -f ~/.claude.json'; then
         fail "remove ~/.claude.json before negative case" "stderr: $(guest_stderr)"
         return
@@ -4645,7 +4650,7 @@ test_reconfigure() {
     if coop resize "$INSTANCE" --vcpus "$want_vcpus" --mem "$want_mem" --start; then
         pass "resize --vcpus/--mem --start exits 0"
     else
-        fail "resize --vcpus/--mem --start exits 0" "exit code: $?"
+        fail "resize --vcpus/--mem --start exits 0" "exit code: $?; stderr: $HARNESS_ERR"
         return
     fi
 
@@ -5263,9 +5268,8 @@ test_restore_reprovision() {
 
     # Install the `coop-<name>` SSH alias so the reprovision has one to
     # refresh. `provision_first_boot` calls `refresh_ssh_config_if_present`,
-    # which is gated on the marker block existing (workspace.rs), and
-    # test_ssh_config ran `--clean` long before this phase — so without this
-    # the call is a no-op and nothing covers it.
+    # which is gated on the marker block existing (workspace.rs) — so without
+    # this the call is a no-op and nothing covers it.
     #
     # Then deliberately break the block's selected transport. Relying on an
     # endpoint changing by itself only works on Lima; Firecracker's TCP and
@@ -5531,7 +5535,7 @@ test_idempotency() {
     # setup -y when golden image already exists should be a fast no-op
     # Must pass the same profiles as the original setup, otherwise the
     # provision script hash changes and triggers a rebuild.
-    local setup_args=(setup -y)
+    local setup_args=(setup -y "${SETUP_TIMEOUT_ARGS[@]}")
     if [[ -n "$PROFILES" ]]; then
         setup_args+=(--profile "$PROFILES")
     fi
@@ -5561,6 +5565,12 @@ test_project_agent_workflow() {
     echo "=== Phase: project and agent workflow ==="
 
     local agent_ws agent_name rc=0 pre_list post_list
+    # Hosted Lima can spend most of 180 seconds restarting a stopped VM
+    # before `up` reaches agent bootstrap. Keep the existing Linux bound.
+    local up_timeout=180
+    if [[ "$(uname -s)" == Darwin ]]; then
+        up_timeout=360
+    fi
     local binary_args=("$BINARY")
     if [[ -n "${SUITE_CONFIG:-}" ]]; then
         binary_args+=(--config "$SUITE_CONFIG")
@@ -5569,7 +5579,7 @@ test_project_agent_workflow() {
     agent_name=${agent_ws##*/}
     agent_name=${agent_name//[!a-zA-Z0-9_-]/-}
 
-    ( cd "$agent_ws" && _timeout 180 "${binary_args[@]}" up \
+    ( cd "$agent_ws" && _timeout "$up_timeout" "${binary_args[@]}" up \
         >"$tmpdir/agent_up_out" 2>"$tmpdir/agent_up_err" ) || rc=$?
     if [[ $rc -ne 0 ]]; then
         fail "up creates project instance" "exit: $rc; stderr: $(cat "$tmpdir/agent_up_err")"
@@ -5610,7 +5620,7 @@ test_project_agent_workflow() {
     fi
 
     pre_list=$("${binary_args[@]}" list 2>/dev/null | sort)
-    if ( cd "$agent_ws" && _timeout 180 "${binary_args[@]}" up >/dev/null 2>&1 ); then
+    if ( cd "$agent_ws" && _timeout "$up_timeout" "${binary_args[@]}" up >/dev/null 2>&1 ); then
         post_list=$("${binary_args[@]}" list 2>/dev/null | sort)
         if [[ "$pre_list" == "$post_list" ]]; then
             pass "up reuses running project instance"
@@ -5625,7 +5635,7 @@ test_project_agent_workflow() {
         fail "stop project instance before restart" "exit code: $?"
         return
     fi
-    if ( cd "$agent_ws" && _timeout 180 "${binary_args[@]}" up >/dev/null 2>&1 ) \
+    if ( cd "$agent_ws" && _timeout "$up_timeout" "${binary_args[@]}" up >/dev/null 2>&1 ) \
         && "${binary_args[@]}" status "$agent_name" 2>/dev/null | grep -q -i running; then
         pass "up restarts stopped project instance"
     else
@@ -6584,6 +6594,8 @@ test_custom_profiles() {
 [profiles.test-custom]
 apt_packages = ["cowsay"]
 post_install = '''
+# A profile may read stdin; that must not consume later provision commands.
+read -r ignored || true
 echo 'custom-profile-marker' > /etc/custom-profile-installed
 printf '#!/bin/sh\necho codex-cli 9.9.9-profile\n' > /usr/local/bin/codex
 chmod 0755 /usr/local/bin/codex
@@ -6594,7 +6606,7 @@ CFGEOF
 
     # Build an image with the custom profile
     local custom_img="custom-test-$$"
-    if "$BINARY" --config "$cfg_file" setup -y --image "$custom_img" --profile test-custom 2>"$tmpdir/stderr"; then
+    if "$BINARY" --config "$cfg_file" setup -y "${SETUP_TIMEOUT_ARGS[@]}" --image "$custom_img" --profile test-custom 2>"$tmpdir/stderr"; then
         pass "setup --image with custom profile exits 0"
     else
         local err
@@ -6773,7 +6785,7 @@ test_builtin_profile_plugins() {
     local img_name="c-rust-plugins-$$"
     coop images --delete "$img_name" 2>/dev/null || true
 
-    if coop setup -y --image "$img_name" --profile c,rust; then
+    if coop setup -y "${SETUP_TIMEOUT_ARGS[@]}" --image "$img_name" --profile c,rust; then
         pass "setup fresh c,rust profile image exits 0"
     else
         fail "setup fresh c,rust profile image exits 0" "stderr: $HARNESS_ERR"
@@ -7342,7 +7354,7 @@ CFGEOF
 
     # Build a golden image with the stub claude baked in
     local mp_img="mp-test-$$"
-    if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" setup -y --image "$mp_img" --profile stub-claude 2>"$tmpdir/stderr"; then
+    if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" setup -y "${SETUP_TIMEOUT_ARGS[@]}" --image "$mp_img" --profile stub-claude 2>"$tmpdir/stderr"; then
         pass "setup with stub claude image exits 0"
     else
         local setup_err
@@ -8600,10 +8612,10 @@ os.setsid()
 with open(sys.argv[1], "x", encoding="ascii") as session_file:
     session_file.write(f"{os.getpid()}\n")
 os.execvp(sys.argv[2], sys.argv[2:])
-' "$session_file" "$BINARY" setup -y --image "$img" --profile python,node \
+' "$session_file" "$BINARY" setup -y "${SETUP_TIMEOUT_ARGS[@]}" --image "$img" --profile python,node \
             >"$tmpdir/int-stdout" 2>"$tmpdir/int-stderr" &
     else
-        "$BINARY" setup -y --image "$img" --profile python,node \
+        "$BINARY" setup -y "${SETUP_TIMEOUT_ARGS[@]}" --image "$img" --profile python,node \
             >"$tmpdir/int-stdout" 2>"$tmpdir/int-stderr" &
     fi
     local setup_pid=$!
@@ -8752,7 +8764,7 @@ os.execvp(sys.argv[2], sys.argv[2:])
     fi
 
     # Retry — setup should clean up leftover state and succeed
-    if coop setup -y --image "$img" --profile python,node; then
+    if coop setup -y "${SETUP_TIMEOUT_ARGS[@]}" --image "$img" --profile python,node; then
         pass "setup succeeds after interrupted build"
     else
         fail "setup succeeds after interrupted build" "exit code: $?"
@@ -9395,7 +9407,7 @@ test_provision_failure() {
     # Reuse the exact default-image definition built by test_setup. Omitting
     # the suite profiles here changes the provision hash and legitimately makes
     # the Lima image stale, which cannot be attributed to the named failure.
-    local default_setup=(setup -y)
+    local default_setup=(setup -y "${SETUP_TIMEOUT_ARGS[@]}")
     if [[ -n "$PROFILES" ]]; then
         default_setup+=(--profile "$PROFILES")
     fi
@@ -9410,12 +9422,13 @@ test_provision_failure() {
 
     # Inject a failure into the provision script via env var.
     # The coop checks COOP_TEST_INJECT_PROVISION_FAILURE and
-    # appends 'exit 1' to the provision script before cleanup.
+    # injects 'exit 1' into the provision script.
     # Use a separate image so the already-built default stays available.
     local failed_image="provision-failure-$$"
     local rc=0
     local err
     COOP_TEST_INJECT_PROVISION_FAILURE=1 "$BINARY" --config "$SUITE_CONFIG" setup -y \
+        "${SETUP_TIMEOUT_ARGS[@]}" \
         --image "$failed_image" >/dev/null 2>"$tmpdir/pf-stderr" || rc=$?
     err=$(cat "$tmpdir/pf-stderr")
 
@@ -9430,7 +9443,9 @@ test_provision_failure() {
     # Error message should mention the failure clearly (check stderr
     # separately — stdout can be enormous with apt output, and piping
     # the combined string through echo+grep can lose content)
-    if grep -qi "provision.*fail\|failed\|error" "$tmpdir/pf-stderr"; then
+    if [[ "$(uname -s)" == Darwin ]] && [[ "$err" == *"Lima builder provisioning failed during initialization"* ]]; then
+        pass "error message identifies the failed Lima provision stage"
+    elif [[ "$(uname -s)" != Darwin ]] && grep -qi "provision.*fail\|failed\|error" "$tmpdir/pf-stderr"; then
         pass "error message mentions failure"
     else
         fail "error message mentions failure" "stderr: $err"
@@ -9548,7 +9563,7 @@ test_guest_user_alt() {
     # Setup a separate image whose `template_config.json` should record
     # guest_user=vscode and whose first boot should create the vscode
     # account at uid 1000.
-    if coop setup -y --image "$img_name" --guest-user "$alt_user"; then
+    if coop setup -y "${SETUP_TIMEOUT_ARGS[@]}" --image "$img_name" --guest-user "$alt_user"; then
         pass "setup --guest-user $alt_user exits 0"
     else
         fail "setup --guest-user $alt_user exits 0" "exit code: $? stderr: $HARNESS_ERR"
@@ -9765,80 +9780,92 @@ EOF
 
     # Setup + primary instance
     run_timed_test test_setup
-    # Keep the stateful primary-instance sequence together. Extended phases
-    # below create their own instances and only need the shared golden image.
-    if [[ "$SHARD" == all || "$SHARD" == lifecycle ]]; then
+    # Each lifecycle half uses its own primary VM on macOS; the unsharded and
+    # Linux lifecycle paths retain the complete stateful sequence.
+    if [[ "$SHARD" == all || "$SHARD" == lifecycle || "$SHARD" == lifecycle-early || "$SHARD" == lifecycle-late ]]; then
         run_timed_test test_up_creates_primary_instance
-        run_timed_test test_firecracker_rejects_pid_outside_service_cgroup
-        run_timed_test test_failed_firecracker_exec_preserves_disk_and_cleans_tap
-        run_timed_test test_abrupt_launcher_exit_keeps_supervised_vm_manageable
-        run_timed_test test_private_storage
-        run_timed_test test_start_rejects_missing_instance
-        run_timed_test test_duplicate_name
-        run_timed_test test_status_running
-        run_timed_test test_list_running
-        run_timed_test test_running_vm_completions
-        run_timed_test test_auto_resolve_running
-        run_timed_test test_shell_connectivity
-        run_timed_test test_firecracker_vsock_transport
-        run_timed_test test_ssh_config
-        run_timed_test test_editor
-        run_timed_test test_web_editor
-        run_timed_test test_exec
-        run_timed_test test_claude_bin_path
-        run_timed_test test_grok_bin_path
-        run_timed_test test_grok_settings_merge
-        run_timed_test test_claude_settings_merge
-        run_timed_test test_claude_onboarding_seed
-        run_timed_test test_codex_bin_path
-        run_timed_test test_codex_account_auth_support
-        run_timed_test test_codex_chatgpt_mode
-        run_timed_test test_codex_sandbox_bypass
-        run_timed_test test_program_status
-        run_timed_test test_agent_update
-        run_timed_test test_github_token_forwarding
-        run_timed_test test_term_handling
-        run_timed_test test_guest_environment
-        run_timed_test test_sudo
-        run_timed_test test_network
-        run_timed_test test_docker
-        run_timed_test test_logs
-        run_timed_test test_profiles
-        run_timed_test test_guest_fingerprint
-        run_timed_test test_vsock_control_without_guest_network
-        run_timed_test test_firecracker_isolated_network_mode
-        run_timed_test test_legacy_firecracker_control_compatibility
-
-        # Stop + restart + stopped-state verification
-        run_timed_test test_stop_preserves_recent_writes
-        run_timed_test test_stop
-        run_timed_test test_stop_idempotency
-        run_timed_test test_auto_resolve_stopped
-        run_timed_test test_status_stopped
-        run_timed_test test_agent_update_stopped
-        run_timed_test test_list_stopped
-        run_timed_test test_stopped_vm_completions
-        run_timed_test test_resize_disk_size
-        run_timed_test test_resize_retry_firecracker
-        run_timed_test test_resize_disk_start
-        run_timed_test test_reconfigure
-        if [[ "$SHARD" == all ]]; then
-            run_timed_test test_commit_restore
+        if [[ "$SHARD" != lifecycle-late ]]; then
+            run_timed_test test_firecracker_rejects_pid_outside_service_cgroup
+            run_timed_test test_failed_firecracker_exec_preserves_disk_and_cleans_tap
+            run_timed_test test_abrupt_launcher_exit_keeps_supervised_vm_manageable
+            run_timed_test test_private_storage
+            run_timed_test test_start_rejects_missing_instance
+            run_timed_test test_duplicate_name
+            run_timed_test test_status_running
+            run_timed_test test_list_running
+            run_timed_test test_running_vm_completions
+            run_timed_test test_auto_resolve_running
+            run_timed_test test_shell_connectivity
+            run_timed_test test_firecracker_vsock_transport
+            run_timed_test test_ssh_config
+            run_timed_test test_editor
+            run_timed_test test_web_editor
+            run_timed_test test_exec
+            run_timed_test test_claude_bin_path
+            run_timed_test test_grok_bin_path
+            run_timed_test test_grok_settings_merge
+            run_timed_test test_claude_settings_merge
+            run_timed_test test_claude_onboarding_seed
+            run_timed_test test_codex_bin_path
+            run_timed_test test_codex_account_auth_support
+            run_timed_test test_codex_chatgpt_mode
+            run_timed_test test_codex_sandbox_bypass
+            run_timed_test test_program_status
+            run_timed_test test_agent_update
+            run_timed_test test_github_token_forwarding
+            run_timed_test test_term_handling
+            run_timed_test test_guest_environment
+            run_timed_test test_sudo
+            run_timed_test test_network
+            run_timed_test test_docker
+            run_timed_test test_logs
+            run_timed_test test_profiles
+            run_timed_test test_guest_fingerprint
+            run_timed_test test_vsock_control_without_guest_network
+            run_timed_test test_firecracker_isolated_network_mode
+            run_timed_test test_legacy_firecracker_control_compatibility
         fi
-        run_timed_test test_private_storage
-        run_timed_test test_restart_stopped
-        run_timed_test test_restart_rejects_ignored_flags
-        run_timed_test test_restore_reprovision
-        run_timed_test test_destroy
-        run_timed_test test_auto_resolve_no_instances
-        run_timed_test test_list_empty
 
-        # Idempotency: re-run commands that should be safe to repeat
-        run_timed_test test_idempotency
+        if [[ "$SHARD" != lifecycle-early ]]; then
+            # Reprovision below checks the token persisted by this phase. The
+            # late shard has a fresh VM, so seed it here as well.
+            if [[ "$SHARD" == lifecycle-late ]]; then
+                run_timed_test test_claude_onboarding_seed
+            fi
+
+            # Stop + restart + stopped-state verification
+            run_timed_test test_stop_preserves_recent_writes
+            run_timed_test test_stop
+            run_timed_test test_stop_idempotency
+            run_timed_test test_auto_resolve_stopped
+            run_timed_test test_status_stopped
+            run_timed_test test_agent_update_stopped
+            run_timed_test test_list_stopped
+            run_timed_test test_stopped_vm_completions
+            run_timed_test test_resize_disk_size
+            run_timed_test test_resize_retry_firecracker
+            run_timed_test test_resize_disk_start
+            run_timed_test test_reconfigure
+            if [[ "$SHARD" == all ]]; then
+                run_timed_test test_commit_restore
+            fi
+            run_timed_test test_private_storage
+            run_timed_test test_restart_stopped
+            run_timed_test test_restart_rejects_ignored_flags
+            run_timed_test test_restore_reprovision
+            run_timed_test test_destroy
+            run_timed_test test_auto_resolve_no_instances
+            run_timed_test test_list_empty
+
+            # Idempotency: re-run commands that should be safe to repeat
+            run_timed_test test_idempotency
+        else
+            run_timed_test test_destroy
+        fi
 
     fi
 
-    if [[ "$SHARD" == features ]]; then
+    if [[ "$SHARD" == features || "$SHARD" == features-restore ]]; then
         # Commit/restore needs a stopped primary instance but none of the
         # preceding lifecycle phases. Keep its image and VM state on this runner.
         run_timed_test test_up_creates_primary_instance
@@ -9850,20 +9877,38 @@ EOF
     fi
 
     # Extended tests (each manages its own instance lifecycle)
-    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace ) ]]; then
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-early-project ) ]]; then
         run_timed_test test_project_agent_workflow
         run_timed_test test_up_project_workflow
         run_timed_test test_git_repo
+    fi
+
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-early-mount ) ]]; then
         run_timed_test test_host_mount
         run_timed_test test_lima_mount_state_boundary
         run_timed_test test_host_mount_custom_guest_path
+    fi
+
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-early-project ) ]]; then
         run_timed_test test_port_forwards
+    fi
+
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-sync ) ]]; then
         run_timed_test test_workspace_sync
         run_timed_test test_appledouble_sidecars
+    fi
+
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-multi ) ]]; then
         run_timed_test test_multi_instance
+    fi
+
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-profiles ) ]]; then
         run_timed_test test_custom_profiles
         run_timed_test test_builtin_profile_plugins
         run_timed_test test_post_start
+    fi
+
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-hooks ) ]]; then
         run_timed_test test_creation_hooks
         run_timed_test test_creation_hook_cancellation
         run_timed_test test_creation_failed_descendants
@@ -9871,33 +9916,39 @@ EOF
 
     fi
 
-    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == features ) ]]; then
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == features || "$SHARD" == features-guest ) ]]; then
         run_timed_test test_builtin_profiles
         run_timed_test test_guest_files
         run_timed_test test_config_dir
     fi
 
-    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == config ) ]]; then
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == config || "$SHARD" == config-users ) ]]; then
         # This image/instance lifecycle is independent of the workspace phases.
         run_timed_test test_guest_user_alt
 
         # Local marketplace directory copy
         run_timed_test test_local_marketplace
+    fi
 
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == config || "$SHARD" == config-github ) ]]; then
         # github = "pat" mode + per-repo token forwarding (uses a stub image)
         run_timed_test test_github_pat_forwarding
         run_timed_test test_no_github
 
         # [guest_env] config block + literal-over-forwarded precedence
         run_timed_test test_guest_env_config
+    fi
 
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == config || "$SHARD" == config-proxy ) ]]; then
         # coop model local/remote: local-model wiring lands and reverts
         run_timed_test test_local_model
 
         # credential-injecting proxy (#411): guest wiring, key suppression,
         # capability gate, teardown — Anthropic + OpenAI/Codex
         run_timed_test test_proxy
+    fi
 
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == config || "$SHARD" == config-setup ) ]]; then
         # Interrupted setup: SIGKILL mid-build, verify clean recovery
         run_timed_test test_interrupted_setup
 

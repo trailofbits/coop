@@ -1,15 +1,18 @@
-name: Firecracker integration
+name: VM integration
 
 on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+  push:
+    branches:
+      - 'ci/vm-integration/*'
 
 permissions:
   contents: read
 
 concurrency:
-  group: firecracker-${{ github.ref }}
+  group: vm-integration-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -17,16 +20,101 @@ env:
 
 jobs:
   integration:
-    name: Full integration (${{ matrix.shard }} / ${{ matrix.os }} / KVM)
+    name: Full integration (${{ matrix.shard }} / ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Guest package installation has varied by more than 30 minutes between
-    # runners, exhausting shorter caps while the suite was still advancing.
-    timeout-minutes: 65
+    timeout-minutes: ${{ matrix.job_timeout }}
     strategy:
       fail-fast: false
       matrix:
-        shard: [lifecycle, workspace, config, features]
-        os: [ubuntu-24.04, ubuntu-26.04]
+        include:
+          - os: ubuntu-24.04
+            shard: lifecycle
+            job_timeout: 65
+            suite_timeout: 60
+          - os: ubuntu-24.04
+            shard: workspace
+            job_timeout: 65
+            suite_timeout: 60
+          - os: ubuntu-24.04
+            shard: config
+            job_timeout: 65
+            suite_timeout: 60
+          - os: ubuntu-24.04
+            shard: features
+            job_timeout: 65
+            suite_timeout: 60
+          - os: ubuntu-26.04
+            shard: lifecycle
+            job_timeout: 65
+            suite_timeout: 60
+          - os: ubuntu-26.04
+            shard: workspace
+            job_timeout: 65
+            suite_timeout: 60
+          - os: ubuntu-26.04
+            shard: config
+            job_timeout: 65
+            suite_timeout: 60
+          - os: ubuntu-26.04
+            shard: features
+            job_timeout: 65
+            suite_timeout: 60
+          - os: macos-15-intel
+            shard: lifecycle-early
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: lifecycle-late
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: workspace-early-project
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: workspace-early-mount
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: workspace-multi
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: workspace-sync
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: workspace-profiles
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: workspace-hooks
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: config-users
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: config-github
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: config-proxy
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: config-setup
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: features-restore
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: features-guest
+            job_timeout: 150
+            suite_timeout: 135
     defaults:
       run:
         shell: bash
@@ -36,6 +124,7 @@ jobs:
           persist-credentials: false
 
       - name: Install host prerequisites
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y acl build-essential cmake curl e2fsprogs \
@@ -45,34 +134,50 @@ jobs:
       # Image rebuilds and copies need more disk than the standard runner's
       # advertised free space. These SDKs are unused by the Linux VM suite.
       - name: Make room for VM images
+        if: runner.os == 'Linux'
         run: |
           df -h /
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
           df -h /
           free -h
 
-      - name: Full Firecracker integration
-        timeout-minutes: 60
+      - name: Install macOS host prerequisites
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake
+          # Lima 2.2 can stall SSH logins after provisioning edits
+          # /etc/environment; pin the upstream release that narrows this race.
+          curl -fsSL https://github.com/lima-vm/lima/releases/download/v2.3.0/lima-2.3.0-Darwin-x86_64.tar.gz -o "$RUNNER_TEMP/lima.tgz"
+          echo 'd58bc7d6b8158d638720d8c8fdb17eb58527dfead6a29a5b60f48a35ee4a65a6  '"$RUNNER_TEMP/lima.tgz" | shasum -a 256 -c -
+          sudo tar -xzf "$RUNNER_TEMP/lima.tgz" -C /usr/local
+          /usr/local/bin/limactl --version
+
+      - name: Full VM integration
+        timeout-minutes: ${{ matrix.suite_timeout }}
         env:
           # Safe only on this disposable runner: exercises destroy --all.
           COOP_TEST_DESTRUCTIVE: "1"
           # Regular CI runs this host-only gate; do not repeat it in each shard.
           COOP_TEST_SKIP_BRIDGE: "1"
+          COOP_TEST_BUILDER_TIMEOUT: ${{ runner.os == 'macOS' && '30m' || '' }}
           SHARD: ${{ matrix.shard }}
         run: |
           set -o pipefail
           args=(--full --shard "$SHARD")
-          if [[ "$SHARD" == config ]]; then
+          if [[ "$SHARD" == config || "$SHARD" == config-proxy ]]; then
             args+=(--require-proxy)
           fi
           ./tests/run-integration.sh "${args[@]}" 2>&1 \
-            | tee "$RUNNER_TEMP/firecracker-integration.log"
+            | tee "$RUNNER_TEMP/vm-integration.log"
 
       - name: Upload integration output
         if: ${{ !cancelled() }}
+        # The full output is also in the job log; artifact-service outages
+        # should not turn a passing integration shard red.
+        continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: firecracker-integration-${{ matrix.os }}-${{ matrix.shard }}-log
-          path: ${{ runner.temp }}/firecracker-integration.log
+          name: vm-integration-${{ matrix.os }}-${{ matrix.shard }}-log
+          path: ${{ runner.temp }}/vm-integration.log
           if-no-files-found: ignore
           retention-days: 7
