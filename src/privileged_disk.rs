@@ -782,6 +782,8 @@ fn install_disk_tool_syscall_filter(filter: &mut [libc::sock_filter]) -> io::Res
             libc::PR_SET_SECCOMP,
             libc::SECCOMP_MODE_FILTER,
             &raw const program,
+            0,
+            0,
         )
     } != 0
     {
@@ -808,15 +810,24 @@ fn drop_disk_tool_capabilities(disk: &File) -> Result<()> {
     // Lock the root-UID exception before clearing the sets: execve must not
     // silently restore capabilities to a UID-0 e2fsprogs process.
     let securebits = libc::SECBIT_NOROOT | libc::SECBIT_NOROOT_LOCKED;
-    if unsafe { libc::prctl(libc::PR_SET_SECUREBITS, securebits) } != 0 {
+    if unsafe { libc::prctl(libc::PR_SET_SECUREBITS, securebits, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error()).context("Cannot lock disk tool securebits");
     }
-    if unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL) } != 0 {
+    if unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    } != 0
+    {
         return Err(io::Error::last_os_error())
             .context("Cannot clear disk tool ambient capabilities");
     }
     for capability in 0..64 {
-        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability) } != 0 {
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) } != 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::EINVAL) {
                 return Err(error).context("Cannot clear disk tool capability bounding set");
