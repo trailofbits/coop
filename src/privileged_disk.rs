@@ -649,7 +649,6 @@ fn disk_tool_denied_syscalls() -> Vec<libc::c_long> {
     let common = [
         libc::SYS_socket,
         libc::SYS_socketpair,
-        libc::SYS_clone,
         libc::SYS_clone3,
         libc::SYS_execveat,
         libc::SYS_memfd_create,
@@ -726,6 +725,10 @@ fn disk_tool_syscall_filter() -> Result<Vec<libc::sock_filter>> {
         jf: 0,
         k: libc::SECCOMP_RET_ERRNO | u32::try_from(libc::EPERM)?,
     };
+    let unavailable = libc::sock_filter {
+        k: libc::SECCOMP_RET_ERRNO | u32::try_from(libc::ENOSYS)?,
+        ..deny
+    };
     let allow = libc::sock_filter {
         code: u16::try_from(libc::BPF_RET | libc::BPF_K)?,
         jt: 0,
@@ -756,6 +759,30 @@ fn disk_tool_syscall_filter() -> Result<Vec<libc::sock_filter>> {
         },
         deny,
     ]);
+    // e2fsck uses worker threads for large images. Permit only clone calls
+    // that join the current thread group; clone3's pointer flags cannot be
+    // inspected by classic seccomp BPF, so report ENOSYS for libc fallback.
+    filter.extend([
+        libc::sock_filter {
+            code: u16::try_from(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K)?,
+            jt: 0,
+            jf: 4,
+            k: u32::try_from(libc::SYS_clone)?,
+        },
+        load_field(u32::try_from(std::mem::offset_of!(
+            libc::seccomp_data,
+            args
+        ))?)?,
+        libc::sock_filter {
+            code: u16::try_from(libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K)?,
+            jt: 1,
+            jf: 0,
+            k: u32::try_from(libc::CLONE_THREAD)?,
+        },
+        deny,
+        allow,
+        load_field(0)?,
+    ]);
     for number in disk_tool_denied_syscalls() {
         filter.push(libc::sock_filter {
             code: u16::try_from(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K)?,
@@ -763,7 +790,11 @@ fn disk_tool_syscall_filter() -> Result<Vec<libc::sock_filter>> {
             jf: 1,
             k: u32::try_from(number)?,
         });
-        filter.push(deny);
+        filter.push(if number == libc::SYS_clone3 {
+            unavailable
+        } else {
+            deny
+        });
     }
     filter.push(allow);
     Ok(filter)
@@ -889,6 +920,10 @@ fn sandbox_probe(disk: &DiskPath, uid: u32, tool: DiskTool) -> Result<()> {
     match std::os::unix::net::UnixStream::pair() {
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
         result => bail!("Disk tool could create a Unix socket pair: {result:?}"),
+    }
+    let worker = std::thread::spawn(|| 17);
+    if worker.join().is_err() {
+        bail!("Disk tool could not run a worker thread");
     }
     probe_process_restrictions()?;
     match std::net::TcpStream::connect("127.0.0.1:1") {

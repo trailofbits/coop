@@ -167,9 +167,11 @@ The privileged disk helper applies a fail-closed sandbox before launching host
 writes, and direct execution by default; it allows disk read/write, the exact
 tool and ELF interpreter for execution, and limited system library/configuration
 reads. A seccomp filter blocks new sockets, process creation, root-owner
-metadata changes, signals, and host IPC access. The helper drops
-all capabilities and uses the disk owner's UID/GID. The parser still receives
-its standard output and error descriptors, and procfs file reads and system
+metadata changes, signals, and host IPC access. Worker threads remain allowed
+because `e2fsck` uses them on large images; forks into separate processes are
+denied. The helper drops all capabilities and uses the disk owner's UID/GID.
+The parser still receives its standard output and error descriptors, and
+procfs file reads and system
 library reads remain available. The dynamic ELF interpreter can load readable
 ELF files without a second `execve`, so this is not a guarantee that only the
 named tool's code can run after a parser compromise. The seccomp and filesystem

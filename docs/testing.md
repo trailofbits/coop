@@ -459,7 +459,8 @@ the privileged disk helper with real formatting, loop mounts, cleanup, symlink
 rejection, sparse copy, and reuse of staging data left by an interrupted copy.
 It also checks that sandboxed filesystem tools can use the verified disk while
 host file reads/writes, unrelated program execution, Unix sockets, metadata
-changes, and signals are denied. The Firecracker integration workflow runs
+changes, and signals are denied. Its sparse 8 GiB fixture also exercises the
+worker-thread path needed by `e2fsck`. The Firecracker integration workflow runs
 this probe on both Ubuntu 24.04 and 26.04 in its lifecycle shard.
 It holds the loop mount busy to check that unmount fails and the mounted disk
 cannot be removed, then verifies the unmounted path is accepted.

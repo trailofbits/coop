@@ -37,7 +37,7 @@ printf 'data_dir = "%s"\n' "$data_dir" >"$data_dir/config.toml"
 mkdir -m 0700 "$data_dir/instances/test" "$data_dir/instances/sparse"
 user_disk="$data_dir/instances/user-owned/rootfs.ext4"
 mkdir -m 0700 "$data_dir/instances/user-owned"
-truncate -s 32M "$user_disk"
+truncate -s 8G "$user_disk"
 mkfs.ext4 -F "$user_disk" >/dev/null
 sudo -n "$coop_bin" __disk-op fsck-read "$data_dir" "$user_disk" >/dev/null
 sudo -n "$coop_bin" __disk-op resize "$data_dir" "$user_disk" >/dev/null
