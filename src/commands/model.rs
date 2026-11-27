@@ -542,4 +542,37 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("stays on cloud")));
         assert!(lines.last().unwrap().contains("next start"));
     }
+
+    #[test]
+    fn selective_reports_name_only_available_tools() {
+        let codex = switch_report_lines_for_agents(
+            "dev",
+            ModelMode::Local,
+            SwitchReport {
+                claude: None,
+                codex: Some(true),
+                applied: true,
+            },
+        );
+        assert!(codex[0].contains("local model for Codex"));
+        assert!(codex.last().unwrap().contains("relaunch codex"));
+        assert!(!codex.iter().any(|line| line.contains("Claude")));
+
+        let grok = switch_report_lines_for_agents(
+            "dev",
+            ModelMode::Remote,
+            SwitchReport {
+                claude: None,
+                codex: None,
+                applied: false,
+            },
+        );
+        assert!(grok[0].contains("cloud models for Grok Build"));
+        assert!(grok.last().unwrap().contains("next start"));
+        assert!(
+            !grok
+                .iter()
+                .any(|line| line.contains("Claude") || line.contains("Codex"))
+        );
+    }
 }

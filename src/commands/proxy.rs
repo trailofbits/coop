@@ -675,4 +675,27 @@ mod tests {
         );
         assert!(text.contains("off"), "openai should be off: {text}");
     }
+
+    #[test]
+    fn codex_only_status_marks_only_anthropic_unavailable() {
+        let cfg = ProxyConfig {
+            anthropic: Some(upstream("cmd:a", ProxyAuthScheme::Bearer)),
+            openai: Some(upstream("cmd:o", ProxyAuthScheme::Bearer)),
+        };
+        let agents = crate::agents::AgentSet::new(vec![crate::agents::AgentId::Codex]).unwrap();
+        let mut buf = Vec::new();
+        write_vm_status_for_agents(&mut buf, "dev", &ProxyState::default(), &cfg, &agents).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let anthropic = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("anthropic"))
+            .unwrap();
+        let openai = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("openai"))
+            .unwrap();
+        assert!(anthropic.contains("unavailable in this image"), "{text}");
+        assert!(!openai.contains("unavailable in this image"), "{text}");
+        assert!(openai.contains("default"), "{text}");
+    }
 }

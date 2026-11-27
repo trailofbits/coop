@@ -872,10 +872,12 @@ assert json.load(sys.stdin)["agents"] == ["codex"]
     else
         fail "proxy setup rejects unavailable provider before credential prompt" "$HARNESS_ERR"
     fi
-    if coop proxy status --vm "$vm" && [[ "$HARNESS_OUT" == *"unavailable in this image"* ]]; then
-        pass "proxy status labels unavailable provider"
+    if coop proxy status --vm "$vm" \
+        && [[ "$HARNESS_OUT" =~ anthropic[[:space:]]+unavailable[[:space:]]in[[:space:]]this[[:space:]]image ]] \
+        && [[ "$HARNESS_OUT" =~ openai[[:space:]]+(off|default|override) ]]; then
+        pass "proxy status marks Anthropic unavailable and OpenAI available"
     else
-        fail "proxy status labels unavailable provider" "$HARNESS_ERR"
+        fail "proxy status marks Anthropic unavailable and OpenAI available" "$HARNESS_OUT $HARNESS_ERR"
     fi
     if coop stop "$vm" && coop start "$vm" --no-agents \
         && guest_exec test -x /usr/local/bin/codex \
