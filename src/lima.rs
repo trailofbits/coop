@@ -2,7 +2,7 @@
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::num::NonZeroU8;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,7 @@ use crate::sha256_hash::Sha256Hash;
 const LIMA_PREFIX: &str = "coop-";
 // Keep the image builder outside the namespace reserved for project VMs.
 const BUILDER_PREFIX: &str = "cb-";
+const BUILDER_ID_FILE: &str = "lima-builder-id";
 
 fn builder_name(id: &LimaBuilderId) -> String {
     format!("{BUILDER_PREFIX}{}", id.as_str())
@@ -33,23 +34,36 @@ fn builder_name(id: &LimaBuilderId) -> String {
 struct BuilderContext {
     name: String,
     lock: FileLock,
+    registration: BuilderRegistration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuilderRegistration {
+    New,
+    Existing,
 }
 
 impl BuilderContext {
     fn acquire(cfg: &CoopConfig) -> Result<Self> {
         let home = lima_home()?;
-        Self::acquire_in(cfg, &home)
+        Self::acquire_in(cfg, &home, limactl_list_output)
     }
 
-    fn acquire_in(cfg: &CoopConfig, home: &Path) -> Result<Self> {
-        PrivateDir::create(home)?;
+    fn acquire_in(
+        cfg: &CoopConfig,
+        home: &Path,
+        inventory: impl FnOnce() -> Result<String>,
+    ) -> Result<Self> {
+        let home_dir = PrivateDir::create(home)?;
         // Lima's home, rather than an image directory, is shared by all coop
         // installations that can see the same Lima instances.
         let lock = crate::fs_util::lock_sibling(&home.join("coop-builder-lifecycle"))?;
-        let id = ensure_builder_id(cfg)?;
+        let (id, registration) =
+            ensure_builder_id(cfg, &home_dir, inventory, LimaBuilderId::generate)?;
         Ok(Self {
             name: builder_name(&id),
             lock,
+            registration,
         })
     }
 
@@ -66,54 +80,92 @@ impl BuilderContext {
     }
 }
 
-/// Persist the identity before any builder VM can be created. The caller holds
-/// the Lima-home lock, so two initial setups cannot select different IDs.
-fn ensure_builder_id(cfg: &CoopConfig) -> Result<LimaBuilderId> {
-    let path = std::path::absolute(
-        cfg.loaded_from
-            .as_deref()
-            .context("Lima setup requires a loaded coop config path")?,
-    )?;
-    let _config_lock = crate::fs_util::lock_sibling(&path)?;
-    let current = CoopConfig::load(&path)?;
-    if let Some(id) = current.lima.builder_id {
-        return Ok(id);
+fn missing_file(error: &anyhow::Error) -> bool {
+    error
+        .root_cause()
+        .downcast_ref::<io::Error>()
+        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+}
+
+fn read_builder_id(cfg: &CoopConfig) -> Result<Option<LimaBuilderId>> {
+    let dir = match PrivateDir::open_existing(&cfg.data_dir) {
+        Ok(dir) => dir,
+        Err(error) if missing_file(&error) => return Ok(cfg.lima.builder_id.clone()),
+        Err(error) => return Err(error).context("Cannot inspect coop builder identity storage"),
+    };
+    read_builder_id_in(&dir).map(|id| id.or_else(|| cfg.lima.builder_id.clone()))
+}
+
+fn read_builder_id_in(dir: &PrivateDir) -> Result<Option<LimaBuilderId>> {
+    let content = match dir.read_to_string(OsStr::new(BUILDER_ID_FILE)) {
+        Ok(content) => content,
+        Err(error) if missing_file(&error) => return Ok(None),
+        Err(error) => return Err(error).context("Cannot read coop builder identity"),
+    };
+    let id = LimaBuilderId::new(content.strip_suffix('\n').unwrap_or(&content))
+        .context("Invalid coop builder identity in data directory")?;
+    Ok(Some(id))
+}
+
+fn save_builder_id(cfg: &CoopConfig, dir: &PrivateDir, id: &LimaBuilderId) -> Result<()> {
+    dir.write_atomic_private(
+        OsStr::new(BUILDER_ID_FILE),
+        format!("{}\n", id.as_str()).as_bytes(),
+        0o600,
+    )
+    .context("Cannot save coop builder identity")?;
+    dir.open_regular(OsStr::new(BUILDER_ID_FILE))?.sync_all()?;
+    File::open(&cfg.data_dir)?.sync_all()?;
+    Ok(())
+}
+
+/// The Lima-home lock is held while checking a new name and saving it.
+fn ensure_builder_id(
+    cfg: &CoopConfig,
+    home: &PrivateDir,
+    inventory: impl FnOnce() -> Result<String>,
+    mut generate: impl FnMut() -> Result<LimaBuilderId>,
+) -> Result<(LimaBuilderId, BuilderRegistration)> {
+    let data = PrivateDir::create(&cfg.data_dir)?;
+    if let Some(id) = read_builder_id_in(&data)? {
+        return Ok((id, BuilderRegistration::Existing));
+    }
+    if let Some(id) = &cfg.lima.builder_id {
+        save_builder_id(cfg, &data, id)?;
+        return Ok((id.clone(), BuilderRegistration::Existing));
     }
 
-    let id = LimaBuilderId::generate()?;
-    let original = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error).context("Failed to read coop config for Lima builder ID"),
-    };
-    let serialized = if path.extension().is_some_and(|ext| ext == "json") {
-        let mut document: serde_json::Value = if original.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_str(&original).context("Failed to parse JSON config file")?
-        };
-        let object = document
-            .as_object_mut()
-            .context("JSON config root must be an object")?;
-        let lima = object
-            .entry("lima")
-            .or_insert_with(|| serde_json::json!({}));
-        lima.as_object_mut()
-            .context("JSON lima config must be an object")?
-            .insert("builder_id".to_owned(), serde_json::json!(id.as_str()));
-        format!("{}\n", serde_json::to_string_pretty(&document)?)
-    } else {
-        let mut document = original
-            .parse::<toml_edit::DocumentMut>()
-            .context("Failed to parse TOML config file")?;
-        document["lima"]["builder_id"] = toml_edit::value(id.as_str());
-        document.to_string()
-    };
-    crate::fs_util::atomic_write_with_mode(&path, &serialized, 0o600)
-        .context("Failed to persist Lima builder ID in coop config")?;
-    File::open(&path)?.sync_all()?;
-    File::open(path.parent().context("Config path has no parent")?)?.sync_all()?;
-    Ok(id)
+    let names = lima_inventory_names(&inventory()?)?;
+    for _ in 0..16 {
+        let id = generate()?;
+        let name = builder_name(&id);
+        if names.iter().any(|existing| existing == &name) {
+            continue;
+        }
+        match home.entry_type(OsStr::new(&name)) {
+            Ok(_) => continue,
+            Err(error) if missing_file(&error) => {}
+            Err(error) => return Err(error).context("Cannot inspect Lima builder name"),
+        }
+        save_builder_id(cfg, &data, &id)?;
+        return Ok((id, BuilderRegistration::New));
+    }
+    bail!("Could not find an unused Lima builder name")
+}
+
+fn lima_inventory_names(output: &str) -> Result<Vec<String>> {
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let entry: serde_json::Value =
+                serde_json::from_str(line).context("Invalid limactl inventory JSON")?;
+            entry["name"]
+                .as_str()
+                .map(str::to_owned)
+                .context("Lima inventory entry has no name")
+        })
+        .collect()
 }
 
 /// Hostname Lima injects into the guest that resolves to the host machine.
@@ -1274,7 +1326,7 @@ fn build_golden_image(
     let pubkey = read_public_key(&pubkey_path)
         .with_context(|| format!("Failed to read SSH public key at {}", pubkey_path.display()))?;
 
-    remove_prior_builder(builder)?;
+    remove_prior_builder_if_needed(builder)?;
 
     // Clean up leftover staging image from a previous failed build
     let base_img = cfg.lima_base_path(image);
@@ -1421,6 +1473,13 @@ fn remove_prior_builder(builder: &BuilderContext) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn remove_prior_builder_if_needed(builder: &BuilderContext) -> Result<()> {
+    match builder.registration {
+        BuilderRegistration::New => Ok(()),
+        BuilderRegistration::Existing => remove_prior_builder(builder),
+    }
 }
 
 fn write_builder_template(
@@ -2542,7 +2601,15 @@ fn headless_limactl_start() -> io::Result<Command> {
 pub(crate) fn prepare_private_storage(cfg: &CoopConfig) -> Result<()> {
     let home = lima_home()?;
     let home_dir = PrivateDir::create(&home)?;
-    let builder_name = cfg.lima.builder_id.as_ref().map(builder_name);
+    let builder_name = match read_builder_id(cfg) {
+        Ok(id) => id.as_ref().map(builder_name),
+        Err(error) => {
+            // Recovery commands still need to reach project VMs when builder
+            // metadata is damaged. Boot preflight rejects the same error.
+            tracing::warn!("Cannot inspect Lima builder identity: {error:#}");
+            None
+        }
+    };
     for name in home_dir.entries()? {
         if !is_coop_lima_name(&name, builder_name.as_deref()) {
             continue;
@@ -2608,8 +2675,17 @@ pub(crate) fn check_writable_mounts(
     cfg: &CoopConfig,
     requested: &[crate::config::Mount],
 ) -> Result<()> {
-    let builder_name = cfg.lima.builder_id.as_ref().map(builder_name);
-    check_writable_mounts_for_builder(cfg, requested, builder_name.as_deref())
+    let control = lima_home()?;
+    check_writable_mounts_with_state_at(cfg, requested, &control)
+}
+
+fn check_writable_mounts_with_state_at(
+    cfg: &CoopConfig,
+    requested: &[crate::config::Mount],
+    control: &Path,
+) -> Result<()> {
+    let builder_name = read_builder_id(cfg)?.as_ref().map(builder_name);
+    check_writable_mounts_at(cfg, requested, builder_name.as_deref(), control)
 }
 
 fn check_writable_mounts_for_builder(
@@ -3010,51 +3086,118 @@ mod tests {
         let root = crate::test_support::private_tempdir().unwrap();
         let path = root.path().join("config.toml");
         fs::write(&path, "# retained comment\nssh_port = 2222\n").unwrap();
-        let cfg = CoopConfig::load(&path).unwrap();
+        let mut cfg = CoopConfig::load(&path).unwrap();
+        cfg.data_dir = crate::config::ConfigPath::new(root.path().join("data"));
+        let home = PrivateDir::create(&root.path().join("lima")).unwrap();
 
-        let first = ensure_builder_id(&cfg).unwrap();
-        let second = ensure_builder_id(&cfg).unwrap();
+        let (first, first_registration) =
+            ensure_builder_id(&cfg, &home, || Ok(String::new()), LimaBuilderId::generate).unwrap();
+        let (second, second_registration) = ensure_builder_id(
+            &cfg,
+            &home,
+            || bail!("saved identity should not query Lima"),
+            LimaBuilderId::generate,
+        )
+        .unwrap();
         assert_eq!(first, second);
+        assert_eq!(first_registration, BuilderRegistration::New);
+        assert_eq!(second_registration, BuilderRegistration::Existing);
         assert_eq!(builder_name(&first).len(), BUILDER_PREFIX.len() + 32);
         assert!(!builder_name(&first).starts_with(LIMA_PREFIX));
-
-        let content = fs::read_to_string(&path).unwrap();
-        assert!(content.contains("# retained comment"));
-        let loaded = CoopConfig::load(&path).unwrap();
-        assert_eq!(loaded.ssh_port.get(), 2222);
-        assert_eq!(loaded.lima.builder_id, Some(first));
+        assert_eq!(read_builder_id(&cfg).unwrap(), Some(first.clone()));
         assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            fs::read_to_string(&path).unwrap(),
+            "# retained comment\nssh_port = 2222\n"
+        );
+        assert_eq!(
+            fs::metadata(cfg.data_dir.join(BUILDER_ID_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
     }
 
     #[test]
-    fn builder_id_persists_in_legacy_json_config() {
-        let root = crate::test_support::private_tempdir().unwrap();
-        let path = root.path().join("config.json");
-        fs::write(&path, "{\"ssh_port\":2222}\n").unwrap();
-        let cfg = CoopConfig::load(&path).unwrap();
-        let id = ensure_builder_id(&cfg).unwrap();
-        let loaded = CoopConfig::load(&path).unwrap();
-        assert_eq!(loaded.lima.builder_id, Some(id));
-        assert_eq!(loaded.ssh_port.get(), 2222);
+    fn saved_config_ids_are_migrated_without_rewriting_config() {
+        for (filename, content) in [
+            (
+                "config.toml",
+                "[lima]\nbuilder_id = 'f5lxx1zz5pnorynqglhzmsp33'\n",
+            ),
+            (
+                "config.json",
+                "{\"lima\":{\"builder_id\":\"f5lxx1zz5pnorynqglhzmsp33\"}}\n",
+            ),
+        ] {
+            let root = crate::test_support::private_tempdir().unwrap();
+            let path = root.path().join(filename);
+            fs::write(&path, content).unwrap();
+            let mut cfg = CoopConfig::load(&path).unwrap();
+            cfg.data_dir = crate::config::ConfigPath::new(root.path().join("data"));
+            let home = PrivateDir::create(&root.path().join("lima")).unwrap();
+            let (id, registration) = ensure_builder_id(
+                &cfg,
+                &home,
+                || bail!("migration should not query Lima"),
+                LimaBuilderId::generate,
+            )
+            .unwrap();
+            assert_eq!(registration, BuilderRegistration::Existing);
+            assert_eq!(id.as_str(), "f5lxx1zz5pnorynqglhzmsp33");
+            assert_eq!(read_builder_id(&cfg).unwrap(), Some(id));
+            assert_eq!(fs::read_to_string(&path).unwrap(), content);
+        }
     }
 
     #[test]
-    fn builder_id_creates_missing_default_config() {
+    fn data_directory_identity_takes_precedence_over_legacy_config() {
         let root = crate::test_support::private_tempdir().unwrap();
         let path = root.path().join("config.toml");
-        let cfg = CoopConfig::load(&path).unwrap();
+        fs::write(&path, "[lima]\nbuilder_id = 'f5lxx1zz5pnorynqglhzmsp33'\n").unwrap();
+        let mut cfg = CoopConfig::load(&path).unwrap();
+        cfg.data_dir = crate::config::ConfigPath::new(root.path().join("data"));
+        let data = PrivateDir::create(&cfg.data_dir).unwrap();
+        let saved = LimaBuilderId::new(&"a".repeat(32)).unwrap();
+        save_builder_id(&cfg, &data, &saved).unwrap();
+        let home = PrivateDir::create(&root.path().join("lima")).unwrap();
+        let (id, registration) = ensure_builder_id(
+            &cfg,
+            &home,
+            || bail!("saved builder should not query inventory"),
+            LimaBuilderId::generate,
+        )
+        .unwrap();
+        assert_eq!(registration, BuilderRegistration::Existing);
+        assert_eq!(id, saved);
+        assert_eq!(read_builder_id(&cfg).unwrap(), Some(saved));
+    }
+
+    #[test]
+    fn builder_id_does_not_create_missing_config() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        let mut cfg = CoopConfig::load(&path).unwrap();
+        cfg.data_dir = crate::config::ConfigPath::new(root.path().join("data"));
+        let home = PrivateDir::create(&root.path().join("lima")).unwrap();
         assert!(!path.exists());
-        let id = ensure_builder_id(&cfg).unwrap();
-        assert_eq!(CoopConfig::load(&path).unwrap().lima.builder_id, Some(id));
+        let (id, registration) =
+            ensure_builder_id(&cfg, &home, || Ok(String::new()), LimaBuilderId::generate).unwrap();
+        assert_eq!(registration, BuilderRegistration::New);
+        assert_eq!(read_builder_id(&cfg).unwrap(), Some(id));
+        assert!(!path.exists());
     }
 
     #[test]
-    fn malformed_builder_id_is_rejected_at_config_load() {
+    fn malformed_builder_id_file_is_rejected() {
         let root = crate::test_support::private_tempdir().unwrap();
-        let path = root.path().join("config.toml");
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path().join("data")),
+            ..CoopConfig::default()
+        };
+        fs::create_dir(&cfg.data_dir).unwrap();
+        let path = cfg.data_dir.join(BUILDER_ID_FILE);
         for invalid in [
             "short".to_owned(),
             "0".repeat(26),
@@ -3065,9 +3208,86 @@ mod tests {
             format!("{}_", "0".repeat(31)),
             format!("{}g", "0".repeat(31)),
         ] {
-            fs::write(&path, format!("[lima]\nbuilder_id = '{invalid}'\n")).unwrap();
-            assert!(CoopConfig::load(&path).is_err(), "accepted {invalid}");
+            fs::write(&path, format!("{invalid}\n")).unwrap();
+            assert!(read_builder_id(&cfg).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn first_registration_skips_occupied_lima_names_before_persisting() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path().join("data")),
+            ..CoopConfig::default()
+        };
+        let home = PrivateDir::create(&root.path().join("lima")).unwrap();
+        let inventory_id = LimaBuilderId::new(&"1".repeat(32)).unwrap();
+        let directory_id = LimaBuilderId::new(&"2".repeat(32)).unwrap();
+        let free_id = LimaBuilderId::new(&"3".repeat(32)).unwrap();
+        home.create_child(OsStr::new(&builder_name(&directory_id)))
+            .unwrap();
+        let mut candidates = [inventory_id.clone(), directory_id, free_id.clone()].into_iter();
+        let inventory = format!("{{\"name\":\"{}\"}}\n", builder_name(&inventory_id));
+
+        let (id, registration) = ensure_builder_id(
+            &cfg,
+            &home,
+            || Ok(inventory),
+            || Ok(candidates.next().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(registration, BuilderRegistration::New);
+        assert_eq!(id, free_id);
+        assert_eq!(read_builder_id(&cfg).unwrap(), Some(free_id));
+    }
+
+    #[test]
+    fn first_registration_fails_without_recording_when_names_remain_occupied() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path().join("data")),
+            ..CoopConfig::default()
+        };
+        let home = PrivateDir::create(&root.path().join("lima")).unwrap();
+        let occupied = LimaBuilderId::new(&"1".repeat(32)).unwrap();
+        let inventory = format!("{{\"name\":\"{}\"}}\n", builder_name(&occupied));
+        assert!(
+            ensure_builder_id(&cfg, &home, || Ok(inventory), || Ok(occupied.clone()),).is_err()
+        );
+        assert_eq!(read_builder_id(&cfg).unwrap(), None);
+    }
+
+    #[test]
+    fn failed_lima_inventory_probe_does_not_record_a_builder_name() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path().join("data")),
+            ..CoopConfig::default()
+        };
+        let home = PrivateDir::create(&root.path().join("lima")).unwrap();
+        let candidate = LimaBuilderId::new(&"1".repeat(32)).unwrap();
+        for inventory in ["not JSON", "{\"status\":\"Running\"}"] {
+            assert!(
+                ensure_builder_id(
+                    &cfg,
+                    &home,
+                    || Ok(inventory.to_owned()),
+                    || Ok(candidate.clone()),
+                )
+                .is_err()
+            );
+            assert_eq!(read_builder_id(&cfg).unwrap(), None);
+        }
+        assert!(
+            ensure_builder_id(
+                &cfg,
+                &home,
+                || bail!("limactl list failed"),
+                || Ok(candidate.clone()),
+            )
+            .is_err()
+        );
+        assert_eq!(read_builder_id(&cfg).unwrap(), None);
     }
 
     #[test]
@@ -3080,22 +3300,30 @@ mod tests {
         let home = root.path().join("lima");
         let config_path = root.path().join("config.toml");
         fs::write(&config_path, "").unwrap();
-        let first_cfg = CoopConfig::load(&config_path).unwrap();
-        let first = BuilderContext::acquire_in(&first_cfg, &home).unwrap();
+        let mut first_cfg = CoopConfig::load(&config_path).unwrap();
+        first_cfg.data_dir = crate::config::ConfigPath::new(root.path().join("data"));
+        let first = BuilderContext::acquire_in(&first_cfg, &home, || Ok(String::new())).unwrap();
         let first_name = first.name.clone();
+        assert_eq!(first.registration, BuilderRegistration::New);
         let probe = File::open(home.join(".coop-builder-lifecycle.lock")).unwrap();
         // SAFETY: probe owns the open descriptor throughout the flock calls.
         let blocked = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(blocked, -1, "builder context must hold the shared lock");
         assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
 
-        let second_cfg = CoopConfig::load(&config_path).unwrap();
+        let mut second_cfg = CoopConfig::load(&config_path).unwrap();
+        second_cfg.data_dir = first_cfg.data_dir.clone();
         let (started_tx, started_rx) = mpsc::channel();
         let (acquired_tx, acquired_rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             started_tx.send(()).unwrap();
-            let second = BuilderContext::acquire_in(&second_cfg, &home).unwrap();
-            acquired_tx.send(second.name).unwrap();
+            let second = BuilderContext::acquire_in(&second_cfg, &home, || {
+                bail!("saved builder should not query inventory")
+            })
+            .unwrap();
+            acquired_tx
+                .send((second.name, second.registration))
+                .unwrap();
         });
         started_rx.recv().unwrap();
         assert!(
@@ -3106,7 +3334,7 @@ mod tests {
         drop(first);
         assert_eq!(
             acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            first_name
+            (first_name, BuilderRegistration::Existing)
         );
         handle.join().unwrap();
         // SAFETY: probe is still open and the builder context has been dropped.
@@ -3157,13 +3385,23 @@ mod tests {
         let root = Path::new(&root);
         let config_path = root.join("config.toml");
         fs::write(&config_path, "").unwrap();
-        let cfg = CoopConfig::load(&config_path).unwrap();
-        let builder = BuilderContext::acquire_in(&cfg, &root.join("lima")).unwrap();
-        remove_prior_builder(&builder).unwrap();
+        let mut cfg = CoopConfig::load(&config_path).unwrap();
+        cfg.data_dir = crate::config::ConfigPath::new(root.join("data"));
+        let home = root.join("lima");
+        let first = BuilderContext::acquire_in(&cfg, &home, || Ok(String::new())).unwrap();
+        assert_eq!(first.registration, BuilderRegistration::New);
+        remove_prior_builder_if_needed(&first).unwrap();
+        assert!(!root.join("calls").exists());
+        drop(first);
+        let builder = BuilderContext::acquire_in(&cfg, &home, || {
+            bail!("saved builder should not query inventory")
+        })
+        .unwrap();
+        remove_prior_builder_if_needed(&builder).unwrap();
         let calls = fs::read_to_string(root.join("calls")).unwrap();
         assert_eq!(calls, format!("delete --force {}\n", builder.name));
         fs::write(root.join("fail"), "").unwrap();
-        assert!(remove_prior_builder(&builder).is_err());
+        assert!(remove_prior_builder_if_needed(&builder).is_err());
     }
 
     #[test]
@@ -3189,6 +3427,10 @@ mod tests {
         };
         assert!(check_writable_mounts_at(&cfg, &[], None, &control).is_ok());
         assert!(check_writable_mounts_at(&cfg, &[], Some(name), &control).is_err());
+        let id = LimaBuilderId::new("0123456789abcdef0123456789abcdef").unwrap();
+        let data_dir = PrivateDir::open_existing(&data).unwrap();
+        save_builder_id(&cfg, &data_dir, &id).unwrap();
+        assert!(check_writable_mounts_with_state_at(&cfg, &[], &control).is_err());
     }
 
     #[test]

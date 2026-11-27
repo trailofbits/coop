@@ -863,7 +863,7 @@ impl NetworkHostToolsConfig {
     }
 }
 
-/// Stable random identity for the Lima image builder in one coop installation.
+/// Stable random identity for the Lima image builder in one coop data directory.
 /// New IDs use 32 lowercase hex digits. Saved 25-character IDs remain valid
 /// so setup can still find and clean up their builder VMs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -881,7 +881,7 @@ impl LimaBuilderId {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase());
         if !hex && !legacy {
-            bail!("lima.builder_id must be 32 lowercase hex digits or a 25-character legacy ID");
+            bail!("Lima builder ID must be 32 lowercase hex digits or a 25-character legacy ID");
         }
         Ok(Self(value.to_owned()))
     }
@@ -913,6 +913,7 @@ impl From<LimaBuilderId> for String {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct LimaConfig {
+    /// Read only for migration from configs written by older drafts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builder_id: Option<LimaBuilderId>,
 }
@@ -942,7 +943,7 @@ pub struct CoopConfig {
     #[serde(default)]
     pub network: NetworkConfig,
 
-    /// Lima builder identity, generated once during setup.
+    /// Legacy builder identity, migrated to private data directory state by setup.
     #[serde(default, skip_serializing_if = "LimaConfig::is_empty")]
     pub lima: LimaConfig,
 

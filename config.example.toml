@@ -42,9 +42,6 @@
 # [setup]
 # prompt_for_pat = true           # auto-prompt to set up a PAT at `coop start`
 
-# [lima]                         # macOS: coop setup writes builder_id here automatically.
-# Do not copy a builder_id between installations sharing one Lima home.
-
 # [vm]
 # firecracker_control = "legacy_tcp" # Linux only: "legacy_tcp" or opt-in "vsock" for new instances
 # firecracker_network = "open"     # Linux only: "open" or "isolated"; isolated requires vsock

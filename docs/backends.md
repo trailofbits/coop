@@ -22,7 +22,7 @@ Coop resolves `limactl` through the shared host-tool validator and uses a fixed 
 
 `coop setup` builds a golden disk image that all instances clone from:
 
-1. Generates a builder ID once and saves it under `[lima]` in the selected coop config file.
+1. Generates a builder ID once per coop data directory, confirms the Lima name is unused, and saves it in `data_dir/lima-builder-id` before creating the VM. A saved ID in an older config is adopted instead.
 2. Generates an ed25519 SSH key pair, stored in the coop data directory.
 3. Creates a temporary builder VM named `cb-<id>` from an Ubuntu 24.04 cloud image. Project VMs use the `coop-` prefix, so a project named `builder` keeps the name `coop-builder`. The Lima YAML template includes a cloud-init provision script.
 4. The provision script installs all packages (Docker, GitHub CLI, Claude Code, Codex, Grok Build, and any profile packages), creates the `ubuntu` user with SSH access, and enables services.
@@ -30,7 +30,7 @@ Coop resolves `limactl` through the shared host-tool validator and uses a fixed 
 6. Stops the builder VM and extracts its disk as the golden image.
 7. Generates a fast-start Lima template that references the golden image directly. No cloud-init provisioning runs on instance start.
 
-Only one Lima image build runs at a time for a given Lima home. Coop attempts to delete the builder VM after extraction or failure. A retry first deletes any VM with this installation's saved builder name, then creates a new one; coop treats that random name as its own. If the config file is removed or the ID is changed, an interrupted builder under the old name is not recovered automatically. Older coop versions used `coop-builder`, which may also be a project VM, so this version leaves it alone. Inspect Lima's inventory and remove it manually only if it is a leftover builder.
+Only one Lima image build runs at a time for a given Lima home. On first registration, coop checks both Lima's inventory and control directory for the generated name; it does not delete a VM under a newly registered name. Coop attempts to delete its builder after extraction or failure. A retry first deletes any VM with the saved builder name, then creates a new one; coop treats that recorded name as its own. If the recorded ID is lost (for example, after removing or changing `data_dir`), an interrupted builder under the old name needs manual cleanup. Older coop versions used `coop-builder`, which may also be a project VM, so this version leaves it alone. Inspect Lima's inventory and remove it manually only if it is a leftover builder.
 
 ### How instances work
 

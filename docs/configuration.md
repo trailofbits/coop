@@ -20,12 +20,12 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 | `post_create` | string | unset | Global shell command run during VM creation, after workspace provisioning. Successful completion is recorded; failures retain the VM and block agent launch. See [Creation hooks](#creation-hooks). |
 | `post_start` | string | unset | Shell command run in the guest after every successful boot and workspace/mount provisioning, before any interactive `shell` / agent launch. Failure is logged at `WARN` and does not fail startup. Override per invocation with `coop up --post-start <cmd>` or `coop start --post-start <cmd>`. |
 
-On macOS, `coop setup` creates or updates the selected config file with a
-`lima.builder_id` value before it starts an image builder. In TOML this is a
-`[lima]` table; legacy JSON config files use a `lima` object. This ID is
-generated once, is reused for later builds, and should not be edited.
-The selected config location must allow coop to replace the file on the first
-Lima setup. Its permission is made no broader than `0600` when the ID is saved.
+On macOS, `coop setup` saves the image builder identity in the private
+`data_dir/lima-builder-id` file before it starts a builder VM. The ID is
+generated once per data directory and reused for later builds. A saved
+`lima.builder_id` value in an older TOML or JSON config is copied into this
+file on the next setup; after that, the data directory copy takes precedence.
+Coop does not edit the selected config file during setup.
 See [Lima builder recovery](backends.md#setup-process).
 
 ### Private host storage
