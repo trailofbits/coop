@@ -1271,12 +1271,15 @@ test_status_running() {
         fi
     fi
 
-    # Multi-instance list: compact summary with valid percentages
-    # Format: "load=X.XX mem=NN% disk=NN%"
+    # The final two columns of the running row are memory and disk usage.
     if coop status; then
-        local mem_pct disk_pct
-        mem_pct=$(echo "$HARNESS_OUT" | sed -n 's/.*mem=\([0-9][0-9]*\)%.*/\1/p' | head -1)
-        disk_pct=$(echo "$HARNESS_OUT" | sed -n 's/.*disk=\([0-9][0-9]*\)%.*/\1/p' | head -1)
+        local mem_pct="" disk_pct="" usage
+        usage=$(sed -n '/^Running$/,/^Stopped$/p' <<<"$HARNESS_OUT" |
+            awk -v name="$INSTANCE" 'NF >= 5 && ($1 "") == (name "") { print $(NF-1), $NF }')
+        if [[ "$usage" =~ ^([0-9]+)%[[:space:]]+([0-9]+)%$ ]]; then
+            mem_pct=${BASH_REMATCH[1]}
+            disk_pct=${BASH_REMATCH[2]}
+        fi
         if [[ -n "$mem_pct" && "$mem_pct" -le 100 && -n "$disk_pct" && "$disk_pct" -le 100 ]]; then
             pass "status list shows resource summary (mem=${mem_pct}% disk=${disk_pct}%)"
         else
@@ -1341,7 +1344,7 @@ test_auto_resolve_running() {
     # Skip if other instances exist (pre-existing state from outside test).
 
     local running_count
-    running_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -c "running" || true)
+    running_count=$(RUST_LOG=off "$BINARY" list --json 2>/dev/null | grep -c '"state": "running"' || true)
 
     if [[ "$running_count" -ne 1 ]]; then
         skip "shell auto-resolves single running instance" "$running_count running (need exactly 1)"
@@ -4117,7 +4120,7 @@ PYEOF
     else
         fail "stopped legacy fixture has root-owned mode-0755 sockets and no PID"
     fi
-    if coop status && grep -qE "^${INSTANCE}[[:space:]]+stopped" <<<"$HARNESS_OUT"; then
+    if coop status && sed -n '/^Stopped$/,$p' <<<"$HARNESS_OUT" | grep -E "^${INSTANCE}[[:space:]]" >/dev/null; then
         pass "bare status reports old stopped VM with stale sockets"
     else
         fail "bare status reports old stopped VM with stale sockets" \
@@ -4393,7 +4396,7 @@ test_auto_resolve_stopped() {
     # Skip if other instances are running (pre-existing state).
 
     local running_count
-    running_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -c "running" || true)
+    running_count=$(RUST_LOG=off "$BINARY" list --json 2>/dev/null | grep -c '"state": "running"' || true)
 
     if [[ "$running_count" -gt 0 ]]; then
         skip "shell rejects when only stopped instances exist" "$running_count still running"
@@ -4446,7 +4449,7 @@ test_list_empty() {
     # Assert what this phase actually owns: the just-destroyed `$INSTANCE`
     # is gone. The empty-state message is only asserted on a clean host.
     local instance_count
-    instance_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -cE "running|stopped" || true)
+    instance_count=$(RUST_LOG=off "$BINARY" list --json 2>/dev/null | grep -cE '"state": "(running|stopped)"' || true)
 
     if [[ "$instance_count" -gt 0 ]]; then
         if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} "; then
@@ -4487,7 +4490,7 @@ test_status_stopped() {
             fail "stopped instance appears in status list" "got: $HARNESS_OUT"
         fi
 
-        if echo "$HARNESS_OUT" | grep "$INSTANCE" | grep -qi "stopped"; then
+        if sed -n '/^Stopped$/,$p' <<<"$HARNESS_OUT" | grep -E "^${INSTANCE}[[:space:]]" >/dev/null; then
             pass "status list shows stopped state"
         else
             fail "status list shows stopped state" "got: $HARNESS_OUT"
@@ -5503,7 +5506,7 @@ test_auto_resolve_no_instances() {
     # Skip if other instances exist (pre-existing state).
 
     local instance_count
-    instance_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -cE "running|stopped" || true)
+    instance_count=$(RUST_LOG=off "$BINARY" list --json 2>/dev/null | grep -cE '"state": "(running|stopped)"' || true)
 
     if [[ "$instance_count" -gt 0 ]]; then
         skip "shell rejects when no instances exist" "$instance_count instances still present"
