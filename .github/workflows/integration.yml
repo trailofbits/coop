@@ -51,6 +51,12 @@ jobs:
           df -h /
           free -h
 
+      - name: Disk operation check
+        if: matrix.shard == 'lifecycle'
+        run: |
+          cargo build --release --bin coop
+          COOP_BIN="$PWD/target/release/coop" bash tests/privileged-disk.sh
+
       - name: Full Firecracker integration
         timeout-minutes: 60
         env:

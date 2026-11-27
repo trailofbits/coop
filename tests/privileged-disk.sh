@@ -35,8 +35,17 @@ printf 'data_dir = "%s"\n' "$data_dir" >"$data_dir/config.toml"
 "$coop_bin" --config "$data_dir/config.toml" list >/dev/null
 [[ $(stat -c %a "$stage") == 600 ]]
 mkdir -m 0700 "$data_dir/instances/test" "$data_dir/instances/sparse"
+user_disk="$data_dir/instances/user-owned/rootfs.ext4"
+mkdir -m 0700 "$data_dir/instances/user-owned"
+truncate -s 8G "$user_disk"
+mkfs.ext4 -F "$user_disk" >/dev/null
+sudo -n "$coop_bin" __disk-op fsck-read "$data_dir" "$user_disk" >/dev/null
+sudo -n "$coop_bin" __disk-op resize "$data_dir" "$user_disk" >/dev/null
 
 sudo -n "$coop_bin" __disk-op format "$data_dir" "$stage" >/dev/null
+sudo -n "$coop_bin" __disk-op sandbox-probe "$data_dir" "$stage"
+sudo -n "$coop_bin" __disk-op sandbox-probe-read "$data_dir" "$stage"
+sudo -n "$coop_bin" __disk-op sandbox-probe-launch "$data_dir" "$stage" >/dev/null
 sudo -n "$coop_bin" __disk-op fsck-read "$data_dir" "$stage" >/dev/null
 sudo -n "$coop_bin" __disk-op mount "$data_dir" "$stage"
 # Holding cwd inside the mount reproduces an EBUSY unmount. A failed cleanup

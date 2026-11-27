@@ -831,7 +831,9 @@ instances.
 
 On Firecracker, retry an interrupted disk resize with the same absolute
 `--size` while the instance is stopped. The retry checks and grows the ext4
-filesystem even if the image file already has the requested length.
+filesystem even if the image file already has the requested length. The host
+must support Landlock and seccomp for the filesystem
+tools; an isolation setup failure never runs them without the sandbox.
 
 By default the instance is left stopped and the change takes effect on the next
 `coop start`. Pass `--start` to boot it immediately. If a start fails and the

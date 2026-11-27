@@ -160,8 +160,27 @@ filesystem tools again after `sudo`. Setup launches from `/` with a cleared
 environment, fixed system `PATH`, and `LANG=C`/`LC_ALL=C`; curl also disables
 its default config file and receives only HTTPS proxy and no-proxy settings
 from the caller. Elevated programs remain subject to trusted sudoers and host
-package-manager configuration. Before package installation, setup checks the
-filesystem entries below `/etc/apt`, their symlink targets, and apt
+package-manager configuration.
+
+The privileged disk helper applies a fail-closed sandbox before launching host
+`e2fsck` or `resize2fs` on a verified image inode. Landlock denies reads,
+writes, and direct execution by default; it allows disk read/write, the exact
+tool and ELF interpreter for execution, and limited system library/configuration
+reads. A seccomp filter blocks new sockets, process creation, root-owner
+metadata changes, signals, and host IPC access. Worker threads remain allowed
+because `e2fsck` uses them on large images; forks into separate processes are
+denied. The helper drops all capabilities and uses the disk owner's UID/GID.
+The parser still receives its standard output and error descriptors, and
+procfs file reads and system
+library reads remain available. The dynamic ELF interpreter can load readable
+ELF files without a second `execve`, so this is not a guarantee that only the
+named tool's code can run after a parser compromise. The seccomp and filesystem
+restrictions remain inherited by any code it loads. Landlock ABI v3 (Linux 6.2)
+is required so pathname truncation is also denied. Unsupported Landlock or
+seccomp setup stops the disk operation before parsing.
+
+Before package installation, setup checks the filesystem entries below
+`/etc/apt`, their symlink targets, and apt
 configuration include paths for root ownership and group/other writability.
 Private root-owned apt fragments are read through the resolved `cat` under
 the same bounded `sudo` launch path; their contents are not logged.

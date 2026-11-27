@@ -2,7 +2,7 @@
 //! managed paths *after* sudo, then uses pinned directories and files.
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{
@@ -15,12 +15,20 @@ use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use landlock::{
+    ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
+    RulesetCreatedAttr, RulesetStatus,
+};
 use rustix::fs::{AtFlags, StatxFlags, statx};
 
 use crate::setup_tool::SetupTool;
 
 const COPY_LOCK_NAME: &CStr = c".coop-disk-copy.lock";
 const COPY_TMP_NAME: &CStr = c".coop-disk-copy.tmp";
+#[cfg(target_arch = "x86_64")]
+const DISK_TOOL_AUDIT_ARCH: u32 = 0xc000_003e;
+#[cfg(target_arch = "aarch64")]
+const DISK_TOOL_AUDIT_ARCH: u32 = 0xc000_00b7;
 
 struct DiskPath {
     root: File,
@@ -39,6 +47,7 @@ enum DiskKind {
 enum DiskTool {
     FsckFix,
     FsckRead,
+    FsckLaunchProbe,
     Resize,
     Format,
 }
@@ -46,7 +55,7 @@ enum DiskTool {
 impl DiskTool {
     fn setup_role(self) -> SetupTool {
         match self {
-            Self::FsckFix | Self::FsckRead => SetupTool::E2fsck,
+            Self::FsckFix | Self::FsckRead | Self::FsckLaunchProbe => SetupTool::E2fsck,
             Self::Resize => SetupTool::Resize2fs,
             Self::Format => SetupTool::MkfsExt4,
         }
@@ -59,7 +68,7 @@ impl DiskTool {
         match self {
             // e2fsck(8): 1 means errors corrected; other bits still require failure.
             Self::FsckFix => status.code() == Some(1),
-            Self::FsckRead | Self::Resize | Self::Format => false,
+            Self::FsckRead | Self::FsckLaunchProbe | Self::Resize | Self::Format => false,
         }
     }
 }
@@ -390,6 +399,11 @@ pub(crate) fn run(operation: &str, root: &Path, path: &Path, argument: Option<&s
             disk_tool(&disk, uid, DiskTool::FsckRead, &["-fn"], false)
         }
         "resize" if argument.is_none() => disk_tool(&disk, uid, DiskTool::Resize, &[], true),
+        "sandbox-probe" if argument.is_none() => sandbox_probe(&disk, uid, DiskTool::Resize),
+        "sandbox-probe-read" if argument.is_none() => sandbox_probe(&disk, uid, DiskTool::FsckRead),
+        "sandbox-probe-launch" if argument.is_none() => {
+            disk_tool(&disk, uid, DiskTool::FsckLaunchProbe, &["-fn"], false)
+        }
         "format" if argument.is_none() => format_disk(&disk, uid),
         "mount" if argument.is_none() => mount_disk(&disk, uid),
         "unmount" if argument.is_none() => unmount_target(&disk, None),
@@ -510,6 +524,509 @@ fn ensure_unmounted(disk: &DiskPath) -> Result<()> {
 
 fn proc_fd(file: &File) -> String {
     format!("/proc/self/fd/{}", file.as_raw_fd())
+}
+
+/// The root helper is dedicated to one operation, so confine it before it
+/// forks the filesystem parser. The inode checked by `DiskPath::file` is the
+/// only regular file the tool can open for writing; inherited output
+/// descriptors may already refer to other files. Image metadata is untrusted.
+fn confine_filesystem_tool(disk: &File, program: &Path, tool: DiskTool) -> Result<()> {
+    // These system trees contain the executable, loader, and shared libraries.
+    // Their contents are readable but never executable through this rule.
+    let read = AccessFs::ReadFile | AccessFs::ReadDir;
+    let disk_access = if matches!(tool, DiskTool::FsckRead | DiskTool::FsckLaunchProbe) {
+        AccessFs::ReadFile.into()
+    } else {
+        AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate
+    };
+    let mut rules = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_all(ABI::V3))?
+        .create()?
+        .add_rule(PathBeneath::new(disk.try_clone()?, disk_access))?
+        .add_rule(PathBeneath::new(
+            PathFd::new(program)?,
+            AccessFs::ReadFile | AccessFs::Execute,
+        ))?;
+    for path in ["/usr/lib", "/usr/lib64", "/lib", "/lib64", "/nix/store"] {
+        if Path::new(path).exists() {
+            rules = rules.add_rule(PathBeneath::new(PathFd::new(path)?, read))?;
+        }
+    }
+    // The kernel also executes a dynamic ELF's interpreter. Read PT_INTERP
+    // from the trusted binary so only that loader is executable, including
+    // non-FHS paths such as Nix's store.
+    if let Some(interpreter) = elf_interpreter(program)? {
+        let policy = crate::host_tool::TrustedToolPolicy::new(
+            "/",
+            ["/lib", "/lib64", "/usr/lib", "/usr/lib64", "/nix/store"].map(PathBuf::from),
+            0,
+        );
+        let (canonical, metadata) = crate::host_tool::validate_trusted_path(&interpreter, &policy)
+            .map_err(anyhow::Error::msg)
+            .context("Filesystem tool ELF interpreter is not trusted")?;
+        if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+            bail!("Filesystem tool ELF interpreter is not executable");
+        }
+        rules = rules.add_rule(PathBeneath::new(PathFd::new(canonical)?, AccessFs::Execute))?;
+    }
+    for path in [
+        "/etc/ld.so.cache",
+        "/etc/e2fsck.conf",
+        "/sys/devices/system/cpu/possible",
+    ] {
+        if Path::new(path).exists() {
+            rules = rules.add_rule(PathBeneath::new(PathFd::new(path)?, AccessFs::ReadFile))?;
+        }
+    }
+    // e2fsprogs opens /proc/mounts through the calling task's /proc/self
+    // symlink. A rule on one task's proc inode does not cover its child, so
+    // allow file reads beneath procfs without directory enumeration. Landlock
+    // also blocks ptrace-style access from this domain to outside processes.
+    rules = rules.add_rule(PathBeneath::new(PathFd::new("/proc")?, AccessFs::ReadFile))?;
+    rules = rules.add_rule(PathBeneath::new(
+        PathFd::new("/dev/null")?,
+        AccessFs::ReadFile | AccessFs::WriteFile,
+    ))?;
+
+    let status = rules.restrict_self()?;
+    if !matches!(status.ruleset, RulesetStatus::FullyEnforced) {
+        bail!("Disk tool filesystem sandbox is not fully enforced");
+    }
+
+    drop_disk_tool_capabilities(disk)?;
+    Ok(())
+}
+
+fn elf_interpreter(program: &Path) -> Result<Option<PathBuf>> {
+    let mut file = File::open(program)?;
+    let length = file.metadata()?.len();
+    let mut header = [0_u8; 64];
+    file.read_exact(&mut header)?;
+    if &header[..4] != b"\x7fELF" || header[4] != 2 || header[5] != 1 {
+        bail!("Sandboxed filesystem tool must be a little-endian ELF64 binary");
+    }
+    let ph_offset = u64::from_le_bytes(header[32..40].try_into()?);
+    let ph_size = u64::from(u16::from_le_bytes(header[54..56].try_into()?));
+    let ph_count = u64::from(u16::from_le_bytes(header[56..58].try_into()?));
+    if ph_size < 56
+        || ph_count > 256
+        || ph_offset
+            .checked_add(
+                ph_size
+                    .checked_mul(ph_count)
+                    .context("ELF header overflow")?,
+            )
+            .is_none_or(|end| end > length)
+    {
+        bail!("Sandboxed filesystem tool has an invalid ELF program table");
+    }
+    for index in 0..ph_count {
+        file.seek(SeekFrom::Start(ph_offset + index * ph_size))?;
+        let mut entry = [0_u8; 56];
+        file.read_exact(&mut entry)?;
+        if u32::from_le_bytes(entry[..4].try_into()?) != 3 {
+            continue;
+        }
+        let offset = u64::from_le_bytes(entry[8..16].try_into()?);
+        let size = u64::from_le_bytes(entry[32..40].try_into()?);
+        if !(2..=4096).contains(&size) || offset.checked_add(size).is_none_or(|end| end > length) {
+            bail!("Sandboxed filesystem tool has an invalid ELF interpreter");
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0; usize::try_from(size)?];
+        file.read_exact(&mut bytes)?;
+        let interpreter = CStr::from_bytes_with_nul(&bytes)
+            .context("Sandboxed filesystem tool has an invalid ELF interpreter string")?;
+        let path = PathBuf::from(OsStr::from_bytes(interpreter.to_bytes()));
+        if !path.is_absolute() {
+            bail!("Sandboxed filesystem tool has a relative ELF interpreter");
+        }
+        return Ok(Some(path));
+    }
+    Ok(None)
+}
+
+/// Landlock does not mediate chmod/chown, xattrs, timestamps, or signals. This
+/// filter closes those root-owner escape paths, separate process creation,
+/// and sockets.
+/// Install it in `pre_exec`: Rust uses a socket pair while spawning a child.
+fn disk_tool_denied_syscalls() -> Vec<libc::c_long> {
+    let common = [
+        libc::SYS_socket,
+        libc::SYS_socketpair,
+        libc::SYS_clone3,
+        libc::SYS_execveat,
+        libc::SYS_memfd_create,
+        libc::SYS_fchmod,
+        libc::SYS_fchmodat,
+        452, // fchmodat2 on the supported x86_64 and aarch64 Linux ABIs.
+        libc::SYS_fchown,
+        libc::SYS_fchownat,
+        libc::SYS_setxattr,
+        libc::SYS_lsetxattr,
+        libc::SYS_fsetxattr,
+        libc::SYS_removexattr,
+        libc::SYS_lremovexattr,
+        libc::SYS_fremovexattr,
+        libc::SYS_utimensat,
+        libc::SYS_kill,
+        libc::SYS_tkill,
+        libc::SYS_tgkill,
+        libc::SYS_pidfd_send_signal,
+        libc::SYS_rt_sigqueueinfo,
+        libc::SYS_rt_tgsigqueueinfo,
+        libc::SYS_ptrace,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
+        libc::SYS_keyctl,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_bpf,
+        libc::SYS_perf_event_open,
+        libc::SYS_shmget,
+        libc::SYS_shmat,
+        libc::SYS_shmctl,
+        libc::SYS_semget,
+        libc::SYS_semop,
+        libc::SYS_semctl,
+        libc::SYS_msgget,
+        libc::SYS_msgsnd,
+        libc::SYS_msgrcv,
+        libc::SYS_msgctl,
+    ];
+    #[cfg(target_arch = "x86_64")]
+    let legacy_syscalls = [
+        libc::SYS_fork,
+        libc::SYS_vfork,
+        libc::SYS_chmod,
+        libc::SYS_chown,
+        libc::SYS_lchown,
+        libc::SYS_utime,
+        libc::SYS_utimes,
+        libc::SYS_futimesat,
+    ];
+    #[cfg(target_arch = "x86_64")]
+    let syscalls = common.into_iter().chain(legacy_syscalls).collect();
+    #[cfg(not(target_arch = "x86_64"))]
+    let syscalls = common.to_vec();
+    syscalls
+}
+
+fn disk_tool_syscall_filter() -> Result<Vec<libc::sock_filter>> {
+    let load_field = |offset: u32| -> Result<libc::sock_filter> {
+        Ok(libc::sock_filter {
+            code: u16::try_from(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS)?,
+            jt: 0,
+            jf: 0,
+            k: offset,
+        })
+    };
+    let deny = libc::sock_filter {
+        code: u16::try_from(libc::BPF_RET | libc::BPF_K)?,
+        jt: 0,
+        jf: 0,
+        k: libc::SECCOMP_RET_ERRNO | u32::try_from(libc::EPERM)?,
+    };
+    let unavailable = libc::sock_filter {
+        k: libc::SECCOMP_RET_ERRNO | u32::try_from(libc::ENOSYS)?,
+        ..deny
+    };
+    let allow = libc::sock_filter {
+        code: u16::try_from(libc::BPF_RET | libc::BPF_K)?,
+        jt: 0,
+        jf: 0,
+        k: libc::SECCOMP_RET_ALLOW,
+    };
+    let mut filter = vec![
+        load_field(u32::try_from(std::mem::offset_of!(
+            libc::seccomp_data,
+            arch
+        ))?)?,
+        libc::sock_filter {
+            code: u16::try_from(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K)?,
+            jt: 1,
+            jf: 0,
+            k: DISK_TOOL_AUDIT_ARCH,
+        },
+        deny,
+        load_field(0)?,
+    ];
+    #[cfg(target_arch = "x86_64")]
+    filter.extend([
+        libc::sock_filter {
+            code: u16::try_from(libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K)?,
+            jt: 0,
+            jf: 1,
+            k: 0x4000_0000, // x32 syscall bit; those numbers differ from x86_64.
+        },
+        deny,
+    ]);
+    // e2fsck uses worker threads for large images. Permit only clone calls
+    // that join the current thread group; clone3's pointer flags cannot be
+    // inspected by classic seccomp BPF, so report ENOSYS for libc fallback.
+    filter.extend([
+        libc::sock_filter {
+            code: u16::try_from(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K)?,
+            jt: 0,
+            jf: 4,
+            k: u32::try_from(libc::SYS_clone)?,
+        },
+        load_field(u32::try_from(std::mem::offset_of!(
+            libc::seccomp_data,
+            args
+        ))?)?,
+        libc::sock_filter {
+            code: u16::try_from(libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K)?,
+            jt: 1,
+            jf: 0,
+            k: u32::try_from(libc::CLONE_THREAD)?,
+        },
+        deny,
+        allow,
+        load_field(0)?,
+    ]);
+    for number in disk_tool_denied_syscalls() {
+        filter.push(libc::sock_filter {
+            code: u16::try_from(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K)?,
+            jt: 0,
+            jf: 1,
+            k: u32::try_from(number)?,
+        });
+        filter.push(if number == libc::SYS_clone3 {
+            unavailable
+        } else {
+            deny
+        });
+    }
+    filter.push(allow);
+    Ok(filter)
+}
+
+fn install_disk_tool_syscall_filter(filter: &mut [libc::sock_filter]) -> io::Result<()> {
+    let Ok(len) = u16::try_from(filter.len()) else {
+        return Err(io::Error::from_raw_os_error(libc::E2BIG));
+    };
+    let program = libc::sock_fprog {
+        len,
+        filter: filter.as_mut_ptr(),
+    };
+    if unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER,
+            &raw const program,
+            0,
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[repr(C)]
+struct CapabilityHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapabilityData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+fn drop_disk_tool_capabilities(disk: &File) -> Result<()> {
+    // Lock the root-UID exception before clearing the sets: execve must not
+    // silently restore capabilities to a UID-0 e2fsprogs process.
+    let securebits = libc::SECBIT_NOROOT | libc::SECBIT_NOROOT_LOCKED;
+    if unsafe { libc::prctl(libc::PR_SET_SECUREBITS, securebits, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error()).context("Cannot lock disk tool securebits");
+    }
+    if unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error())
+            .context("Cannot clear disk tool ambient capabilities");
+    }
+    for capability in 0..64 {
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINVAL) {
+                return Err(error).context("Cannot clear disk tool capability bounding set");
+            }
+        }
+    }
+    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+        return Err(io::Error::last_os_error()).context("Cannot clear disk tool groups");
+    }
+    let owner = disk.metadata()?;
+    if unsafe { libc::setresgid(owner.gid(), owner.gid(), owner.gid()) } != 0 {
+        return Err(io::Error::last_os_error()).context("Cannot set disk tool group");
+    }
+    if unsafe { libc::setresuid(owner.uid(), owner.uid(), owner.uid()) } != 0 {
+        return Err(io::Error::last_os_error()).context("Cannot set disk tool user");
+    }
+    let header = CapabilityHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let empty = CapabilityData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    };
+    let data = [empty; 2];
+    if unsafe { libc::syscall(libc::SYS_capset, &raw const header, &raw const data) } != 0 {
+        return Err(io::Error::last_os_error()).context("Cannot clear disk tool capabilities");
+    }
+    Ok(())
+}
+
+/// Exercise the policy with harmless opens and a denied launch of a different
+/// trusted filesystem tool. Called by the privileged disk probe.
+fn sandbox_probe(disk: &DiskPath, uid: u32, tool: DiskTool) -> Result<()> {
+    let read_only = matches!(tool, DiskTool::FsckRead);
+    let file = disk.file(!read_only, uid)?;
+    let executable = tool.setup_role().command()?.build();
+    let other_tool = if read_only {
+        SetupTool::Resize2fs
+    } else {
+        SetupTool::E2fsck
+    };
+    let mut other_command = other_tool.command()?.build();
+    confine_filesystem_tool(&file, Path::new(executable.get_program()), tool)?;
+    match File::open("/etc/passwd") {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+        result => bail!("Disk tool could read an unrelated host file: {result:?}"),
+    }
+    match File::open("/proc/1/environ") {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+        result => bail!("Disk tool could read another process's environment: {result:?}"),
+    }
+    match fs::OpenOptions::new().write(true).open("/etc/passwd") {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+        result => bail!("Disk tool could open an unrelated host file for writing: {result:?}"),
+    }
+    match other_command.status() {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+        result => bail!("Disk tool could launch an unrelated program: {result:?}"),
+    }
+    let mut syscall_filter = disk_tool_syscall_filter()?;
+    install_disk_tool_syscall_filter(&mut syscall_filter)
+        .context("Cannot block disk tool syscalls in probe")?;
+    match std::os::unix::net::UnixStream::pair() {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+        result => bail!("Disk tool could create a Unix socket pair: {result:?}"),
+    }
+    let worker = std::thread::spawn(|| 17);
+    if worker.join().is_err() {
+        bail!("Disk tool could not run a worker thread");
+    }
+    probe_process_restrictions()?;
+    match std::net::TcpStream::connect("127.0.0.1:1") {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+        result => bail!("Disk tool could create a TCP connection: {result:?}"),
+    }
+    match file.set_permissions(file.metadata()?.permissions()) {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+        result => bail!("Disk tool could change file permissions: {result:?}"),
+    }
+    if unsafe { libc::kill(1, 0) } != -1
+        || io::Error::last_os_error().kind() != io::ErrorKind::PermissionDenied
+    {
+        bail!("Disk tool could signal another host process");
+    }
+    if read_only {
+        match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(proc_fd(&file))
+        {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+            result => bail!("Read-only disk tool could write its image: {result:?}"),
+        }
+        File::open(proc_fd(&file))?;
+    } else {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(proc_fd(&file))?;
+    }
+    let header = CapabilityHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let empty = CapabilityData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    };
+    let mut data = [empty; 2];
+    if unsafe { libc::syscall(libc::SYS_capget, &raw const header, &raw mut data) } != 0 {
+        return Err(io::Error::last_os_error()).context("Cannot inspect disk tool capabilities");
+    }
+    if data
+        .iter()
+        .any(|entry| entry.effective != 0 || entry.permitted != 0 || entry.inheritable != 0)
+    {
+        bail!("Disk tool retained capabilities");
+    }
+    Ok(())
+}
+
+fn probe_process_restrictions() -> Result<()> {
+    let forked = unsafe { libc::fork() };
+    if forked == 0 {
+        unsafe { libc::_exit(0) };
+    }
+    if forked > 0 {
+        unsafe { libc::waitpid(forked, std::ptr::null_mut(), 0) };
+        bail!("Disk tool could create a child process");
+    }
+    if io::Error::last_os_error().kind() != io::ErrorKind::PermissionDenied {
+        bail!("Disk tool fork failed for a reason other than the sandbox");
+    }
+    if unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            c"coop-disk-probe".as_ptr(),
+            libc::MFD_CLOEXEC,
+        )
+    } != -1
+        || io::Error::last_os_error().kind() != io::ErrorKind::PermissionDenied
+    {
+        bail!("Disk tool could create executable anonymous memory");
+    }
+    if unsafe {
+        libc::syscall(
+            libc::SYS_execveat,
+            -1,
+            c"".as_ptr(),
+            std::ptr::null::<*const libc::c_char>(),
+            std::ptr::null::<*const libc::c_char>(),
+            libc::AT_EMPTY_PATH,
+        )
+    } != -1
+        || io::Error::last_os_error().kind() != io::ErrorKind::PermissionDenied
+    {
+        bail!("Disk tool could execute an anonymous file descriptor");
+    }
+    Ok(())
 }
 
 fn mount_disk(disk: &DiskPath, uid: u32) -> Result<()> {
@@ -807,20 +1324,49 @@ fn write_resolv(disk: &DiskPath) -> Result<()> {
 /// CLOEXEC only in its child, never in coop's long-lived process. If a tool
 /// forks and closes the descriptor, its open fails rather than re-resolving
 /// the original untrusted path.
-fn run_on_descriptors(tool: DiskTool, args: &[&str], descriptors: &[&File]) -> Result<()> {
+fn run_on_descriptors(
+    tool: DiskTool,
+    args: &[&str],
+    descriptors: &[&File],
+    sandbox_disk: Option<&File>,
+) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
     let fds: Vec<_> = descriptors.iter().map(|file| file.as_raw_fd()).collect();
     let program = tool.setup_role().name();
     let mut command = tool.setup_role().command()?.build();
     command.args(args);
     command.stdin(std::process::Stdio::null());
-    // SAFETY: pre_exec performs only async-signal-safe fcntl calls. The fd
-    // vector is captured before fork and each fd is owned by a live File.
+    let mut syscall_filter = sandbox_disk
+        .map(|_| disk_tool_syscall_filter())
+        .transpose()?;
+    if let Some(disk) = sandbox_disk {
+        confine_filesystem_tool(disk, Path::new(command.get_program()), tool)?;
+        if matches!(tool, DiskTool::FsckLaunchProbe) {
+            match File::open("/etc/passwd") {
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+                result => bail!("Disk tool launch could read an unrelated host file: {result:?}"),
+            }
+        }
+    }
+    // SAFETY: pre_exec uses only async-signal-safe fcntl, prctl, getpid, and
+    // kill calls with data prepared before fork. It does not allocate or lock.
     unsafe {
         command.pre_exec(move || {
             for fd in &fds {
                 if libc::fcntl(*fd, libc::F_SETFD, 0) < 0 {
                     return Err(io::Error::last_os_error());
+                }
+            }
+            if let Some(filter) = &mut syscall_filter {
+                install_disk_tool_syscall_filter(filter)?;
+            }
+            if matches!(tool, DiskTool::FsckLaunchProbe) {
+                if libc::kill(libc::getpid(), 0) == 0 {
+                    return Err(io::Error::from_raw_os_error(libc::EACCES));
+                }
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EPERM) {
+                    return Err(error);
                 }
             }
             Ok(())
@@ -843,7 +1389,7 @@ fn disk_tool(disk: &DiskPath, uid: u32, tool: DiskTool, flags: &[&str], write: b
     let proc_path = format!("/proc/self/fd/{}", file.as_raw_fd());
     let mut args = flags.to_vec();
     args.push(&proc_path);
-    run_on_descriptors(tool, &args, &[&file])
+    run_on_descriptors(tool, &args, &[&file], Some(&file))
 }
 
 fn format_disk(disk: &DiskPath, uid: u32) -> Result<()> {
@@ -866,6 +1412,7 @@ fn format_disk(disk: &DiskPath, uid: u32) -> Result<()> {
         DiskTool::Format,
         &["-d", &source_path, "-F", &disk_path],
         &[&unpack, &file],
+        None,
     )
 }
 
@@ -998,6 +1545,33 @@ mod tests {
             maximum * crate::config::GIB_BYTES
         );
         assert!(size_bytes(&(maximum + 1).to_string()).is_err());
+    }
+
+    #[test]
+    fn elf_interpreter_reads_only_a_bounded_absolute_path() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = b"/lib/ld-linux-aarch64.so.1\0";
+        let mut elf = vec![0_u8; 120 + path.len()];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
+        elf[64..68].copy_from_slice(&3_u32.to_le_bytes());
+        elf[72..80].copy_from_slice(&120_u64.to_le_bytes());
+        elf[96..104].copy_from_slice(&(path.len() as u64).to_le_bytes());
+        elf[120..].copy_from_slice(path);
+        fs::write(file.path(), &elf).unwrap();
+        assert_eq!(
+            elf_interpreter(file.path()).unwrap(),
+            Some(PathBuf::from("/lib/ld-linux-aarch64.so.1"))
+        );
+        elf[120] = b'.';
+        fs::write(file.path(), &elf).unwrap();
+        assert!(elf_interpreter(file.path()).is_err());
+        elf[120] = b'/';
+        elf[96..104].copy_from_slice(&5000_u64.to_le_bytes());
+        fs::write(file.path(), &elf).unwrap();
+        assert!(elf_interpreter(file.path()).is_err());
     }
 
     #[test]
