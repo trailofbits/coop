@@ -1,732 +1,206 @@
 # Trust model
 
-This document records coop's trust boundaries, taint sources, and isolation
-invariants. It is the security reference for contributors. The
-[`review`](../.agents/skills/review/SKILL.md) workflow and
-[`AGENTS.md`](../AGENTS.md) link to it.
-
-This complements — it does not replace — [`SECURITY.md`](../SECURITY.md), which
-is the vulnerability-disclosure policy. `SECURITY.md` tells outsiders how to
-report a problem; this document tells contributors where the boundaries are so
-they don't introduce one.
+This document states coop's security boundaries and the rules contributors must
+preserve. [`THREAT_MODEL.md`](../THREAT_MODEL.md) lists prioritized threat
+scenarios; [`SECURITY.md`](../SECURITY.md) gives the disclosure process.
 
 ## The core boundary: the VM
 
-**coop's isolation boundary is the guest VM itself** — a Firecracker microVM on
-Linux, a Lima VM (Apple Virtualization.framework) on macOS. The point of the
-tool is to run AI coding agents (Claude Code, Codex, Grok Build) with broad
-autonomy *inside* that boundary, so the guest is deliberately permissive:
-
-- The guest user has passwordless `sudo` (`NOPASSWD:ALL`).
-- Claude runs with a managed `~/.claude/settings.json` carrying
-  `defaultMode: bypassPermissions`; the `codex`/`claude` launchers pass
-  `--dangerously-bypass-approvals-and-sandbox` / `--dangerously-skip-permissions`
-  unless the user passes `--ask`. Grok Build is launched with
-  `--always-approve` and a managed `ui.permission_mode = "always-approve"`;
-  `--ask` passes `--permission-mode default` so the guest config does not
-  keep always-approve for that session.
-
-The guest has broad privileges within its VM. Guest execution is isolated
-from the host, but configured channels cross the boundary: live mounts, file
-sync, forwarded credentials, SSH, and host-side services. The controls below
-limit how guest-authored data can affect host execution, filesystem paths, and
-credentials. They do not make guest-controlled content safe for host tools to
-process. The host treats the guest as **untrusted**, even though the user
-launched it.
+The **guest VM is the isolation boundary**: Firecracker on Linux and Lima on
+macOS. Coding agents have broad permissions inside it, including passwordless
+`sudo` and default bypass modes. Treat the guest as compromised from the host's
+point of view. Guest-controlled files, output, network requests, and disk state
+must not become host code execution, filesystem escape, or unapproved credential
+access. Explicitly configured mounts, transfers, forwards, and host services
+cross this boundary; the VM does not make their data safe for host tools.
 
 ## Trust zones
 
-| Zone | Trust | Notes |
-|------|-------|-------|
-| Host user + `config.toml` | Trusted | `config.toml` `cmd:` values run arbitrary `sh -c` on the host (`config.rs:resolve_cmd_value`). The config file is a host code-execution surface; only the owner should write it. |
-| Project files (local or fetched) | **Untrusted** | Opting into project configuration authorizes guest configuration, not host code execution. |
-| coop process (host) | Trusted | Holds/relays secrets, constructs guest commands, runs privileged host tools via `sudo`. Linux launch requires the pinned root-owned Firecracker/jailer pair and supervises the jailer in a systemd system service. The jailer confines Firecracker to a fresh root and drops it to a distinct unprivileged UID/GID. Coop validates the effective UID/GID, capabilities, seccomp mode, cgroup, and jail root after exec. |
-| The guest VM | **Untrusted** | Agent-controlled. Anything it emits — file contents, paths, archive members, command output — is a taint source once it crosses back to the host. |
-| GitHub API / model endpoints / DNS | External | `api.github.com` (PAT probe, release metadata), the model endpoint, `8.8.8.8`. Reached over the network; authenticated where applicable. |
+| Zone | Trust assumption |
+| --- | --- |
+| Host user and `config.toml` | Trusted. `cmd:` values execute host shell commands; only the owner should write this file. |
+| Local or fetched project files | Untrusted. Project opt-in grants guest configuration, not host execution authority. |
+| coop host process | Trusted to hold secrets, launch host tools, and manage VM state. Privileged Linux operations require special scrutiny. |
+| Guest VM | Untrusted, including agent output, paths, archive members, and transferred files. |
+| GitHub, model providers, DNS, and downloads | External inputs, authenticated or integrity-checked where the operation requires it. |
 
 ## Taint sources (treat as untrusted)
 
-- **Guest filesystem content pulled to the host.** `workspace.rs` `pull` /
-  `rsync_pull` bring guest-authored file contents, filenames,
-  and symlinks onto the host filesystem. This is the **widest guest→host
-  channel** and the primary place a path-traversal or symlink escape could land.
-  Files retain their untrusted origin after transfer, including when a host tool
-  discovers them implicitly or consumes them during a later operation.
-  Pull never invokes host Git to inspect its destination. It refuses a nonempty
-  destination unless the user supplies `--force`, which authorizes overwriting
-  matching files but does not change their trust level. Pull attempts
-  to omit common ASCII-case `.git` paths, and pull writes into
-  an empty staging directory before a trusted host-side filtered installation.
-  The staging boundary is a host-owned `0700` outer directory under private
-  coop storage; transfer tools write only into its child. Pulls sharing a coop
-  data directory are serialized across destination authorization, transfer,
-  installation, and cleanup. All such pulls reuse one fixed staging tree, so
-  interrupted transfers cannot accumulate additional staging trees. Writer
-  subprocesses inherit the operation lock; a retry times out rather than
-  removing staging that an orphaned writer may still be using.
-  Those filters are
-  defense-in-depth, not a guarantee across every transport, Git, and filesystem
-  naming behavior. Treat every pulled file and the resulting directory as
-  potentially malicious. In particular, coop does not make a repository
-  previously pulled by a vulnerable release safe for host Git or other tools.
-- **Rootfs files touched while loop-mounted during setup.** `setup.rs`
-  `patch_guest_network` reads and rewrites the guest's `/etc/hosts`, and `coop
-  commit` turns a guest-mutated rootfs into an image template — so the guest
-  authors both the contents and the directory entry at that path on every later
-  create/restore. Contents are read bounded and best-effort
-  (`bound_guest_hosts` degrades to a default rather than aborting the
-  lifecycle). Hosts-file operations use pinned directory descriptors, reject
-  symlinked `/etc`, and read only regular files checked through an `O_PATH`
-  descriptor. Replacement is atomic; permissions are set on the new file's
-  descriptor. The hostname and network-config writes likewise open each parent
-  through pinned directory descriptors and replace the final entry by rename,
-  so guest-authored symlinks cannot redirect those privileged writes outside
-  the mounted rootfs.
-- **Guest command output read by the host.** e.g. `check_guest_dirty` reads
-  `git status --porcelain` from the guest. Today this only gates control flow /
-  is printed to the user — it is never fed into `sh -c` on the host. Keep it
-  that way.
-- **Global creation commands.** `post_create` becomes a private guest script
-  sent over SSH stdin; it never becomes host shell source. Selected recipes may
-  contain secrets, so `creation.json` is owner-only and debug output redacts
-  commands. Creation commands have the guest user's existing environment and
-  sudo access; failure gates agent launch, not shell/exec access for debugging.
-- **Downloaded update artifacts.** `update.rs` tarball + `SHA256SUMS` from the
-  release host — gated by checksum and (best-effort) Sigstore attestation.
+- **Pulled files and live mounts.** Guest-authored names, symlinks, contents,
+  and metadata can affect host paths and tools. Pull staging and `.git` filters
+  are defense in depth; transferred files remain untrusted when a host tool
+  later discovers them. See [workspaces](workspaces.md).
+- **Guest disks and output.** `coop commit` can make modified disk contents a
+  future image template. Guest command output is data, never host shell source.
+  Linux setup and disk operations must preserve the checked filesystem boundary.
+- **Project and fetched configuration.** Follow values through translation,
+  merging, saved state, and later host consumers; a guest configuration opt-in
+  does not authorize host interpretation.
+- **Update artifacts.** Release metadata, archives, checksums, and attestation
+  bundles are external inputs subject to the update chain below.
 
 ## Host subprocess boundary
 
-For every tainted input that reaches a host subprocess, trace its origin through
-translation, merging, persistence, and reload to the actual launch. Include
-unchanged consumers when a change adds a less-trusted producer. Inspect the
-executable and its lookup path, arguments and option parsing, environment,
-working directory, and configuration files or wrappers the tool consumes.
+For every less-trusted input reaching a host process, inspect the *whole* launch:
+executable lookup, argv and option parsing, environment, cwd, inherited file
+descriptors, and files or wrappers the tool reads implicitly. Follow the value
+through persisted state and unchanged later consumers. An argv API prevents
+shell interpolation, but a tainted `PATH`, loader variable, tool config, or
+transferred file may still change host behavior. Path containment and transfer
+opt-in do not authorize execution.
 
-Argv APIs prevent shell interpolation; they do not prevent executable lookup
-through a tainted `PATH`, loader controls such as `LD_PRELOAD` or
-`DYLD_INSERT_LIBRARIES`, or tool-specific configuration from changing host
-behavior. An absolute executable path addresses lookup only. Guest-bound data
-must remain inert to the host transport and gain its intended meaning only in
-the guest; see the `EnvForward` invariant below. Review the complete launch
-context, including credentials inherited by a substituted process.
+Coop-owned SSH clients and Linux setup/network tools resolve validated absolute
+executables and use bounded launch environments. Linux network overrides are
+exact paths with no fallback; path-chain checks establish filesystem control,
+not package identity or command semantics. Validation is pathname based and
+does not pin the executable inode or loader closure. Setup's package manager
+still delegates to trusted host package policy. See [host tool configuration](configuration.md#exact-network-host-tool-paths)
+and [backend setup](backends.md).
 
-Transferred files also form part of a host tool's execution context. Trace
-implicitly discovered configuration and metadata through later coop commands
-and ordinary host-tool use, even when coop never parses the files itself. Path
-containment and successful transfer establish neither safe interpretation nor
-host execution authority. Record which consumer interprets each file and what
-authority that interpretation grants; explicit transfer opt-in does not by
-itself authorize host execution.
-
-The Linux network control-plane family is one narrow implementation of this
-contract. `network.rs` selects `sudo`, `ip`, `bridge`, `iptables`, and `sysctl`
-from exact absolute paths. Unset fields use candidates under `/usr/bin`,
-`/usr/sbin`, `/bin`, or `/sbin` and require the canonical target to remain
-under those roots. The built-in `sudo` candidate may also resolve to the exact
-`/usr/lib/cargo/bin/sudo` target seen on Ubuntu 26.04 CI. The invocation-selected
-config can replace an identity with one exact path for non-FHS layouts; an
-override never falls back to built-ins.
-Both forms validate every actually traversed path component and symlink hop and
-require root ownership, a regular executable target, and no group/other write
-bits. Configured paths establish filesystem control only, not package, hash,
-basename, or command-semantic identity. Coop executes the selected absolute
-spelling (preserving alternatives/multi-call argv[0]),
-clears the launcher environment, supplies only `LANG=C` and `LC_ALL=C`, and
-sets cwd to `/`. Elevated commands use both the resolved absolute `sudo` and
-resolved absolute target. `sudo` may rebuild the elevated command's environment
-or cwd according to trusted sudoers/plugins; the guarantee here is the bounded
-context supplied to `sudo`, not an exact post-policy root environment.
-
-This remains pathname-based validation followed by pathname-based execution;
-it does not pin an inode, validate an executable's loader/library closure, or
-close inherited file descriptors. It also does not cover other host subprocess
-families. Exact overrides are re-resolved from the current config on every
-operation and are never persisted into instance state.
-
-Firecracker setup applies the same pathname checks to its system tools. On the
-Ubuntu CI coreutils layout, the conventional candidates for `cat`, `chmod`,
-`rm`, `mkdir`, `tee`, `chroot`, `rmdir`, `id`, and `timeout` may also resolve to
-their exact `/usr/lib/cargo/bin/coreutils/<tool>` targets. Only those setup
-roles accept those targets; ownership and writability checks still cover every
-path component. The bootstrap phase resolves `sudo`, `timeout`, and `curl`, the
-available package prerequisites, and `apt-get` plus `cat` if installation is
-needed before setup's first storage change.
-After package installation, setup re-resolves `sudo` and `timeout`, then resolves `tar`, `gzip`, `chmod`, `rm`,
-`unsquashfs`, `ssh-keygen`, `mkdir`, `tee`, `chroot`, `rmdir`, `mkfs.ext4`,
-`e2fsck`, `resize2fs`, and the managed SSH clients before its first artifact
-request. KVM access repair additionally resolves `setfacl` or `usermod` and
-`id` before changing permissions. The privileged disk helper resolves its
-filesystem tools again after `sudo`. Setup launches from `/` with a cleared
-environment, fixed system `PATH`, and `LANG=C`/`LC_ALL=C`; curl also disables
-its default config file and receives only HTTPS proxy and no-proxy settings
-from the caller. Elevated programs remain subject to trusted sudoers and host
-package-manager configuration. Before package installation, setup checks the
-filesystem entries below `/etc/apt`, their symlink targets, and apt
-configuration include paths for root ownership and group/other writability.
-Private root-owned apt fragments are read through the resolved `cat` under
-the same bounded `sudo` launch path; their contents are not logged.
-Apt delegates its method helpers, `dpkg`, configured hooks, and package
-maintainer scripts to that system package policy; these indirect children are
-not a closed preflight family. Package installation passes only
-`DEBIAN_FRONTEND=noninteractive` through `sudo` in addition to the fixed
-launcher environment. These pathname checks do not authenticate
-downloaded artifacts or pin an executable inode through `exec`. For elevated
-launches, a nonzero `sudo` status can come from `sudo`, `timeout`, or the target;
-the outer status alone does not prove which process returned it.
+Guest-bound environment variables use generated `COOP_SSH_ENV_*` aliases until
+a guest shell restores their intended names. Missing aliases or failed guest
+exports stop the command. Never pass the guest environment map to a host
+subprocess or let those aliases configure a host SSH wrapper.
 
 ## Secrets and how they cross into the guest
 
-`[[guest_files]]` explicitly authorizes copying complete host source trees into
-the guest, including any credentials in those trees. Each boot stages private
-copies before VM startup. Source links are materialized only within declared
-source roots; cycles, dangling links, and special files fail staging. Source
-components are opened relative to pinned directory descriptors without following
-symlinks; copying reads the validated file descriptor. Sources containing the
-staging directory are rejected. Destinations
-are guest paths, never inputs to host filesystem writes. Guest copying rejects
-symlinks and live-mount overlaps and does not delete unmatched guest files.
-These opt-in copies are separate from the agent allowlists and proxy filtering;
-users must select sources that contain only data they intend to expose.
-
-coop relays several secrets from the host into the guest: `ANTHROPIC_API_KEY`,
-`OPENAI_API_KEY`, `XAI_API_KEY`, `GITHUB_TOKEN`/PAT, `CLAUDE_CODE_OAUTH_TOKEN`, arbitrary
-user `env_forward` entries, and the VM SSH key. The invariants:
-
-- **Never on argv.** Secrets ride SSH `SendEnv` (env channel) or process env
-  (`backend.rs:prepare_env_forwarding`, `EnvForward`), or are piped via **stdin**
-  (`SshTarget::exec_with_stdin`, the git-clone credential helper
-  `build_clone_with_token_script`, `curl -H @-` in `github_pat.rs`/`update.rs`).
-  Never build a command line with the secret as an argument — it is visible in
-  `ps`/`/proc`. Known exceptions are the macOS `security` and 1Password `op`
-  backends, which take the secret on argv because their CLIs offer no stdin
-  path; this is documented at the call sites and limited to the store step.
-- **`GITHUB_TOKEN` defaults to Off.** PAT mode requires a saved, explicit VM
-  binding containing a validated entry key. Git origin and clone URL are
-  suggestions only. Assignment and destruction share the VM operation lock;
-  credential reads are serialized with sidecar replacement. Invocation-level
-  `--no-github` suppresses the assignment before loading it. Active assignments
-  reject both managed `GITHUB_TOKEN` and `GH_TOKEN` overrides and fail closed
-  on missing references or failed retrieval. It is only forwarded with an explicit
-  `github = auto|env|pat` opt-in (`backend.rs:resolve_github_token`). When
-  forwarded, `bootstrap_agents` runs `gh auth setup-git`, which makes the token
-  **persistent guest state** (a git credential helper any guest process can
-  read). A change that forwards it by default, or makes it persistent where it
-  wasn't, is a finding. `up --no-github` / `start --no-github` override the
-  strategy to Off and disable the PAT wizard for that invocation. This does
-  not scrub existing guest credentials or block explicit environment entries.
-  Clone uses the same VM credential selection; Off, `--no-github`, and unbound
-  PAT mode have no managed or implicit host-token fallback. See
+- **Explicit exposure.** `[[guest_files]]` copies selected host source trees,
+  including any secrets within them. Staging rejects unsafe source entries and
+  guest destinations; the selected content is still intentionally exposed.
+  Writable Lima mounts likewise expose their selected host trees. See
+  [guest files](configuration.md#guest-files) and [private host storage](configuration.md#private-host-storage).
+- **Transport.** Managed model keys, GitHub credentials, custom environment,
+  and other secrets travel via process environment, SSH `SendEnv`, or stdin,
+  not argv. The macOS `security` and 1Password `op` store commands are documented
+  argv exceptions. Redact resolved values from logs and debug output. Host
+  `cmd:` resolvers are trusted commands, executed at VM start.
+- **GitHub.** Managed `GITHUB_TOKEN` forwarding defaults to off and requires
+  explicit configuration or a saved PAT binding. `--no-github` suppresses the
+  managed assignment for that invocation. Bootstrap may save a forwarded token
+  as guest Git credential state; later starts do not erase it. See
   [GitHub auth](configuration.md#github-auth).
-- **Private host storage is enforced.** Managed data/image/instance/state
-  directories use `0700`; persisted environment overrides, JSON state, tokens,
-  SSH private keys, and VM disks use `0600`. Atomic temporary files are private
-  before content is written. Shared roots are sealed before migration; unsafe
-  instance/image entries are reported independently, and removed entries are
-  ignored. Shared credential storage remains strict. Selected instance and image state is strictly repaired before use without
-  entering mounted guest filesystems. Directory traversal rejects
-  symlinks except root-owned OS ancestor aliases, foreign ownership, and
-  non-sticky writable ancestors; sensitive files reject symlinks and hardlinks.
-  Lima’s same-directory `disk` → `diffdisk` alias is permitted. macOS ancestor
-  ACLs must not grant write/control access. Extended ACLs are cleared on private directories and user-owned files.
-  Root-owned Firecracker disks are chmodded with sudo when needed; their Unix
-  ACL mask is restricted by `0600`. Managed storage operations pin checked
-  directories and open child files relative to those descriptors. The Linux
-  privileged disk helper repeats managed-path validation after sudo, uses the
-  opened disk for filesystem tools and loop setup, and serializes copies through
-  a private lock. Sudo runs the current executable through the parent's procfs
-  executable link, which pins its inode even if its install pathname changes.
-  Privileged unmounts use the kernel's no-follow flag on guest mountpoint names.
-  Disk replacement and failed-start directory removal stop if the rootfs mount
-  still has a distinct kernel mount ID.
-  Atomic replacement assumes the trusted host user does not
-  concurrently replace names inside the private directory. `limactl` accepts
-  paths rather than inherited descriptors, so its own path resolution remains
-  within the trusted host-tool boundary. Lima uses a private child umask, reseals disks after startup, and protects
-  its coop directories separately from `data_dir`. See
-  [private host storage](configuration.md#private-host-storage).
-  Lima boot checks requested and saved writable mounts, including Lima's global
-  base, default, and override configuration, against the effective
-  config, coop data/secret state, and Lima control directory. A mount covering
-  one of these host paths is rejected before `limactl start`; a previously
-  exposed state needs host inspection because current path checks cannot prove
-  what a guest changed in the past. A host process that can rewrite source
-  paths concurrently remains in the trusted host-user boundary. A host
-  `~/.grok/auth.json` copied into an open-mode guest is `chmod 0600` after
-  `scp` (`backend.rs:restrict_guest_grok_auth`). Isolated bootstrap makes no
-  new auth-file copy and does not sanitize a copy retained on the guest disk.
-- **Guest environment names never configure host tools.** `EnvForward` sends
-  values under generated `COOP_SSH_ENV_<index>` aliases. A guest shell captures
-  all aliases, removes them, and exports the original names before executing
-  the requested command. This covers config literals, CLI overrides, and saved
-  `guest_env.json` equally. Never pass the guest map
-  to a host `Command::envs`, even with an absolute executable path: guest
-  loader and SSH settings must also remain guest-only. Values stay out of
-  command arguments, stdin, and temporary files; existing images' `AcceptEnv *`
-  supports the transport. Missing forwarded aliases fail before the command.
-  Assignment failures also stop the command; shell diagnostics that could
-  contain values are replaced with a message containing only the variable name.
-  The `COOP_SSH_ENV_` namespace is reserved for transport: trusted host SSH
-  wrappers and configuration must not interpret these values as instructions.
-- **Secrets stay out of logs.** `Cmd::redacted_arg` redacts argv in traces;
-  `EnvForward`/`Secret<T>` custom `Debug` impls keep values out of debug output.
-  Do not log a resolved secret.
-- **The stored token is indirected, never inlined.** `config.toml` holds a
-  `cmd:...` retrieval command (`secret_store.rs:CmdToken`), not the plaintext
-  token; coop runs it at VM-start to fetch the value.
-- **Proxy mode keeps the model API keys out of the guest entirely** (issue #411,
-  opt-in `[proxy]`). When enabled in remote model mode, `ANTHROPIC_API_KEY`
-  (Claude) and/or `OPENAI_API_KEY` (Codex) are **not** forwarded
-  (`prepare_env_forwarding`'s `suppress_anthropic_key`/`suppress_openai_key`, one
-  per provider); the host-side `coop-proxy` holds the real credential and the
-  guest gets only a per-instance capability token (Claude via `settings.json`,
-  Codex via the `coop_local` provider's bearer `env_key`). In proxy mode Codex's
-  `~/.codex/auth.json` is also **not** staged onto the guest disk (it holds a
-  refreshable subscription token). Each credential is resolved on the host and
-  handed to `coop-proxy` over **stdin**, never argv or a transport file. Literal
-  credentials are persisted in host configuration; `cmd:` indirections resolve
-  them at startup. A resolution failure fails the boot closed. A per-VM override
-  (`proxy_state.rs`, `<inst.dir>/proxy.json`) selects a different host-side
-  credential for one VM — resolution is override → default → off — without
-  changing the proxy binary or the capability token. See
-  [`credential-proxy.md`](credential-proxy.md).
-- **Codex access-token proxy auth stays on the host.** With `[proxy.openai]
-  auth = "codex_access_token"`, coop validates a Codex workspace PAT (`at-...`)
-  through a fixed, bounded HTTPS lookup at `auth.openai.com` before starting
-  the proxy. The token goes to curl and the proxy on stdin, never argv. Only
-  the workspace ID and FedRAMP routing flag are retained from the metadata
-  response; malformed metadata fails closed without echoing the response.
-  The proxy pins `chatgpt.com`, translates only the allowed Responses creation
-  operation to `/backend-api/codex/responses`, reconstructs the workspace and
-  FedRAMP headers from host-validated metadata, and strips guest-supplied
-  actor authorization. Both `OPENAI_API_KEY`
-  and `CODEX_ACCESS_TOKEN` are suppressed from managed guest forwarding in
-  OpenAI proxy mode. Cached OAuth tokens and legacy agent-identity JWTs are
-  unsupported; there is no refresh or API-key fallback. Token rotation takes
-  effect on VM restart. The guest's capability still authorizes inference
-  using the token creator's workspace entitlements; it is not a usage budget.
-- **Codex ChatGPT account auth is persistent guest state.** With
-  `[codex] auth = "chatgpt"`, coop suppresses `OPENAI_API_KEY` across config,
-  process env, `env_forward`, and persisted `--env` overlays, writes
-  `cli_auth_credentials_store = "keyring"` to guest `~/.codex/config.toml`, and
-  excludes host `auth.json` from the guest copy. Codex stores its cached account
-  credentials in the guest Linux Secret Service instead. This avoids API-key
-  billing and host `auth.json` copying, but it does **not** keep the ChatGPT
-  refresh token out of the guest. A compromised guest can use or extract any
-  credential its keyring session can unlock. The keyring setting is written
-  during agent bootstrap, so `--no-agents` skips it. On a guest where no
-  earlier boot wrote it, the wrapper then falls through to plain Codex and
-  `codex login` writes a plaintext `~/.codex/auth.json` instead. coop warns in
-  exactly that case; the setting lives on the guest disk, so once written it
-  survives a later `--no-agents` start. Two guardrails close the gaps that
-  leaves: each bootstrap in this mode deletes any guest `~/.codex/auth.json`
-  left by an earlier `api_key` boot or `--no-agents` login (dropping the file
-  from the staged set only stops coop *copying* one, it removes nothing), and
-  `coop codex` refuses to launch when the guest config does not actually
-  select the keyring store — otherwise the wrapper would pass through to plain
-  Codex and write the token in the clear. The wrapper also fails closed when a
-  session-level `CODEX_HOME` is set while coop's managed
-  `~/.codex/config.toml` selects keyring mode; coop does not otherwise stage or
-  maintain an alternate Codex home.
+- **Private state.** Managed directories and sensitive files use owner-only
+  permissions (`0700` and `0600` respectively), with symlink, hardlink, and
+  path checks at sensitive boundaries. Lima rejects writable mounts covering
+  coop config, data, secrets, or control state before boot; a path check cannot
+  prove that a previously exposed file is clean.
+- **Proxy mode.** The opt-in host proxy keeps selected model credentials and
+  Codex host `auth.json` out of the guest. The guest receives a per-instance
+  capability that still authorizes allowed model operations. The real secret
+  reaches the proxy via stdin. Resolution failure aborts boot. A per-VM
+  override can select a different host credential. See
+  [credential proxy](credential-proxy.md).
+- **Selective agent images.** Each copied image records which agents coop
+  installed. Boot and session preparation resolve credentials and start proxies
+  only for those agents. Proxy teardown checks a recorded process start identity
+  before signaling; Linux also pins the process with pidfd. macOS retains a
+  narrow PID reuse window between the identity check and signal. A live legacy
+  PID-only record is kept for manual inspection rather than signaled. A pending
+  model apply blocks agent launch until bootstrap or restart succeeds; stopping
+  a VM cancels that generation before proxy cleanup.
+- **Codex ChatGPT mode.** Guest keyring storage avoids copying host `auth.json`
+  but leaves a refreshable credential accessible to the guest. Bootstrap removes
+  stale guest `auth.json`; the managed launcher refuses a missing keyring
+  setting. `--no-agents` can skip first-boot setup, so it is not a credential
+  isolation control. See [Codex integration](codex-integration.md).
 
 ## SSH boundary
 
-- Every coop-owned `ssh`, `scp`, and rsync-with-SSH launch resolves a validated
-  absolute executable from fixed system candidates or an exact
-  `[ssh.host_tools]` setting. The child environment is cleared and rebuilt with
-  `LANG=C` and `LC_ALL=C`, plus only generated `COOP_SSH_ENV_*` aliases or the
-  normalized interactive `TERM` value required by that invocation. Managed
-  clients run from `/` and pass `-F none`, so neither user nor system SSH
-  configuration contributes proxy commands, local commands, environment
-  forwarding, identities, agents, canonicalization, or forwards. Forwarding
-  is disabled unless the call site constructs a specific coop port or proxy
-  forward. The `ssh coop-<name>` alias written for an operator is not a
-  coop-owned process and remains subject to the operator's SSH configuration.
-- Lima resolves `limactl` through the shared host-tool validator from fixed system
-  and package-manager paths. Paths must be owned by root or the invoking user;
-  macOS `admin` (GID 80) group write is permitted for Homebrew compatibility.
-  Other group write and all world write remain forbidden. Lima retains its host
-  configuration, with a fixed helper `PATH`. The macOS Nix package instead
-  embeds its exact Lima and helper store paths at build time. That route trusts
-  Nix's immutable runtime closure rather than applying the generic ownership
-  checks to the build-user-writable store directory. It does not add a general
-  `/nix/store` search root or accept runtime path overrides.
-- An exact host-tool setting authorizes only the validated filesystem identity:
-  coop does not attest its package provenance, hash, basename, or OpenSSH/rsync
-  semantics. Resolution is pathname-based and does not pin an executable
-  descriptor or its dynamic-loader closure.
-- coop connects to the guest with `StrictHostKeyChecking=no`,
-  `UserKnownHostsFile=/dev/null`, `IdentitiesOnly=yes`,
-  `ForwardAgent=no`, and `IdentityAgent=none`
-  (`openssh.rs:authority_options` — the one list `ssh`, `scp`, and rsync's
-  `-e` all derive from — and `workspace.rs:ssh_config_block`). coop's
-  own transports add `BatchMode=yes`, so a rejected key fails instead of
-  falling back to a password prompt; the `~/.ssh/config` block written for the
-  user's own `ssh coop-<name>` deliberately does not. This is
-  deliberate: guest keys are ephemeral and regenerated per VM, so there is no
-  stable host key to pin. The trade-off is that a MITM on the path to the guest
-  is not detected — acceptable because that path is loopback / a local TAP link
-  to a VM the host itself owns. Coop-owned transports disable host agent use
-  and forwarding; generated SSH config blocks set the same options for aliases,
-  subject to OpenSSH configuration precedence for the user-owned file.
-- The Firecracker-vsock transport renders `ProxyCommand` only from the running
-  coop executable, a trusted per-instance socket path, and a non-zero numeric
-  guest port. Paths reject OpenSSH expansion characters and control bytes,
-  escape `%` tokens, and are POSIX-shell quoted before OpenSSH interprets the
-  command. The helper accepts no command text from the guest: it sends one
-  bounded `CONNECT <port>` request, validates one bounded `OK <port>` response,
-  and then relays bytes. Firecracker starts with `--no-api`, so newly started
-  VMs have no API socket. Its process umask makes the base vsock socket mode
-  0666 inside a fresh jail root beneath a root-owned, per-host-user private
-  directory. Coop grants the invoking host user directory traversal and bind
-  mounts a pinned socket inode at the instance's `vsock.sock` path; other users
-  cannot traverse the private jail ancestor. This grants the invoking user
-  access to the guest transport, not a Firecracker control API. A process started before
-  `--no-api` may retain an API socket until stopped. Without a verified PID,
-  coop uses a privileged, nonblocking connection probe on the API and base
-  vsock socket entries, checking the instance's pinned mount for new launches.
-  Only a refused or missing socket permits cleanup; a live listener,
-  non-socket entry, or uncertain result blocks it. Coop never kills a process
-  found through a socket lookup. Confirmed stale mounts are unmounted, then
-  runtime entries are unlinked through the pinned private directory;
-  root-owned jail generations are removed only after service process death is
-  confirmed.
-- An absent `firecracker.runtime.json` denotes a legacy instance. After
-  confirming it is stopped and verifying the managed binary pair, coop
-  atomically publishes version 1 with the jailed launcher. The operation does
-  not copy or replace the guest disk; a failed publication blocks startup,
-  and an unknown version never falls back to direct root launch.
-- A newly jailed Firecracker sends its guest-influenced serial output and VMM
-  logs to systemd's journal stream. Coop verifies the unit's journal routing
-  and its 30-second interval and 1000-message configured burst after launch;
-  journald may multiply the effective burst based on available disk space.
-  A guest can put secrets on its serial console. Host users allowed to read the
-  system journal (for example members of `systemd-journal` or `adm`) can read
-  those messages, including messages from other users' VMs. Previously the
-  live VMM log was confined to its owner's private instance directory and
-  stdout was discarded. This wider readership is a confidentiality trade-off
-  that requires explicit confirmation before merge.
-  Coop creates no growing live VMM log file or launcher pipe. `coop logs`
-  uses a trusted `journalctl` executable for the active unit, and stopped
-  cleanup saves at most 16 MiB of recent output for later `coop logs`
-  snapshots. Journal retention follows the host's journald policy.
-- A Firecracker instance's control mode is persisted at creation. `vsock`
-  mode never silently retries TCP: readiness, shutdown, shell, file transfer,
-  forwarding, and generated SSH configuration all derive the same target from
-  that tag. Older untagged instances map to `legacy_tcp` for compatibility.
-  This is control-plane independence, not host network isolation: the guest
-  NIC, TAP, bridge, forwarding, NAT, and TCP SSH recovery listener remain.
-- A Firecracker instance in persisted `isolated` network mode is started with
-  no network interface and coop does not create its TAP. Control and managed
-  fixed-destination proxy forwards use SSH over vsock without a TCP fallback.
-  The composite persisted marker is rejected by prior releases. This prevents
-  guest Ethernet/IP egress through coop, but model request bodies still leave
-  through the selected host credential proxy and existing guest-disk secrets
-  are not sanitized by switching modes.
-- The guest SSH key (`<data_dir>/vm_key`, ed25519, **passphrase-less by
-  design**) is a VM-access credential. Do not "harden" it with a passphrase
-  (it must be used non-interactively), but do flag any change that exposes it
-  or copies it off the host.
-- Flag any change that extends the no-host-key-checking options to a
-  **non-guest** host.
+Coop-owned SSH, SCP, and rsync clients use validated executables, clear their
+host environment, disable ambient SSH config, agent use, and agent forwarding,
+and permit only call-site forwards. A user-run `ssh coop-<name>` is outside that
+managed launch contract. Exact host-tool overrides still trust the selected
+executable's semantics and dynamic dependencies.
+
+Guest host-key checking is disabled because VM keys are ephemeral. This is a
+local-path trade-off: traffic diverted to an impostor guest could be
+intercepted, including `SendEnv` data. Never extend this exception to a
+non-guest host. The passphrase-less VM-access private key stays in private host
+storage and must not be copied into the guest.
+
+Firecracker vsock mode uses a bounded `CONNECT` handshake and a trusted
+per-instance socket path; it does not fall back to TCP. Its jailer runs a
+verified, unprivileged Firecracker process under a private host-user directory.
+Unknown runtime state and uncertain live sockets block cleanup rather than
+being killed or unlinked by guesswork. Guest-influenced serial output goes to
+the system journal, whose readers may include users other than the VM owner.
+This wider readership requires explicit confirmation before merge; `coop logs`
+saves a bounded stopped snapshot. See [backend lifecycle](backends.md)
+and [Firecracker modes](firecracker-network-modes.md).
 
 ## Network
 
-- **Port-forwards bind to `127.0.0.1` only** (`port_forward.rs`): both the
-  collision probe and the `ssh -L 127.0.0.1:<host>:127.0.0.1:<guest>` spec.
-  There are **no `0.0.0.0` binds** anywhere in the tree. A new listener must
-  bind loopback explicitly.
-- Firecracker networking (`network.rs`) sets up a `br0` bridge + per-instance
-  TAP, enables `ip_forward`, and adds a `MASQUERADE` + `FORWARD` ruleset so the
-  guest reaches the internet through the host's default interface. A change
-  that widens guest egress or adds inbound reachability is a finding.
-- Firecracker setup resolves all five required network-tool identities before
-  default-interface discovery or the first network mutation. Teardown resolves
-  only the tools needed for each cleanup category, logs unavailable best-effort
-  categories, and never falls back to ambient `PATH`.
-- **Guest VMs cannot reach each other by IP.** All Firecracker guests share
-  `br0` and a single subnet, so this is enforced, not structural, and it takes
-  **two** complementary controls — removing either one re-opens the path:
-  1. Every TAP is an isolated bridge port (`bridge link set … isolated on`),
-     which stops the bridge forwarding frames between two guest ports. This is
-     the only control that covers the L2 path, because bridged frames reach the
-     `FORWARD` chain only when `br_netfilter` is loaded.
-  2. An `iptables -I FORWARD 1 -i br0 -o br0 -j DROP` rule, which stops a
-     routed guest→guest packet. Port isolation cannot cover this path: a frame
-     addressed to the bridge is *local delivery*, not port-to-port forwarding,
-     so the isolated flag never applies, and `ip_forward` would otherwise send
-     it back out `br0` from the bridge device — which has no isolated source
-     port either. Without the rule this falls through to the host's `FORWARD`
-     policy, `ACCEPT` on a stock host.
+Host port forwards and the credential proxy bind loopback. Firecracker `open`
+mode uses a TAP, bridge, NAT, and host forwarding; guests can reach the host for
+intended services. Guest-to-guest IP isolation requires both isolated bridge
+ports and a first-position `FORWARD` drop rule, asserted at startup. Residuals
+include pre-existing unisolated bridge members, guest address impersonation,
+IPv6, and firewall reloads. Lima templates use separate per-instance usernet
+stacks; adding shared networks changes that boundary. See [backend networking](backends.md#tap-networking-open-mode).
 
-  Both are asserted on every `setup_tap` and fail closed. The rule is
-  idempotent because `ensure_guest_isolation_rule` probes with `iptables -C`
-  first, then checks that it is the first FORWARD rule. Startup fails if another
-  rule precedes it; move the DROP first in the host firewall configuration before
-  retrying. It is asserted per call rather than in `ensure_bridge` because that
-  returns early on a pre-existing bridge. The bridge flag is read back after
-  being set — a kernel older than 4.18 caps the bridge-port attribute policy
-  below `IFLA_BRPORT_ISOLATED` and silently drops it, so `bridge` exits 0 on a
-  port that is not isolated. Requires Linux ≥ 4.18 and iproute2 ≥ 4.19.
+Firecracker `isolated` mode starts without a NIC and uses vsock for control and
+selected proxy forwards. It prevents guest Ethernet/IP egress through coop,
+but model bodies can still leave through the host proxy and old guest-disk
+secrets remain. See [network modes](firecracker-network-modes.md).
 
-  **Known residuals**, in scope for a follow-up, not closed here:
-  - *Isolation is pairwise.* The kernel drops a frame only when both ports are
-    isolated, so one non-isolated member of `br0` re-opens L2 for every guest.
-    A VM still running from before the upgrade therefore leaves the whole
-    bridge unisolated, not just itself, until it is restarted.
-  - *A guest can still impersonate a peer.* Neither control governs ARP or the
-    guest's own addressing, and coop reaches guests by IP with host-key
-    checking deliberately disabled — so a connection meant for a peer could
-    land on an impostor along with its `SendEnv` payload.
-  - *IPv6 and firewall reloads.* Only `iptables` is touched, and any
-    `iptables-restore` (`firewall-cmd --reload`, `ufw reload`) discards the
-    rule until the next `coop up` re-asserts it.
-  - *A pre-existing `br0`.* `ensure_bridge` adopts a bridge it did not create
-    without inspecting its members or installing its other rules; on such a
-    host the DROP also applies to that bridge's traffic.
-
-  **Accepted by design:** guests *can* reach the host — that path carries the
-  local-model gateway and the credential proxy's `ssh -R` tunnel. A change that
-  drops either control, or that stops asserting them per start, is a finding.
-
-  On Lima this holds structurally instead: the generated templates declare no
-  `networks:` stanza, so each guest gets its own per-instance gvisor usernet
-  stack (not Apple's shared-segment `VZNATNetworkDeviceAttachment`) and has no
-  L2 neighbor to reach. Adding a `networks:` stanza would put guests on a
-  shared segment and void this.
-- `rewrite_host_url` rewrites a loopback local-model endpoint to the
-  guest-visible gateway address so the guest can reach a model server running
-  on the host; non-loopback URLs pass through unchanged.
-- **The credential proxy (issue #411) binds host loopback** (`127.0.0.1`, it
-  refuses an unspecified address at bind) and is exposed into the guest with a
-  per-instance `ssh -R` reverse tunnel (`proxy.rs:spawn_reverse_forward`), so —
-  like the port-forwards above — it never binds a non-loopback interface and is
-  reachable by exactly one guest, identically on both backends. It is guarded
-  by a per-instance capability token and forwards only its documented
-  provider-specific operations to a fixed per-provider upstream
-  (`api.anthropic.com` / `api.openai.com` / `chatgpt.com`), never a
-  guest-supplied host — one proxy process and one tunnel per (VM, provider). Its own TLS-verifying
-  outbound HTTPS is the intended egress; a change that lets the guest influence
-  the upstream host, widens the operation policy without security review, or
-  binds anything wider than loopback, is a finding. The proxy streams allowed
-  request bodies opaquely, so this does not isolate provider objects referenced
-  by ID within an allowed request.
-
-  Its stdin startup document is capped at 64 KiB by both producer and consumer.
-  Host `cmd:` credential resolvers concurrently drain independently capped
-  stdout/stderr. They may wait for user-mediated authorization, but interruption
-  or overflow kills their transient process group and reaps the direct child.
-  Proxy and tunnel startup diagnostics are also bounded, and autonomous tunnel
-  setup retains a fixed deadline, preventing a configurable peer from turning
-  error capture into unbounded host allocation or pipe backpressure.
-
-  A VM's copied image contract records which agents coop installed. Boot and
-  session preparation resolve credentials and start proxies only for those
-  agents. Proxy teardown checks a recorded process start identity before
-  signaling; Linux also pins the process with pidfd. macOS still has a narrow
-  identity-check-to-signal PID reuse window. A live legacy PID-only record is retained for manual
-  inspection rather than signaling a possibly reused process. A pending model
-  apply blocks agent launch until a successful bootstrap or restart, and a
-  stopped VM cancels the generation before proxy cleanup.
-
-- **The credential proxy is jailed (issue #411, slice 3).** `coop-proxy` holds
-  the real credential and terminates connections the untrusted guest
-  originates, so it is the feature's new attack surface; the jail bounds the
-  blast radius of a proxy exploit. On **Linux** the proxy self-confines with
-  **Landlock**, applied in `coop-proxy`'s `main` after its libraries load and
-  before it binds, so every tokio worker inherits the domain. The confinement
-  is tiered by kernel capability: all filesystem writes and all program `exec`
-  are denied as a hard floor (kernel ≥5.13); on kernels ≥6.7 TCP `connect` is
-  additionally limited to `:443` (upstream) and `:53` (DNS), `bind` to the
-  listener port (see the host-kernel floor below).
-  On **macOS** the launcher wraps the spawn in `sandbox-exec` with the Seatbelt
-  profile in [`src/seatbelt-proxy.sb`](../src/seatbelt-proxy.sb) (deny by
-  default; allow file reads, name resolution, the loopback listener, and egress
-  only to `:443`/`:53`). Either way the launch is **fail-closed** on the
-  high-value denials: if the filesystem-write/program-`exec` floor cannot be
-  established — Linux kernel <5.13, or the macOS Seatbelt profile fails to
-  apply — the proxy exits before serving, `proxy.rs`'s post-spawn readiness
-  probe never connects, and the VM start aborts, so the credential-holding
-  proxy never runs without that floor. Reads stay open (the resolver
-  config, the dynamic linker) and writes to the already-open stderr log fd are
-  unaffected, because both jails gate path opens / new connections, not
-  existing descriptors.
-
-  **Accepted limitations, by construction** (do not file these as findings; do
-  flag a change that *widens* them):
-  - **Port-scoped, not host-scoped.** Both Landlock and Seatbelt filter by
-    port, not hostname/IP. A *fully compromised* proxy could still open a TCP
-    connection to some other host on `:443`; the fixed upstreams' identity is
-    enforced one layer up, at the proxy's TLS verification + pinned `Host`, and
-    the guest still cannot retarget them. Host-scoped egress would need IP
-    pinning (fragile against CDN rotation) or an L7 egress proxy — out of scope
-    and consistent with the DNS/CDN caveat #2 already accepts.
-  - **UDP egress is not restricted on Linux.** Landlock's network rules are
-    TCP-only, and DNS needs UDP `:53`, so arbitrary UDP egress remains possible
-    for a compromised proxy. Closing it would need `nftables` owner-matching
-    (a dedicated uid + `sudo` + per-instance teardown) — deliberately deferred.
-  - **Host-kernel floor / deprecated primitive.** The Linux jail degrades by
-    kernel version rather than all-or-nothing:
-    - **kernel ≥6.7** — full jail: filesystem-write + program-`exec` denied and
-      TCP egress port-scoped to `:443`/`:53`;
-    - **kernel 5.13–6.6** — filesystem-write + program-`exec` denied, but
-      Landlock has no network rules, so TCP egress is **not** scoped (open
-      egress). Acceptable because the network tier is already the weak,
-      port-scoped layer and upstream identity is TLS-pinned in the proxy;
-    - **kernel <5.13** — the floor cannot be established, so the proxy **fails
-      closed** and refuses to start.
-
-    `sandbox-exec` is officially deprecated but still functional and has no CLI
-    successor — a pragmatic, aging primitive.
+The host credential proxy accepts only a per-instance capability and allowed
+operations to fixed provider hosts over TLS. Its Linux Landlock or macOS
+Seatbelt jail must deny filesystem writes and program execution before serving.
+Network restrictions are port scoped, and older supported Linux kernels have
+weaker TCP restrictions; Linux UDP remains unrestricted. A proxy compromise
+can therefore still use some outbound paths. See [proxy policy and limits](credential-proxy.md#what-it-does-and-does-not-guarantee).
 
 ## Browser editor transport
 
-`coop editor --web` runs code-server, extensions, and terminals inside the VM,
-reducing exposure through the native host-editor integrations used by `coop editor`.
-Browser vulnerabilities remain part of the attack surface.
-
-Code-server's password login restricts access to the editor, and the host
-browser handles guest-controlled content under a fresh, session-specific
-`.localhost` origin.
+`coop editor --web` runs code-server, extensions, and terminals in the VM.
+Password login limits editor access, and the host browser uses a fresh
+session-specific `.localhost` origin for guest-controlled content. Browser
+vulnerabilities remain possible. See [editor](editor.md#browser-editing).
 
 ## `coop update` trust chain
 
-Self-update (`update.rs`) must preserve, in order:
+Both the CLI updater and `install.sh` need review when this chain changes:
 
-1. Metadata from the fixed
-   `https://api.github.com/repos/trailofbits/coop/releases` identity. Official
-   builds reject the retired runtime origin override before network I/O; the
-   background check applies the same policy.
-2. The requested or returned tag must be canonical `v`-prefixed semver. Before
-   an asset download, metadata entries for the platform archive, `SHA256SUMS`,
-   and optional `attestations.jsonl` are independently bound to the exact
-   `https://github.com/trailofbits/coop/releases/download/<tag>/<filename>`
-   identity. Userinfo, ports, queries, fragments, encoded separators, path
-   ambiguity, lookalike names, and conflicting duplicates are rejected.
-3. **Mandatory checksum.** The `SHA256SUMS` asset must be present (install is
-   refused otherwise) and every downloaded tarball is verified against it
-   (`verify_sha256`, constant-size `Sha256Hash` compare).
-4. **Best-effort attestation.** `gh attestation verify --repo trailofbits/coop
-   --bundle attestations.jsonl` (Sigstore provenance), against the bundle asset
-   downloaded from the same release. Both `update.rs` and `install.sh` also
-   require `--cert-identity
-   https://github.com/trailofbits/coop/.github/workflows/release.yml@refs/tags/<tag>`,
-   `--source-ref refs/tags/<tag>`, and `--deny-self-hosted-runners` on both the
-   bundle and API paths. The signer must be the release workflow at the exact
-   selected tag, attesting on a GitHub-hosted runner.
+1. Bind metadata to the fixed `trailofbits/coop` release identity and a
+   canonical `v`-prefixed semver tag. Bind each asset URL to that tag and exact
+   expected filename before download; reject ambiguous identities.
+2. Require `SHA256SUMS` and verify the archive digest before extraction.
+3. When `gh` is present, verify artifact provenance against the release
+   workflow at the selected tag and source ref, on a GitHub-hosted runner.
+   Prefer the published bundle; an absent or empty bundle may fall back to the
+   digest-keyed attestations API. Verification or parsing failure aborts the
+   install. Without `gh`, provenance is skipped, so checksum is the floor.
+4. Use HTTPS-only download and redirect protocols, reject archive path escape,
+   and atomically replace the installed binary. The CLI and proxy binary are
+   each replaced atomically, not as one transaction.
 
-   `--bundle` means **no attestations-API call and no credential** — `gh` marks
-   the flag `DisableAuthCheckFlag`, so no token or `gh auth login` is needed.
-   The bundle asset is fetched with a deliberately unauthenticated request
-   (`curl_download(asset, dest, None)` in `update.rs`, `download_bundle` in
-   `install.sh`) rather than through `download_asset` / `gh release download`,
-   which first attempts authenticated access. Direct anonymous retrieval avoids
-   unnecessary credential use and authorization failures. Keep both bundle
-   fetches credential-free. It is *not* offline:
-   without `--custom-trusted-root`, `gh` still reaches `tuf-repo.github.com`
-   and the Sigstore public-good CDN for the trust root (one-day cache) and
-   fails if neither is reachable.
-
-   It does *not* weaken the check materially, but the two transports are not
-   interchangeable, and the differences are worth stating rather than arguing
-   away:
-
-   - **The bundle path accepts a superset.** The API path only returns
-     attestations registered in the repo's attestation store, so minting one
-     requires `attestations: write`. The `--bundle` path accepts any
-     correctly-signed bundle satisfying the signer/ref/runner policy sitting
-     in a release, whose publication requires only `contents: write`.
-   - **The bundle path is unrevocable.** `DELETE
-     /orgs/{org}/attestations/digest/{digest}` exists, Fulcio certificates
-     carry no CRL or OCSP, and nothing in `gh`'s verification path consults a
-     revocation source — so a bundle already saved by a client keeps verifying
-     indefinitely after the attestation is deleted.
-
-   What still defeats a substituted bundle is the **subject-digest binding** —
-   `gh` digests the artifact and requires a matching subject. Repository-only
-   verification could accept another workflow or ref in the same repository;
-   the exact certificate identity and source-ref checks reject those on both
-   verification paths. These checks pin a tag name, not an immutable commit
-   digest: moving a tag and rerunning the release workflow is not prevented
-   by this policy.
-
-   A release that publishes no bundle asset, or whose bundle download fails or
-   is empty, falls back to an anonymous request to the repository attestations
-   API keyed by the verified tarball's SHA-256 digest. The updater extracts
-   nonempty bundle objects into JSONL and runs the same pinned `gh --bundle`
-   verification. The installer uses `jq` for this extraction when available;
-   without `jq` it retains the authenticated `gh` API transport and explains
-   how to enable anonymous retrieval. If the anonymous API transfer fails, both
-   clients retain authenticated `gh` verification for private resources and
-   anonymous rate limits. Parsing and verification failures abort installation. The request asks for up to
-   100 attestations; verification fails closed if none of those satisfy the
-   signer policy.
-   An empty bundle is
-   rejected rather than passed through because `gh` before 2.56.0
-   (cli/cli#9541) reports success on one, having verified nothing;
-   `release.yml` also fails the release rather than publish one. A bundle that
-   downloads and fails to *verify* is refused outright, not retried through the
-   API — that is no stricter on integrity, but a digest mismatch, a corrupt
-   download and an unusable `gh` all surface here, and switching transports
-   would mask them. Skipped with a logged note if `gh` is absent, and skipped
-   in the separately compiled test-source build unless the updater integration
-   suite sets `COOP_UPDATE_TEST_VERIFY_ATTESTATION=1` to exercise verification
-   against its loopback fixture. Official builds cannot construct that source. So
-   provenance is *not* guaranteed on hosts without `gh` — checksum is the
-   floor.
-5. Extraction with `tar -xzf --no-same-owner --no-same-permissions` (path-escape
-   safe), then an atomic `rename`-over-self.
-
-Release metadata and asset downloads prefer the existing authenticated
-transport, then retry a failed transfer once anonymously. The installer can
-try both `gh` and an explicit token before its anonymous attempt. Since
-`gh release download` does not expose a structured HTTP status, transfer
-failures are retried without guessing whether they are authorization, rate
-limit, or network failures. Parsing and integrity failures are never retried.
-Partial asset files are removed before retrying. Curl's default config file
-is disabled so it cannot silently add authentication to an anonymous request.
-
-Production curl transfers restrict both initial and redirected protocols to
-HTTPS and retain curl's default refusal to forward authorization headers across
-hosts. `install.sh` remains a separate update path with its own policy. Flag any
-change that makes a production update source runtime-selectable or softens any
-step above.
+The attestation pins a tag name, not an immutable commit. Bundle verification
+accepts a correctly signed bundle published with release-content permission
+and cannot revoke one already obtained by a client; API verification has a
+narrower publication path. Neither path authenticates every upstream build
+input. The separately compiled test source does not make production update
+origins runtime-selectable. See [architecture](ARCHITECTURE.md#coop-update).
 
 ## Documented, accepted trade-offs
 
-These are deliberate and documented in [`AGENTS.md`](../AGENTS.md) /
-[`docs/ARCHITECTURE.md`](ARCHITECTURE.md). Don't "fix" them without
-understanding the rationale; do flag a change that *widens* them:
-
-- **Native agent installers are trusted build inputs.** Provisioning fetches
-  Claude's installer from `claude.ai` and Codex's from
-  `https://chatgpt.com/codex/install.sh` over HTTPS, then runs them as the
-  configured guest user. On Firecracker this happens in the host-side chroot;
-  a chroot does not provide VM isolation. Lima provisioning and live agent
-  updates execute inside a VM. This build-time trust is distinct from the
-  untrusted guest boundary described above.
-- **`DOCKER_INSECURE_NO_IPTABLES_RAW=1`** in the guest. The Firecracker CI
-  kernel lacks `iptable_raw`, so Docker 28+ can't install its raw-table
-  "direct access filtering" rule. Without it, other hosts on the guest's LAN
-  could route to published container ports bound to loopback — irrelevant here
-  because the guest's only network neighbor is the host and the VM *is* the
-  isolation boundary.
-- **iptables-legacy** and a **static `/etc/resolv.conf`** in the guest — both
-  work around the minimal CI kernel (no nftables, no systemd-resolved). Guest
-  config only; no host-side trust impact.
+- Native agent installers are trusted build inputs. Firecracker provisioning
+  runs them in a host-side chroot, which is not VM isolation; Lima provisioning
+  and live updates run inside a VM.
+- `DOCKER_INSECURE_NO_IPTABLES_RAW=1`, `iptables-legacy`, and a static guest
+  resolver are guest-side workarounds for the minimal Firecracker CI kernel.
+  See [platform notes](platform-notes.md).
+- Deliberate guest host access, disabled guest host-key checking, proxy
+  capability use, and proxy network limits are described above. A change that
+  widens any of them requires review.
 
 ## Changes requiring explicit confirmation
 
-The following changes require explicit human confirmation before merge:
+Before merge, obtain explicit human confirmation if a change:
 
-- An outbound URL, network listener, or egress/`FORWARD`/NAT rule is added;
-  its boundary and authentication require review.
-- A new secret is forwarded into the guest, or an existing one becomes
-  persistent there.
-- A host subprocess receives tainted (guest-, project-, or fetch-derived)
-  input; the full launch context includes executable lookup, environment, cwd,
-  tool configuration, shell behavior, and arguments.
-- A host filesystem path is derived from tainted data; traversal and path
-  resolution require review.
-- Tainted or secret content enters logs or traces, creating an exfiltration
-  channel.
-- Any step of the `coop update` verification chain is weakened.
+- Adds an outbound URL, listener, egress rule, `FORWARD` rule, or NAT rule.
+- Forwards a new secret into the guest or makes an existing one persistent.
+- Passes guest, project, or fetched data into a host subprocess; inspect its
+  executable, environment, cwd, configuration, and arguments.
+- Derives a host filesystem path from tainted data.
+- Logs or traces tainted or secret content.
+- Weakens any step of the `coop update` verification chain.
