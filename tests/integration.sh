@@ -9616,9 +9616,11 @@ test_guest_user_alt() {
 
     # Create an instance from the alt-user image — no `--guest-user` flag
     # here on purpose; coop must read the persisted value.
-    local alt_ws="$tmpdir/${inst_name}-ws"
-    mkdir -p "$alt_ws"
-    if coop up "$alt_ws" --name "$inst_name" --no-agents --image "$img_name"; then
+    local alt_ws="$tmpdir/${inst_name}-ws" alt_mount="$tmpdir/${inst_name}-mount"
+    mkdir -p "$alt_ws" "$alt_mount"
+    echo "alternate user mount" > "$alt_mount/marker"
+    if coop up "$alt_ws" --name "$inst_name" --no-agents --image "$img_name" \
+            --extra-mount "$alt_mount:/data/project"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up (alt-user image) exits 0"
     else
@@ -9628,6 +9630,12 @@ test_guest_user_alt() {
     fi
 
     GUEST_INSTANCE="$inst_name"
+
+    if guest_exec test -f /data/project/marker && guest_exec touch /data/project/guest-write; then
+        pass "extra mount is populated and writable by $alt_user"
+    else
+        fail "extra mount is populated and writable by $alt_user" "$(guest_stderr)"
+    fi
 
     # whoami via SSH — this is the highest-signal assertion. If any
     # SshTarget construction site still hardcoded `ubuntu`, the session
