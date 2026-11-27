@@ -700,7 +700,7 @@ fuzz run <target> <artifact-path>`.
 - `config_load` — `toml::from_str` into `coop::config::CoopConfig` then
   `validate`, fed `config.toml` text. Exercises the custom `Deserialize`/
   `visit_map` impls (`SubnetMask`, `HostInterface`, `PortForward`). Property:
-  never panics, only returns `Err`.
+  valid and invalid inputs both complete without panicking.
 
 ## Formal verification (kani)
 

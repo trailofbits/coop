@@ -108,7 +108,7 @@ pub(crate) fn validate_explicit_setup_inputs<T>(
 ///
 /// `guest_user` is set at setup time and immutable for the image's
 /// lifetime — `coop start`/`shell`/`exec` read it from here rather
-/// than accepting a flag. Existing `template_config.json` files
+/// than accepting a flag. Existing `template-config.json` files
 /// without the field deserialize via `GuestUser::default()` to the
 /// historical `ubuntu` user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
