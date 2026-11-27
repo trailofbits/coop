@@ -24,7 +24,7 @@ non-fatal, so extraction can retain stale files from an earlier build.
 ## Choose coding agents
 
 New images include Claude Code, Codex, and Grok Build by default. Repeat
-`--agent` to build a smaller image:
+`--agent` to build a smaller image (at least one agent is required):
 
 ```bash
 coop setup --image codex-dev --agent codex
@@ -32,17 +32,25 @@ coop setup --image pair-dev --agent claude --agent codex
 coop up . --image codex-dev
 ```
 
+The order of repeated selectors does not matter; duplicates are ignored.
 Omitting `--agent` when setting up an existing image preserves its recorded
-selection. To change it, pass the new selection with `--rebuild`. An instance
-keeps the agent set from the image disk it copied, even if that image is later
-rebuilt. `coop images` and `coop status` show the recorded set. Commands that
-launch, update, or configure an absent agent reject it with recovery guidance.
+selection, including on a rebuild. To change it, pass the new selection with
+`--rebuild`, or choose a new image name. An instance keeps the agent set from
+the image disk it copied, even if that image is later rebuilt or deleted. To
+use a different set in an existing VM, restore it from an image with that set
+(`coop restore VM --image IMAGE --reprovision` replaces its guest disk), or
+create a new VM from the image. Save guest-only work before restoring.
+`coop images` and `coop status` show the recorded set. Commands that launch,
+update, or configure an absent agent reject it with recovery guidance. The
+set describes agents installed by coop, not tools installed later by hand in
+the guest. A committed image inherits its source VM's recorded set.
 `--no-agents` at VM start only skips boot-time agent setup; it does not change
 the image contents.
 
-## What every template includes
+## Base packages and selected agents
 
-Every template installs these packages regardless of profile selection.
+Every template installs the base packages, Docker, and GitHub CLI regardless
+of profile selection. The agent tools below are installed only when selected.
 
 **Base packages:** `openssh-server`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `util-linux`, `jq`, `rsync`, `unzip`, `zip`, `file`, `less`. Images containing Codex also install `dbus-user-session`, `gnome-keyring`, and `libsecret-tools` for account authentication.
 
@@ -143,7 +151,9 @@ coop up --profile node,python
 
 coop runs the same recipe-hash staleness check used by `coop setup`. If the
 derived image is missing or stale, it is built or rebuilt first; if it is
-current, startup reuses it.
+current, startup reuses it. A new profile-derived image includes all three
+agents; an existing one keeps its recorded selection. For a predictable
+subset, use `coop setup --image NAME --agent AGENT` and `coop up --image NAME`.
 
 Explicitly named images are not affected by this shorthand. To choose the
 image name yourself, build it with `setup` and start a project from that image:

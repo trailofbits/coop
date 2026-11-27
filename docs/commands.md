@@ -444,6 +444,14 @@ load, or `null` when stopped or the query fails). The rich
 single-instance text report (guest IP, PID, SSH port, …) is text-only. JSON goes
 to stdout; tracing stays on stderr, so `coop status --json | jq` stays clean.
 
+`agents` is the set recorded when this VM's disk was copied or restored.
+`restore_pending` identifies an interrupted disk replacement or reprovision;
+retry `coop restore VM --image IMAGE --reprovision` to complete it before
+starting or connecting to the VM.
+`model_apply_pending` means a live model change did not finish; restart the VM
+normally to reapply it before launching an agent. `coop shell` and `coop exec`
+remain available for diagnosis when only a model change is pending.
+
 ```
 $ coop status my-project --json
 {
@@ -804,6 +812,7 @@ coop images --delete old-image
 ```
 
 With `--json`, each element is `{ "name", "agents", "profiles", "created", "size_bytes" }`.
+If image metadata is unreadable, `agents` is `null` rather than a guessed set.
 Absence is modelled honestly: `profiles` is `[]` (not `"none"`), `created` is
 `null` (not `"unknown"`), and `size_bytes` is the raw byte count (the text path's
 `"8.0 GiB"` is presentation only).

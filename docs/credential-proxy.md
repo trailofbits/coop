@@ -171,6 +171,12 @@ status --vm <name>` shows one VM's effective resolution. Credentials are shown
 as their `cmd:` reference (a command, not the secret); a hand-written literal is
 redacted.
 
+A per-VM proxy requires the matching agent in that VM's image: Anthropic for
+Claude Code and OpenAI for Codex. `coop proxy setup --vm <name>` rejects a
+provider absent from the image before storing a credential. A global default
+can still serve other VMs. For an absent provider, per-VM status labels its
+default or override as inactive; it does not resolve that credential on boot.
+
 Proxy mode applies only in **remote** model mode. `coop model <vm> local` takes
 precedence (the VM routes at your local model server and the proxy is torn
 down). If credential resolution fails at start, the VM **fails closed** — it
