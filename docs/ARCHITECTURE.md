@@ -173,7 +173,7 @@ publishing the instance. It releases its directory lock before boot.
 
 The `commands/` submodules own the domains: `lifecycle.rs` (up/start/shell/
 exec/stop/destroy/status/list/resize/commit/restore),
-`profiles.rs` (+ images), `agent.rs` (`coop agent update`),
+`profiles.rs` (+ images), `agent.rs` (`coop agent update` / `status`),
 `model.rs` (`coop model`), `proxy.rs` (`coop proxy`), `github.rs`,
 `admin.rs` (init/validate/uninstall), and `json.rs` (machine-readable `--json` output types). `commands/mod.rs`
 re-exports the dispatch surface and holds cross-domain helpers
