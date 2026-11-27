@@ -2742,15 +2742,10 @@ mod tests {
     }
 
     #[test]
-    fn up_accepts_leading_underscore_instance_name() {
-        let cli = parse(&["up", "--name", "_worker"]);
-        let super::Commands::Up { name, .. } = cli.command else {
-            panic!("expected Up variant");
-        };
-        assert_eq!(
-            name.as_ref().map(super::config::InstanceName::as_str),
-            Some("_worker")
-        );
+    fn up_rejects_leading_underscore_instance_name() {
+        let err = parse_err(&["up", "--name", "_worker"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("invalid character '_'"));
     }
 
     #[test]

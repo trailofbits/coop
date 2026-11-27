@@ -737,25 +737,15 @@ const GUEST_HOSTS_ALIAS_IP: &str = "127.0.1.1";
 /// few hundred bytes.
 const MAX_GUEST_HOSTS_BYTES: usize = 64 * 1024;
 
-/// One byte under Linux's `HOST_NAME_MAX` of 64, which POSIX counts without
-/// the terminator. A 57-character instance name is already pathological, so
-/// the spare byte is free — and the clamp holds even where the limit is read
-/// as including the terminator.
+/// One byte under Linux's `HOST_NAME_MAX` of 64. `InstanceName` is limited to
+/// 56 ASCII bytes, so the `claude-` prefix always fits without truncation.
 const MAX_GUEST_HOSTNAME_LEN: usize = 63;
 
-/// The guest hostname for an instance: `claude-<name>`, clamped to fit
-/// `HOST_NAME_MAX`.
-///
-/// Instance names allow 64 characters, so the prefixed form reaches 71 — past
-/// the kernel's limit. An over-long name cannot reach
-/// the running hostname intact, so `/etc/hostname` and the `/etc/hosts` alias
-/// would then name different things. Deriving both from this one value is what
-/// keeps them equal.
+/// The guest hostname for an instance: `claude-<name>`. The validated name
+/// guarantees this is a portable static hostname that fits `HOST_NAME_MAX`.
 fn guest_hostname(name: &InstanceName) -> String {
-    // `truncate` is a byte index, and `InstanceName` is validated ASCII, so
-    // every index is a char boundary.
-    let mut hostname = format!("claude-{name}");
-    hostname.truncate(MAX_GUEST_HOSTNAME_LEN);
+    let hostname = format!("claude-{name}");
+    debug_assert!(hostname.len() <= MAX_GUEST_HOSTNAME_LEN);
     hostname
 }
 
@@ -4488,21 +4478,23 @@ mod tests {
             guest_hostname(&instance_name("auditor-1")),
             "claude-auditor-1"
         );
+        assert_eq!(
+            guest_hostname(&instance_name("Dev-Box-01")),
+            "claude-Dev-Box-01"
+        );
     }
 
-    /// Asserted against literals, not `MAX_GUEST_HOSTNAME_LEN` — comparing the
-    /// output length to the constant that produced it passes for any bound.
     #[test]
-    fn guest_hostname_clamps_the_longest_instance_name() {
-        let longest = instance_name(&"n".repeat(64));
+    fn guest_hostname_preserves_the_longest_instance_name() {
+        let longest = instance_name(&"n".repeat(56));
         assert_eq!(
             guest_hostname(&longest),
             format!("claude-{}", "n".repeat(56))
         );
     }
 
-    /// The exact-fit boundary: 56 characters is the longest name that survives
-    /// the clamp untouched, so this pins which names the fix still reaches.
+    /// The exact-fit boundary pins the guest hostname length independently of
+    /// the constant used by production code.
     #[test]
     fn guest_hostname_leaves_an_exactly_fitting_name_intact() {
         let name = "n".repeat(56);

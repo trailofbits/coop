@@ -1963,7 +1963,10 @@ impl<'de> Deserialize<'de> for LocalModel {
 /// Permissive local servers (Ollama, LM Studio, vLLM) ignore the value.
 pub const LOCAL_MODEL_AUTH_FALLBACK: &str = "coop-local";
 
-const MAX_INSTANCE_NAME_LEN: usize = 64;
+// Firecracker prefixes `claude-` to the guest hostname and keeps it within
+// 63 bytes. Lima's `coop-` prefix is shorter and its limit is 76 bytes.
+const MAX_INSTANCE_NAME_LEN: usize = 56;
+const MAX_DERIVED_INSTANCE_NAME_LEN: usize = MAX_INSTANCE_NAME_LEN - 3;
 
 fn validate_instance_name(name: &str) -> Result<()> {
     if name.is_empty() {
@@ -1977,11 +1980,11 @@ fn validate_instance_name(name: &str) -> Result<()> {
     }
     if let Some(c) = name
         .chars()
-        .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_'))
+        .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-'))
     {
         let mut msg = format!(
             "Instance name contains invalid character '{c}' \
-             (allowed: a-z, A-Z, 0-9, '-', '_')"
+             (allowed: a-z, A-Z, 0-9, '-')"
         );
         if looks_like_path(name) {
             msg.push_str(
@@ -1994,6 +1997,12 @@ fn validate_instance_name(name: &str) -> Result<()> {
     if name.starts_with('-') {
         bail!("Instance name must not start with '-'");
     }
+    if name.ends_with('-') {
+        bail!("Instance name must not end with '-'");
+    }
+    if name.contains("--") {
+        bail!("Instance name must not contain adjacent '-' characters");
+    }
     Ok(())
 }
 
@@ -2005,8 +2014,8 @@ fn looks_like_path(name: &str) -> bool {
 }
 
 /// Validated instance name. Construction guarantees the name matches
-/// `[a-zA-Z0-9_][a-zA-Z0-9_-]{0,63}`, so downstream code (path construction,
-/// shell commands, SSH config blocks) can use it without re-checking.
+/// `[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*` with at most 56 bytes, so downstream code
+/// (path construction, shell commands, SSH config blocks) need not re-check it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InstanceName(String);
 
@@ -2150,26 +2159,28 @@ fn lock_dir(dir: &Path) -> Result<File> {
 
 /// Sanitize a directory basename for use as an instance name.
 ///
-/// Replaces characters outside `[a-zA-Z0-9_-]` with `-` and removes leading
-/// `-` characters. Returns `"workspace"` if the result would be empty.
-/// Truncates to 60 characters to leave room for collision suffixes.
+/// Replaces non-alphanumeric runs with one `-` and removes leading and trailing
+/// separators. Returns `"workspace"` if the result would be empty.
+/// Truncates to 53 characters to leave room for collision suffixes.
 fn sanitize_basename(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let sanitized = sanitized.trim_start_matches('-');
-    if sanitized.is_empty() {
-        return "workspace".to_string();
+    sanitize_instance_basename(name).unwrap_or_else(|| "workspace".to_string())
+}
+
+/// Derive a portable name from a workspace or repository basename.
+/// `None` lets callers choose their own fallback when no alphanumeric remains.
+pub(crate) fn sanitize_instance_basename(name: &str) -> Option<String> {
+    let mut sanitized = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            sanitized.push(c);
+        } else if !sanitized.is_empty() && !sanitized.ends_with('-') {
+            sanitized.push('-');
+        }
     }
-    let max = 60.min(sanitized.len());
-    sanitized[..max].to_string()
+    let sanitized = sanitized.trim_end_matches('-');
+    let max = MAX_DERIVED_INSTANCE_NAME_LEN.min(sanitized.len());
+    let sanitized = sanitized[..max].trim_end_matches('-');
+    (!sanitized.is_empty()).then(|| sanitized.to_string())
 }
 
 /// Find a unique instance name by appending `-2`, `-3`, etc. on collision.
@@ -4476,17 +4487,7 @@ mod tests {
 
     #[test]
     fn validate_name_accepts_valid() {
-        for name in [
-            "foo",
-            "my-project",
-            "test_vm",
-            "Dev-Box_01",
-            "a",
-            "A",
-            "0",
-            "_vm",
-            "_",
-        ] {
+        for name in ["foo", "my-project", "test-vm", "Dev-Box-01", "a", "A", "0"] {
             validate_instance_name(name).unwrap();
         }
     }
@@ -4496,6 +4497,17 @@ mod tests {
         for name in ["--all", "-vm", "-"] {
             let err = InstanceName::new(name).unwrap_err().to_string();
             assert!(err.contains("must not start with '-'"), "{err}");
+        }
+    }
+
+    #[test]
+    fn validate_name_rejects_nonportable_separators() {
+        for name in ["_vm", "test_vm", "_"] {
+            let err = InstanceName::new(name).unwrap_err().to_string();
+            assert!(err.contains("invalid character '_'"), "{err}");
+        }
+        for name in ["vm-", "vm--one"] {
+            assert!(InstanceName::new(name).is_err(), "accepted {name:?}");
         }
     }
 
@@ -4559,14 +4571,14 @@ mod tests {
 
     #[test]
     fn validate_name_rejects_too_long() {
-        let long = "a".repeat(65);
+        let long = "a".repeat(57);
         let err = validate_instance_name(&long).unwrap_err();
         assert!(err.to_string().contains("too long"));
     }
 
     #[test]
     fn validate_name_accepts_max_length() {
-        let max = "a".repeat(64);
+        let max = "a".repeat(56);
         validate_instance_name(&max).unwrap();
     }
 
@@ -5489,16 +5501,16 @@ skip = ["not-a-slug"]
 
     #[test]
     fn instance_name_roundtrip_serde() {
-        let name = InstanceName::new("_my-vm").unwrap();
+        let name = InstanceName::new("my-vm").unwrap();
         let json = serde_json::to_string(&name).unwrap();
-        assert_eq!(json, r#""_my-vm""#);
+        assert_eq!(json, r#""my-vm""#);
         let loaded: InstanceName = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded, name);
     }
 
     #[test]
     fn instance_name_rejects_invalid_on_deserialize() {
-        for json in [r#""../evil""#, r#""--all""#] {
+        for json in [r#""../evil""#, r#""--all""#, r#""test_vm""#] {
             assert!(serde_json::from_str::<InstanceName>(json).is_err());
         }
     }
@@ -7398,20 +7410,25 @@ rsync = "/run/current-system/sw/bin/rsync"
     #[test]
     fn sanitize_basename_removes_leading_hyphens() {
         assert_eq!(sanitize_basename(".hidden-project"), "hidden-project");
-        assert_eq!(sanitize_basename("--_project"), "_project");
-        assert_eq!(sanitize_basename("_project"), "_project");
+        assert_eq!(sanitize_basename("--_project"), "project");
+        assert_eq!(sanitize_basename("_project"), "project");
     }
 
     #[test]
     fn sanitize_basename_truncates_long_names() {
         let long = "a".repeat(100);
         let result = sanitize_basename(&long);
-        assert_eq!(result.len(), 60);
+        assert_eq!(result.len(), 53);
     }
 
     #[test]
-    fn sanitize_basename_preserves_hyphens_and_underscores() {
-        assert_eq!(sanitize_basename("my-project_v2"), "my-project_v2");
+    fn sanitize_basename_collapses_and_trims_separators() {
+        assert_eq!(sanitize_basename("my--project_v2-"), "my-project-v2");
+        assert_eq!(sanitize_basename("a".repeat(52).as_str()), "a".repeat(52));
+        assert_eq!(
+            sanitize_basename(&format!("{}-end", "a".repeat(52))),
+            "a".repeat(52)
+        );
     }
 
     #[test]

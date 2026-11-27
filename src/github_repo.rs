@@ -148,7 +148,8 @@ fn canonicalize(path: &str) -> Option<RepoSlug> {
 ///
 /// Prefers the canonical GitHub slug's repo segment; otherwise falls back to
 /// the URL's trailing path segment (with any `.git` suffix stripped). The
-/// basename is sanitized to the instance-name charset and capped at 60 chars.
+/// basename is sanitized to the portable instance-name charset and capped at
+/// 53 chars to leave room for collision suffixes.
 /// Returns `None` when nothing usable remains.
 pub(crate) fn git_repo_default_instance_name(repo_url: &str) -> Option<InstanceName> {
     let base = parse_repo_slug_from_url(repo_url)
@@ -160,22 +161,8 @@ pub(crate) fn git_repo_default_instance_name(repo_url: &str) -> Option<InstanceN
                 .next()
                 .map(|s| s.trim_end_matches(".git").to_string())
         })?;
-    let sanitized: String = base
-        .chars()
-        .map(|c| {
-            if matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let sanitized = sanitized.trim_start_matches('-').trim_end_matches('-');
-    if sanitized.is_empty() {
-        return None;
-    }
-    let max = 60.min(sanitized.len());
-    InstanceName::new(&sanitized[..max]).ok()
+    let sanitized = crate::config::sanitize_instance_basename(&base)?;
+    InstanceName::new(&sanitized).ok()
 }
 
 /// Detect the `owner/repo` slug for the GitHub remote of `git_dir`.
@@ -319,7 +306,7 @@ mod tests {
     #[test]
     fn git_repo_default_instance_name_removes_leading_hyphens() {
         let name = git_repo_default_instance_name("https://example.com/org/_-widget").unwrap();
-        assert_eq!(name.as_str(), "_-widget");
+        assert_eq!(name.as_str(), "widget");
 
         let name = git_repo_default_instance_name("https://example.com/org/--widget").unwrap();
         assert_eq!(name.as_str(), "widget");
@@ -329,8 +316,15 @@ mod tests {
     fn git_repo_default_instance_name_caps_long_basenames() {
         let long = format!("https://example.com/org/{}.git", "a".repeat(200));
         let name = git_repo_default_instance_name(&long).unwrap();
-        assert_eq!(name.as_str().len(), 60);
+        assert_eq!(name.as_str().len(), 53);
         assert!(name.as_str().chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn git_repo_default_instance_name_is_portable() {
+        let name =
+            git_repo_default_instance_name("https://example.com/org/_my--repo_.git").unwrap();
+        assert_eq!(name.as_str(), "my-repo");
     }
 
     #[test]

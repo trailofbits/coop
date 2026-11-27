@@ -166,7 +166,7 @@ failure diagnostics and session cleanup, including mounted workspaces.
 For a focused run, use a disposable VM: this fixture stops and restarts it.
 
 ```sh
-python3 tests/integration-web-editor.py --binary target/debug/coop --name TEST_VM --config TEST_CONFIG
+python3 tests/integration-web-editor.py --binary target/debug/coop --name test-vm --config TEST_CONFIG
 ```
 
 Generated completion is checked without a VM by
