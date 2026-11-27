@@ -518,7 +518,7 @@ test_invalid_names() {
     fi
 
     local invalid_name
-    for invalid_name in _vm test_vm vm--one vm-; do
+    for invalid_name in _vm test_vm vm-_one vm_-one vm--one vm-; do
         if coop_fails start "$invalid_name" --no-agents \
             && [[ "$HARNESS_ERR" == *"Instance name"* ]]; then
             pass "rejects nonportable name ($invalid_name)"
@@ -834,7 +834,7 @@ EOF
     else
         local guest_name
         guest_name=$(guest_exec hostname) || guest_name=""
-        if [[ "$guest_name" == "claude-$INSTANCE" ]]; then
+        if [[ "$guest_name" == "coop-$INSTANCE" ]]; then
             pass "portable name reaches Firecracker guest hostname"
         else
             fail "portable name reaches Firecracker guest hostname" \

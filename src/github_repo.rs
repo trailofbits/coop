@@ -149,7 +149,7 @@ fn canonicalize(path: &str) -> Option<RepoSlug> {
 /// Prefers the canonical GitHub slug's repo segment; otherwise falls back to
 /// the URL's trailing path segment (with any `.git` suffix stripped). The
 /// basename is sanitized to the portable instance-name charset and capped at
-/// 53 chars to leave room for collision suffixes.
+/// 55 chars to leave room for collision suffixes.
 /// Returns `None` when nothing usable remains.
 pub(crate) fn git_repo_default_instance_name(repo_url: &str) -> Option<InstanceName> {
     let base = parse_repo_slug_from_url(repo_url)
@@ -316,7 +316,7 @@ mod tests {
     fn git_repo_default_instance_name_caps_long_basenames() {
         let long = format!("https://example.com/org/{}.git", "a".repeat(200));
         let name = git_repo_default_instance_name(&long).unwrap();
-        assert_eq!(name.as_str().len(), 53);
+        assert_eq!(name.as_str().len(), 55);
         assert!(name.as_str().chars().all(|c| c == 'a'));
     }
 

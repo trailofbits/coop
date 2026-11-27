@@ -1963,9 +1963,9 @@ impl<'de> Deserialize<'de> for LocalModel {
 /// Permissive local servers (Ollama, LM Studio, vLLM) ignore the value.
 pub const LOCAL_MODEL_AUTH_FALLBACK: &str = "coop-local";
 
-// Firecracker prefixes `claude-` to the guest hostname and keeps it within
-// 63 bytes. Lima's `coop-` prefix is shorter and its limit is 76 bytes.
-const MAX_INSTANCE_NAME_LEN: usize = 56;
+// Firecracker prefixes `coop-` to the guest hostname and keeps it within
+// 63 bytes. Lima uses the same prefix and allows up to 76 bytes.
+const MAX_INSTANCE_NAME_LEN: usize = 58;
 const MAX_DERIVED_INSTANCE_NAME_LEN: usize = MAX_INSTANCE_NAME_LEN - 3;
 
 fn validate_instance_name(name: &str) -> Result<()> {
@@ -2014,7 +2014,7 @@ fn looks_like_path(name: &str) -> bool {
 }
 
 /// Validated instance name. Construction guarantees the name matches
-/// `[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*` with at most 56 bytes, so downstream code
+/// `[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*` with at most 58 bytes, so downstream code
 /// (path construction, shell commands, SSH config blocks) need not re-check it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InstanceName(String);
@@ -2161,7 +2161,7 @@ fn lock_dir(dir: &Path) -> Result<File> {
 ///
 /// Replaces non-alphanumeric runs with one `-` and removes leading and trailing
 /// separators. Returns `"workspace"` if the result would be empty.
-/// Truncates to 53 characters to leave room for collision suffixes.
+/// Truncates to 55 characters to leave room for collision suffixes.
 fn sanitize_basename(name: &str) -> String {
     sanitize_instance_basename(name).unwrap_or_else(|| "workspace".to_string())
 }
@@ -4502,7 +4502,7 @@ mod tests {
 
     #[test]
     fn validate_name_rejects_nonportable_separators() {
-        for name in ["_vm", "test_vm", "_"] {
+        for name in ["_vm", "test_vm", "_", "vm-_one", "vm_-one"] {
             let err = InstanceName::new(name).unwrap_err().to_string();
             assert!(err.contains("invalid character '_'"), "{err}");
         }
@@ -4571,14 +4571,14 @@ mod tests {
 
     #[test]
     fn validate_name_rejects_too_long() {
-        let long = "a".repeat(57);
+        let long = "a".repeat(59);
         let err = validate_instance_name(&long).unwrap_err();
         assert!(err.to_string().contains("too long"));
     }
 
     #[test]
     fn validate_name_accepts_max_length() {
-        let max = "a".repeat(56);
+        let max = "a".repeat(58);
         validate_instance_name(&max).unwrap();
     }
 
@@ -7418,16 +7418,18 @@ rsync = "/run/current-system/sw/bin/rsync"
     fn sanitize_basename_truncates_long_names() {
         let long = "a".repeat(100);
         let result = sanitize_basename(&long);
-        assert_eq!(result.len(), 53);
+        assert_eq!(result.len(), 55);
     }
 
     #[test]
     fn sanitize_basename_collapses_and_trims_separators() {
         assert_eq!(sanitize_basename("my--project_v2-"), "my-project-v2");
-        assert_eq!(sanitize_basename("a".repeat(52).as_str()), "a".repeat(52));
+        assert_eq!(sanitize_basename("my-_project"), "my-project");
+        assert_eq!(sanitize_basename("my_-project"), "my-project");
+        assert_eq!(sanitize_basename("a".repeat(54).as_str()), "a".repeat(54));
         assert_eq!(
-            sanitize_basename(&format!("{}-end", "a".repeat(52))),
-            "a".repeat(52)
+            sanitize_basename(&format!("{}-end", "a".repeat(54))),
+            "a".repeat(54)
         );
     }
 
