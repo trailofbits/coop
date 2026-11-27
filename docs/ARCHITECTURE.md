@@ -266,7 +266,7 @@ atomic; the pair is not a single transaction. Official builds cannot replace
 the metadata origin at runtime. A separately compiled test policy permits only
 a loopback fixture for the host-only updater integration test. A background notifier checks for
 new versions on a 24-hour interval (disabled in dev/CI/non-TTY). The full verification chain and
-its trust properties are documented in [`trust-model.md`](trust-model.md#coop-update-trust-chain).
+its trust properties are summarized in [`trust-model.md`](trust-model.md#coop-update-trust-chain).
 
 ## Guest image
 
