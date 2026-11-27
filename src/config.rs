@@ -863,6 +863,72 @@ impl NetworkHostToolsConfig {
     }
 }
 
+/// Stable random identity for the Lima image builder in one coop installation.
+/// Base-36 keeps all 128 random bits in a lowercase Lima-safe component.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct LimaBuilderId(String);
+
+impl LimaBuilderId {
+    pub fn new(value: &str) -> Result<Self> {
+        if value.len() != 25
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+        {
+            bail!("lima.builder_id must be exactly 25 lowercase letters or digits");
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn generate() -> Result<Self> {
+        let mut bytes = [0_u8; 16];
+        getrandom::fill(&mut bytes).context("Cannot generate Lima builder identity")?;
+        Self::from_number(u128::from_be_bytes(bytes))
+    }
+
+    fn from_number(mut number: u128) -> Result<Self> {
+        let mut encoded = [b'0'; 25];
+        let alphabet = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        for digit in encoded.iter_mut().rev() {
+            *digit = alphabet[(number % 36) as usize];
+            number /= 36;
+        }
+        let value = std::str::from_utf8(&encoded).context("Invalid Lima builder encoding")?;
+        Self::new(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for LimaBuilderId {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        Self::new(&value)
+    }
+}
+
+impl From<LimaBuilderId> for String {
+    fn from(value: LimaBuilderId) -> Self {
+        value.0
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct LimaConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_id: Option<LimaBuilderId>,
+}
+
+impl LimaConfig {
+    fn is_empty(&self) -> bool {
+        self.builder_id.is_none()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CoopConfig {
     /// Effective CLI config path, retained for Lima mount preflight. This is
@@ -881,6 +947,10 @@ pub struct CoopConfig {
     pub vm: VmConfig,
     #[serde(default)]
     pub network: NetworkConfig,
+
+    /// Lima builder identity, generated once during setup.
+    #[serde(default, skip_serializing_if = "LimaConfig::is_empty")]
+    pub lima: LimaConfig,
 
     /// Coop-managed OpenSSH client configuration.
     #[serde(default, skip_serializing_if = "SshConfig::is_empty")]
@@ -2736,6 +2806,7 @@ impl Default for CoopConfig {
             data_dir: default_data_dir(),
             vm: VmConfig::default(),
             network: NetworkConfig::default(),
+            lima: LimaConfig::default(),
             ssh: SshConfig::default(),
             ssh_port: default_ssh_port(),
             firecracker_bin: default_firecracker_bin(),
@@ -3631,6 +3702,17 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn lima_builder_id_encoding_roundtrip() {
+        let id = LimaBuilderId::from_number(u128::MAX).unwrap();
+        assert_eq!(id.as_str(), "f5lxx1zz5pnorynqglhzmsp33");
+        assert_eq!(String::from(id.clone()), "f5lxx1zz5pnorynqglhzmsp33");
+        assert_eq!(
+            LimaBuilderId::new(&String::from(id)).unwrap().as_str(),
+            "f5lxx1zz5pnorynqglhzmsp33"
+        );
+    }
 
     fn test_config(tmp: &TempDir) -> CoopConfig {
         CoopConfig {

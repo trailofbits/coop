@@ -33,6 +33,7 @@ libc = "0.2.186"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "1.1.2"
+toml_edit = "0.25.17"
 tracing = "0.1"
 semver = "1"
 # Only concrete SHA-256 digests are used.

@@ -68,7 +68,7 @@ pub fn prepare(cfg: &CoopConfig) -> Result<()> {
         }
     }
     #[cfg(target_os = "macos")]
-    crate::lima::prepare_private_storage()?;
+    crate::lima::prepare_private_storage(cfg)?;
     Ok(())
 }
 

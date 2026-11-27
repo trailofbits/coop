@@ -2,7 +2,7 @@
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::num::NonZeroU8;
 use std::path::{Path, PathBuf};
@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::backend::{Hostname, LogMode, SshTarget, SshUser};
-use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName, MiB};
-use crate::fs_util::{PrivateDir, PrivateEntryType};
+use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName, LimaBuilderId, MiB};
+use crate::fs_util::{FileLock, PrivateDir, PrivateEntryType};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
     SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, SCRIPT_GROK,
@@ -24,7 +24,97 @@ use crate::sha256_hash::Sha256Hash;
 
 const LIMA_PREFIX: &str = "coop-";
 // Keep the image builder outside the namespace reserved for project VMs.
-const BUILDER_NAME: &str = "coopimg";
+const BUILDER_PREFIX: &str = "cb-";
+
+fn builder_name(id: &LimaBuilderId) -> String {
+    format!("{BUILDER_PREFIX}{}", id.as_str())
+}
+
+struct BuilderContext {
+    name: String,
+    lock: FileLock,
+}
+
+impl BuilderContext {
+    fn acquire(cfg: &CoopConfig) -> Result<Self> {
+        let home = lima_home()?;
+        Self::acquire_in(cfg, &home)
+    }
+
+    fn acquire_in(cfg: &CoopConfig, home: &Path) -> Result<Self> {
+        PrivateDir::create(home)?;
+        // Lima's home, rather than an image directory, is shared by all coop
+        // installations that can see the same Lima instances.
+        let lock = crate::fs_util::lock_sibling(&home.join("coop-builder-lifecycle"))?;
+        let id = ensure_builder_id(cfg)?;
+        Ok(Self {
+            name: builder_name(&id),
+            lock,
+        })
+    }
+
+    fn command(&self) -> io::Result<Command> {
+        let mut command = private_limactl()?;
+        self.lock.inherit_in(&mut command);
+        Ok(command)
+    }
+
+    fn start_command(&self) -> io::Result<Command> {
+        let mut command = headless_limactl_start()?;
+        self.lock.inherit_in(&mut command);
+        Ok(command)
+    }
+}
+
+/// Persist the identity before any builder VM can be created. The caller holds
+/// the Lima-home lock, so two initial setups cannot select different IDs.
+fn ensure_builder_id(cfg: &CoopConfig) -> Result<LimaBuilderId> {
+    let path = std::path::absolute(
+        cfg.loaded_from
+            .as_deref()
+            .context("Lima setup requires a loaded coop config path")?,
+    )?;
+    let _config_lock = crate::fs_util::lock_sibling(&path)?;
+    let current = CoopConfig::load(&path)?;
+    if let Some(id) = current.lima.builder_id {
+        return Ok(id);
+    }
+
+    let id = LimaBuilderId::generate()?;
+    let original = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).context("Failed to read coop config for Lima builder ID"),
+    };
+    let serialized = if path.extension().is_some_and(|ext| ext == "json") {
+        let mut document: serde_json::Value = if original.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&original).context("Failed to parse JSON config file")?
+        };
+        let object = document
+            .as_object_mut()
+            .context("JSON config root must be an object")?;
+        let lima = object
+            .entry("lima")
+            .or_insert_with(|| serde_json::json!({}));
+        lima.as_object_mut()
+            .context("JSON lima config must be an object")?
+            .insert("builder_id".to_owned(), serde_json::json!(id.as_str()));
+        format!("{}\n", serde_json::to_string_pretty(&document)?)
+    } else {
+        let mut document = original
+            .parse::<toml_edit::DocumentMut>()
+            .context("Failed to parse TOML config file")?;
+        document["lima"]["builder_id"] = toml_edit::value(id.as_str());
+        document.to_string()
+    };
+    crate::fs_util::atomic_write_with_mode(&path, &serialized, 0o600)
+        .context("Failed to persist Lima builder ID in coop config")?;
+    File::open(&path)?.sync_all()?;
+    File::open(path.parent().context("Config path has no parent")?)?.sync_all()?;
+    Ok(id)
+}
 
 /// Hostname Lima injects into the guest that resolves to the host machine.
 /// Used to rewrite local-model endpoints so the guest can reach a server
@@ -44,7 +134,8 @@ pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     }
 
     check_requirements()?;
-    ensure_ssh_key(cfg)?;
+    let builder = BuilderContext::acquire(cfg)?;
+    ensure_ssh_key(cfg, &builder.lock)?;
 
     let base_img = cfg.lima_base_path(image);
     if base_img.exists()
@@ -65,6 +156,7 @@ pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
             &opts.profiles,
             &opts.guest_user,
             opts.builder_timeout,
+            &builder,
         )?;
     }
 
@@ -1078,7 +1170,7 @@ fn check_requirements() -> Result<()> {
     Ok(())
 }
 
-fn ensure_ssh_key(cfg: &CoopConfig) -> Result<()> {
+fn ensure_ssh_key(cfg: &CoopConfig, builder_lock: &FileLock) -> Result<()> {
     let key_path = cfg.ssh_key_path();
     if key_path.exists() {
         eprintln!("\n=> SSH key: already at {}", key_path.display());
@@ -1086,7 +1178,9 @@ fn ensure_ssh_key(cfg: &CoopConfig) -> Result<()> {
     }
 
     eprintln!("\n=> Generating SSH key pair for VM access");
-    let status = Command::new("ssh-keygen")
+    let mut command = Command::new("ssh-keygen");
+    builder_lock.inherit_in(&mut command);
+    let status = command
         .args(["-t", "ed25519", "-f"])
         .arg(&key_path)
         .args(["-N", "", "-q"])
@@ -1169,6 +1263,7 @@ fn build_golden_image(
     profiles: &[ProfileDef],
     guest_user: &GuestUser,
     builder_timeout: Option<Duration>,
+    builder: &BuilderContext,
 ) -> Result<()> {
     eprintln!(
         "\n=> Building golden VM image \
@@ -1179,12 +1274,7 @@ fn build_golden_image(
     let pubkey = read_public_key(&pubkey_path)
         .with_context(|| format!("Failed to read SSH public key at {}", pubkey_path.display()))?;
 
-    // Clean up any leftover builder instance from a previous failed build
-    if let Err(e) = private_limactl()
-        .and_then(|mut command| command.args(["delete", "--force", BUILDER_NAME]).output())
-    {
-        tracing::debug!("Failed to clean up leftover builder (non-fatal): {e}");
-    }
+    remove_prior_builder(builder)?;
 
     // Clean up leftover staging image from a previous failed build
     let base_img = cfg.lima_base_path(image);
@@ -1222,9 +1312,10 @@ fn build_golden_image(
         &builder_template,
         guest_user,
         builder_timeout,
+        builder,
     );
 
-    cleanup_builder(&data_dir, builder_template_name);
+    cleanup_builder(&data_dir, builder_template_name, builder);
 
     let baked = match result {
         Ok(lists) => lists,
@@ -1299,16 +1390,37 @@ fn report_builder_inputs(profiles: &[ProfileDef]) {
     }
 }
 
-fn cleanup_builder(data_dir: &PrivateDir, template_name: &OsStr) {
+fn cleanup_builder(data_dir: &PrivateDir, template_name: &OsStr, builder: &BuilderContext) {
     eprintln!("  Cleaning up builder VM...");
-    if let Err(error) = private_limactl()
-        .and_then(|mut command| command.args(["delete", "--force", BUILDER_NAME]).status())
+    match builder
+        .command()
+        .and_then(|mut command| command.args(["delete", "--force", &builder.name]).status())
     {
-        tracing::warn!("Failed to delete builder VM (non-fatal): {error}");
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::warn!("Failed to delete builder VM (non-fatal): exit {status}"),
+        Err(error) => tracing::warn!("Failed to delete builder VM (non-fatal): {error}"),
     }
     if let Err(error) = data_dir.remove_child(template_name) {
         tracing::debug!("Failed to remove builder template (non-fatal): {error}");
     }
+}
+
+/// A prior interrupted build may leave this installation's builder VM. Lima
+/// 2.1+ accepts deletion of an absent instance, so require successful removal
+/// before reusing the same name.
+fn remove_prior_builder(builder: &BuilderContext) -> Result<()> {
+    let status = builder
+        .command()?
+        .args(["delete", "--force", &builder.name])
+        .status()
+        .context("Failed to run limactl delete for prior builder")?;
+    if !status.success() {
+        bail!(
+            "Failed to delete prior Lima image builder '{}'; retry setup after fixing Lima state",
+            builder.name
+        );
+    }
+    Ok(())
 }
 
 fn write_builder_template(
@@ -1338,10 +1450,11 @@ fn run_builder_vm(
     builder_template: &std::path::Path,
     guest_user: &GuestUser,
     builder_timeout: Option<Duration>,
+    builder: &BuilderContext,
 ) -> Result<BakedLists> {
     eprintln!("  Starting builder VM and installing packages...");
-    check_writable_mounts(cfg, &[])?;
-    let mut command = headless_limactl_start()?;
+    check_writable_mounts_for_builder(cfg, &[], Some(&builder.name))?;
+    let mut command = builder.start_command()?;
     if let Some(timeout) = builder_timeout {
         command
             .arg("--timeout")
@@ -1349,37 +1462,38 @@ fn run_builder_vm(
     }
     let status = command
         .arg(builder_template)
-        .arg(format!("--name={BUILDER_NAME}"))
+        .arg(format!("--name={}", builder.name))
         .status()
         .context("Failed to run limactl start for builder")?;
 
-    seal_instance_storage(&lima_home()?.join(BUILDER_NAME))?;
+    seal_instance_storage(&lima_home()?.join(&builder.name))?;
     if !status.success() {
-        dump_builder_logs();
+        dump_builder_logs(builder);
         bail!("Failed to build golden image — limactl start failed.");
     }
 
     // limactl start returns exit 0 even when the provision script
     // fails — it only waits for SSH, not cloud-init completion.
     // Verify cloud-init finished successfully before proceeding.
-    verify_cloud_init_status(builder_timeout)?;
+    verify_cloud_init_status(builder_timeout, builder)?;
 
     // Verify critical binaries are installed before extracting the
     // image. Cloud-init can report "done" even if individual install
     // steps failed silently (e.g. network timeout during download).
-    verify_builder_binaries(guest_user)?;
+    verify_builder_binaries(guest_user, builder)?;
 
     // Install marketplaces and plugins into the builder VM so they're
     // baked into the golden image. Runs after binary verification
     // (confirms claude CLI is installed) and before cloud-init clean.
-    let baked = install_builder_plugins(cfg, profiles, guest_user)?;
+    let baked = install_builder_plugins(cfg, profiles, guest_user, builder)?;
 
     // Clean cloud-init state so it re-runs on new instances
     eprintln!("  Preparing image for reuse...");
-    let ci_status = private_limactl()?
+    let ci_status = builder
+        .command()?
         .args([
             "shell",
-            BUILDER_NAME,
+            &builder.name,
             "--",
             "sudo",
             "cloud-init",
@@ -1398,8 +1512,9 @@ fn run_builder_vm(
 
     // Stop the builder VM
     eprintln!("  Stopping builder VM...");
-    let status = private_limactl()?
-        .args(["stop", BUILDER_NAME])
+    let status = builder
+        .command()?
+        .args(["stop", &builder.name])
         .status()
         .context("Failed to stop builder VM")?;
 
@@ -1410,7 +1525,7 @@ fn run_builder_vm(
     // Extract the disk image.
     // Lima v2.1.0 renamed "diffdisk" to "disk"; try new name first.
     eprintln!("  Extracting disk image...");
-    let lima_dir = lima_home()?.join(BUILDER_NAME);
+    let lima_dir = lima_home()?.join(&builder.name);
     let lima_dir_handle = PrivateDir::open_existing(&lima_dir)?;
     let disk_name = disk_name_at(&lima_dir_handle, &lima_dir)?;
     let src_disk = lima_dir.join(disk_name);
@@ -1441,8 +1556,12 @@ fn run_builder_vm(
 }
 
 /// Get an SSH target for the builder VM.
-fn builder_ssh_target(cfg: &CoopConfig, guest_user: &GuestUser) -> Result<SshTarget> {
-    let info = limactl_list_entry(BUILDER_NAME)?;
+fn builder_ssh_target(
+    cfg: &CoopConfig,
+    guest_user: &GuestUser,
+    builder: &BuilderContext,
+) -> Result<SshTarget> {
+    let info = limactl_list_entry(&builder.name)?;
     let port = info["sshLocalPort"]
         .as_u64()
         .context("Builder VM has no sshLocalPort")?;
@@ -1486,6 +1605,7 @@ fn install_builder_plugins(
     cfg: &CoopConfig,
     profiles: &[ProfileDef],
     guest_user: &GuestUser,
+    builder: &BuilderContext,
 ) -> Result<BakedLists> {
     let (marketplaces, plugins) = crate::guest::collect_baked_lists(cfg, profiles);
     let (codex_marketplaces, codex_plugins) = crate::guest::collect_codex_baked_lists(cfg);
@@ -1504,7 +1624,7 @@ fn install_builder_plugins(
     }
 
     eprintln!("  Installing marketplaces and plugins...");
-    let target = builder_ssh_target(cfg, guest_user)?;
+    let target = builder_ssh_target(cfg, guest_user, builder)?;
 
     // Minimal env forwarding: GITHUB_TOKEN for private repo access
     let mut env = crate::backend::EnvForward::default();
@@ -1549,13 +1669,13 @@ fn install_builder_plugins(
 ///
 /// Tries two sources: the Lima serial log on the host filesystem,
 /// and (if SSH is still reachable) cloud-init-output.log inside the guest.
-fn dump_builder_logs() {
+fn dump_builder_logs(builder: &BuilderContext) {
     eprintln!("\n  --- Builder VM diagnostic logs ---");
 
     // 1. Host-side: Lima serial log
     if let Ok(lima_home) = lima_home() {
-        let serial = lima_home.join(BUILDER_NAME).join("serial.log");
-        let content = PrivateDir::open_existing(&lima_home.join(BUILDER_NAME))
+        let serial = lima_home.join(&builder.name).join("serial.log");
+        let content = PrivateDir::open_existing(&lima_home.join(&builder.name))
             .and_then(|dir| dir.read_to_string(OsStr::new("serial.log")));
         if let Ok(content) = content {
             let lines: Vec<&str> = content.lines().collect();
@@ -1577,11 +1697,11 @@ fn dump_builder_logs() {
     }
 
     // 2. Guest-side: try to grab cloud-init-output.log via SSH
-    if let Ok(output) = private_limactl().and_then(|mut command| {
+    if let Ok(output) = builder.command().and_then(|mut command| {
         command
             .args([
                 "shell",
-                BUILDER_NAME,
+                &builder.name,
                 "--",
                 "sudo",
                 "tail",
@@ -1608,13 +1728,12 @@ fn dump_builder_logs() {
 /// `limactl start` returns exit 0 as soon as SSH is reachable, even
 /// if the provision script failed. `cloud-init status --wait` blocks
 /// until cloud-init finishes and returns exit 1 on error.
-fn verify_cloud_init_status(builder_timeout: Option<Duration>) -> Result<()> {
+fn verify_cloud_init_status(
+    builder_timeout: Option<Duration>,
+    builder: &BuilderContext,
+) -> Result<()> {
     eprintln!("  Verifying provision script completed...");
-    let mut args = vec![
-        "shell".to_string(),
-        BUILDER_NAME.to_string(),
-        "--".to_string(),
-    ];
+    let mut args = vec!["shell".to_string(), builder.name.clone(), "--".to_string()];
     if let Some(timeout) = builder_timeout {
         args.push("timeout".to_string());
         args.push(crate::format_duration(timeout));
@@ -1625,7 +1744,8 @@ fn verify_cloud_init_status(builder_timeout: Option<Duration>) -> Result<()> {
         "--wait".to_string(),
     ]);
 
-    let output = private_limactl()?
+    let output = builder
+        .command()?
         .args(args)
         .output()
         .context("Failed to check cloud-init status in builder VM")?;
@@ -1648,13 +1768,14 @@ fn verify_cloud_init_status(builder_timeout: Option<Duration>) -> Result<()> {
     if let Err(e) = cloud_init_result {
         // Grab diagnostics from both cloud-init logs
         let grab_log = |path: &str| -> String {
-            private_limactl()
+            builder
+                .command()
                 .ok()
                 .and_then(|mut command| {
                     command
                         .args([
                             "shell",
-                            BUILDER_NAME,
+                            &builder.name,
                             "--",
                             "sudo",
                             "tail",
@@ -1731,15 +1852,16 @@ fn check_cloud_init_output(exit_code: Option<i32>, stdout: &str) -> Result<()> {
 /// Runs after cloud-init completes but before extracting the disk
 /// image. Catches silent install failures (e.g. network timeouts)
 /// that cloud-init doesn't flag as errors.
-fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
+fn verify_builder_binaries(guest_user: &GuestUser, builder: &BuilderContext) -> Result<()> {
     crate::guest::verify_required_binaries(
         guest_user,
         "provision script",
         |path| {
-            Ok(private_limactl()?
+            Ok(builder
+                .command()?
                 .args([
                     "shell",
-                    BUILDER_NAME,
+                    &builder.name,
                     "--",
                     "bash",
                     "-c",
@@ -1750,20 +1872,21 @@ fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
                 .status()
                 .is_ok_and(|s| s.success()))
         },
-        builder_log_tail,
+        || builder_log_tail(builder),
     )
 }
 
 /// Tail of the builder's cloud-init log, formatted as a trailing section for
 /// the missing-binaries error. Empty when the log is unavailable or blank.
-fn builder_log_tail() -> String {
-    let log_tail = private_limactl()
+fn builder_log_tail(builder: &BuilderContext) -> String {
+    let log_tail = builder
+        .command()
         .ok()
         .and_then(|mut command| {
             command
                 .args([
                     "shell",
-                    BUILDER_NAME,
+                    &builder.name,
                     "--",
                     "sudo",
                     "tail",
@@ -2325,8 +2448,9 @@ fn lima_name_for(name: &InstanceName) -> String {
     format!("{LIMA_PREFIX}{name}")
 }
 
-fn is_coop_lima_name(name: &OsStr) -> bool {
-    name == BUILDER_NAME || name.to_string_lossy().starts_with(LIMA_PREFIX)
+fn is_coop_lima_name(name: &OsStr, builder_name: Option<&str>) -> bool {
+    builder_name.is_some_and(|builder| name == builder)
+        || name.to_string_lossy().starts_with(LIMA_PREFIX)
 }
 
 /// Restrict files created by Lima, including disks and transient builder state.
@@ -2415,11 +2539,12 @@ fn headless_limactl_start() -> io::Result<Command> {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn prepare_private_storage() -> Result<()> {
+pub(crate) fn prepare_private_storage(cfg: &CoopConfig) -> Result<()> {
     let home = lima_home()?;
     let home_dir = PrivateDir::create(&home)?;
+    let builder_name = cfg.lima.builder_id.as_ref().map(builder_name);
     for name in home_dir.entries()? {
-        if !is_coop_lima_name(&name) {
+        if !is_coop_lima_name(&name, builder_name.as_deref()) {
             continue;
         }
         let path = home.join(&name);
@@ -2483,13 +2608,31 @@ pub(crate) fn check_writable_mounts(
     cfg: &CoopConfig,
     requested: &[crate::config::Mount],
 ) -> Result<()> {
+    let builder_name = cfg.lima.builder_id.as_ref().map(builder_name);
+    check_writable_mounts_for_builder(cfg, requested, builder_name.as_deref())
+}
+
+fn check_writable_mounts_for_builder(
+    cfg: &CoopConfig,
+    requested: &[crate::config::Mount],
+    builder_name: Option<&str>,
+) -> Result<()> {
     let control = lima_home()?;
-    let protected = protected_mount_paths(cfg, &control)?;
+    check_writable_mounts_at(cfg, requested, builder_name, &control)
+}
+
+fn check_writable_mounts_at(
+    cfg: &CoopConfig,
+    requested: &[crate::config::Mount],
+    builder_name: Option<&str>,
+    control: &Path,
+) -> Result<()> {
+    let protected = protected_mount_paths(cfg, control)?;
     let mut sources = requested
         .iter()
         .map(|mount| check_mount_source(&mount.host_path, &protected))
         .collect::<Result<Vec<_>>>()?;
-    sources.extend(check_saved_mounts(&control, &protected)?);
+    sources.extend(check_saved_mounts(control, &protected, builder_name)?);
     reject_overlapping_sources(&sources)
 }
 
@@ -2562,6 +2705,7 @@ struct WritableHostMount {
 fn check_saved_mounts(
     control: &Path,
     protected: &[(&str, PathBuf)],
+    builder_name: Option<&str>,
 ) -> Result<Vec<WritableHostMount>> {
     let mut sources = Vec::new();
     let global = control.join("_config");
@@ -2593,7 +2737,7 @@ fn check_saved_mounts(
     };
     for entry in entries {
         let entry = entry.context("Cannot inspect Lima control directory entry")?;
-        if !is_coop_lima_name(&entry.file_name()) {
+        if !is_coop_lima_name(&entry.file_name(), builder_name) {
             continue;
         }
         if !entry.file_type()?.is_dir() {
@@ -2851,9 +2995,195 @@ mod tests {
     fn image_builder_name_is_outside_project_namespace() {
         let project_vm = lima_name_for(&InstanceName::new("builder").unwrap());
         assert_eq!(project_vm, "coop-builder");
-        assert!(!BUILDER_NAME.starts_with(LIMA_PREFIX));
-        assert!(is_coop_lima_name(OsStr::new(BUILDER_NAME)));
-        assert!(is_coop_lima_name(OsStr::new(&project_vm)));
+        let builder = builder_name(&LimaBuilderId::new("0123456789abcdefghijklmno").unwrap());
+        assert!(!builder.starts_with(LIMA_PREFIX));
+        assert!(is_coop_lima_name(OsStr::new(&builder), Some(&builder)));
+        assert!(!is_coop_lima_name(OsStr::new(&builder), None));
+        assert!(is_coop_lima_name(OsStr::new(&project_vm), None));
+    }
+
+    #[test]
+    fn builder_id_is_persisted_once_before_reuse() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = crate::test_support::private_tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        fs::write(&path, "# retained comment\nssh_port = 2222\n").unwrap();
+        let cfg = CoopConfig::load(&path).unwrap();
+
+        let first = ensure_builder_id(&cfg).unwrap();
+        let second = ensure_builder_id(&cfg).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(builder_name(&first).len(), BUILDER_PREFIX.len() + 25);
+        assert!(!builder_name(&first).starts_with(LIMA_PREFIX));
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("# retained comment"));
+        let loaded = CoopConfig::load(&path).unwrap();
+        assert_eq!(loaded.ssh_port.get(), 2222);
+        assert_eq!(loaded.lima.builder_id, Some(first));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn builder_id_persists_in_legacy_json_config() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "{\"ssh_port\":2222}\n").unwrap();
+        let cfg = CoopConfig::load(&path).unwrap();
+        let id = ensure_builder_id(&cfg).unwrap();
+        let loaded = CoopConfig::load(&path).unwrap();
+        assert_eq!(loaded.lima.builder_id, Some(id));
+        assert_eq!(loaded.ssh_port.get(), 2222);
+    }
+
+    #[test]
+    fn builder_id_creates_missing_default_config() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        let cfg = CoopConfig::load(&path).unwrap();
+        assert!(!path.exists());
+        let id = ensure_builder_id(&cfg).unwrap();
+        assert_eq!(CoopConfig::load(&path).unwrap().lima.builder_id, Some(id));
+    }
+
+    #[test]
+    fn malformed_builder_id_is_rejected_at_config_load() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        for invalid in [
+            "short".to_owned(),
+            "0".repeat(26),
+            format!("{}A", "0".repeat(24)),
+            format!("{}_", "0".repeat(24)),
+        ] {
+            fs::write(&path, format!("[lima]\nbuilder_id = '{invalid}'\n")).unwrap();
+            assert!(CoopConfig::load(&path).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn builder_lock_serializes_installs_and_retry_reuses_id() {
+        use std::os::fd::AsRawFd as _;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let root = crate::test_support::private_tempdir().unwrap();
+        let home = root.path().join("lima");
+        let config_path = root.path().join("config.toml");
+        fs::write(&config_path, "").unwrap();
+        let first_cfg = CoopConfig::load(&config_path).unwrap();
+        let first = BuilderContext::acquire_in(&first_cfg, &home).unwrap();
+        let first_name = first.name.clone();
+        let probe = File::open(home.join(".coop-builder-lifecycle.lock")).unwrap();
+        // SAFETY: probe owns the open descriptor throughout the flock calls.
+        let blocked = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(blocked, -1, "builder context must hold the shared lock");
+        assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+
+        let second_cfg = CoopConfig::load(&config_path).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let second = BuilderContext::acquire_in(&second_cfg, &home).unwrap();
+            acquired_tx.send(second.name).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+        drop(first);
+        assert_eq!(
+            acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            first_name
+        );
+        handle.join().unwrap();
+        // SAFETY: probe is still open and the builder context has been dropped.
+        assert_eq!(
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+    }
+
+    #[test]
+    fn prior_builder_cleanup_uses_saved_name_and_blocks_failed_delete() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Ok(root) = std::env::var("COOP_TEST_BUILDER_DELETE_ROOT") else {
+            let root = crate::test_support::private_tempdir().unwrap();
+            let bin = root.path().join("bin");
+            fs::create_dir(&bin).unwrap();
+            let shim = bin.join("limactl");
+            fs::write(
+                &shim,
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COOP_TEST_BUILDER_DELETE_CALLS\"\n[ ! -e \"$COOP_TEST_BUILDER_DELETE_FAIL\" ]\n",
+            )
+            .unwrap();
+            fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lima::tests::prior_builder_cleanup_uses_saved_name_and_blocks_failed_delete",
+                    "--nocapture",
+                ])
+                .env("COOP_TEST_BUILDER_DELETE_ROOT", root.path())
+                .env("COOP_TEST_BUILDER_DELETE_CALLS", root.path().join("calls"))
+                .env("COOP_TEST_BUILDER_DELETE_FAIL", root.path().join("fail"))
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        bin.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        };
+
+        let root = Path::new(&root);
+        let config_path = root.join("config.toml");
+        fs::write(&config_path, "").unwrap();
+        let cfg = CoopConfig::load(&config_path).unwrap();
+        let builder = BuilderContext::acquire_in(&cfg, &root.join("lima")).unwrap();
+        remove_prior_builder(&builder).unwrap();
+        let calls = fs::read_to_string(root.join("calls")).unwrap();
+        assert_eq!(calls, format!("delete --force {}\n", builder.name));
+        fs::write(root.join("fail"), "").unwrap();
+        assert!(remove_prior_builder(&builder).is_err());
+    }
+
+    #[test]
+    fn first_build_mount_guard_checks_the_runtime_builder_name() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let control = root.path().join("lima");
+        let data = root.path().join("data");
+        let name = "cb-0123456789abcdefghijklmno";
+        let builder = control.join(name);
+        crate::fs_util::private_dir(&builder).unwrap();
+        fs::create_dir(&data).unwrap();
+        fs::write(
+            builder.join("lima.yaml"),
+            format!(
+                "mounts:\n- location: '{}'\n  writable: true\n",
+                data.display()
+            ),
+        )
+        .unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(&data),
+            ..CoopConfig::default()
+        };
+        assert!(check_writable_mounts_at(&cfg, &[], None, &control).is_ok());
+        assert!(check_writable_mounts_at(&cfg, &[], Some(name), &control).is_err());
     }
 
     #[test]
@@ -2867,7 +3197,7 @@ mod tests {
         fs::create_dir_all(&data).unwrap();
         fs::create_dir_all(&project).unwrap();
         let protected = [("data", resolved_host_path(&data).unwrap())];
-        assert!(check_saved_mounts(&control, &protected).is_err());
+        assert!(check_saved_mounts(&control, &protected, None).is_err());
         fs::write(
             instance.join("lima.yaml"),
             format!(
@@ -2876,7 +3206,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let result = check_saved_mounts(&control, &protected);
+        let result = check_saved_mounts(&control, &protected, None);
         assert!(result.is_ok(), "{result:?}");
         fs::create_dir(project.join("inner")).unwrap();
         let alias = root.path().join("project-alias");
@@ -2890,7 +3220,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let sources = check_saved_mounts(&control, &protected).unwrap();
+        let sources = check_saved_mounts(&control, &protected, None).unwrap();
         assert!(reject_overlapping_sources(&sources).is_err());
         fs::write(
             instance.join("lima.yaml"),
@@ -2900,7 +3230,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(check_saved_mounts(&control, &protected).is_err());
+        assert!(check_saved_mounts(&control, &protected, None).is_err());
     }
 
     #[test]
@@ -2913,7 +3243,7 @@ mod tests {
         fs::create_dir_all(&data).unwrap();
         let protected = [("data", resolved_host_path(&data).unwrap())];
         fs::write(global.join("default.yaml"), "mountType: virtiofs\n").unwrap();
-        assert!(check_saved_mounts(&control, &protected).is_ok());
+        assert!(check_saved_mounts(&control, &protected, None).is_ok());
         fs::write(
             global.join("override.yaml"),
             format!(
@@ -2922,7 +3252,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(check_saved_mounts(&control, &protected).is_err());
+        assert!(check_saved_mounts(&control, &protected, None).is_err());
     }
 
     #[test]
