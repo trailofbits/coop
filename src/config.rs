@@ -3134,7 +3134,11 @@ impl Instance {
         if let Some(template) = self.load_meta()?.template_config {
             return Ok(template);
         }
-        crate::setup::TemplateConfig::load_for(cfg, &self.image)
+        let mut template = crate::setup::TemplateConfig::load_for(cfg, &self.image)?;
+        // Legacy instances predate selection and contain all three agents,
+        // even when their source image has since been rebuilt with a subset.
+        template.agents = crate::agents::AgentSet::default();
+        Ok(template)
     }
 
     pub(crate) fn source_guest_user(&self, cfg: &CoopConfig) -> Result<crate::guest::GuestUser> {
@@ -3764,6 +3768,50 @@ mod tests {
             data_dir: ConfigPath::new(tmp.path()),
             ..CoopConfig::default()
         }
+    }
+
+    #[test]
+    fn legacy_instance_commit_source_retains_all_agents_after_image_rebuild() {
+        use crate::agents::{AgentId, AgentSet};
+
+        let root = crate::test_support::private_tempdir().unwrap();
+        let cfg = CoopConfig {
+            data_dir: ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("source").unwrap();
+        crate::fs_util::private_dir(&cfg.image_dir(&image)).unwrap();
+        let mut template: crate::setup::TemplateConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": crate::setup::TEMPLATE_VERSION,
+                "created": "2026-01-01T00:00:00Z",
+                "install_script_hash": crate::sha256_hash::Sha256Hash::of("fixture"),
+                "profiles": [],
+                "extra_packages": [],
+                "post_install_hash": null,
+            }))
+            .unwrap();
+        template.agents = AgentSet::new(vec![AgentId::Codex]).unwrap();
+        template.save_for(&cfg, &image).unwrap();
+
+        let inst = Instance {
+            name: InstanceName::new("legacy").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("legacy"),
+            image,
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
+        };
+        crate::fs_util::private_dir(&inst.dir).unwrap();
+        inst.save().unwrap();
+        assert_eq!(inst.agents().unwrap(), AgentSet::default());
+        assert_eq!(
+            inst.source_template(&cfg).unwrap().agents,
+            AgentSet::default()
+        );
+
+        inst.set_source_template(template.clone()).unwrap();
+        assert_eq!(inst.agents().unwrap(), template.agents);
+        assert_eq!(inst.source_template(&cfg).unwrap().agents, template.agents);
     }
 
     #[test]
