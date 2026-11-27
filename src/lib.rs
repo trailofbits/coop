@@ -726,7 +726,7 @@ scripts after upgrading coop. Alternatively, generate them on shell startup:
 enum AgentAction {
     /// Update coding agent(s) to the latest version inside the VM.
     ///
-    /// With no --agent selector, Claude Code, Codex, and Grok Build are updated.
+    /// With no --agent selector, every agent included in the VM image is updated.
     /// The VM must be running.
     Update {
         /// Instance name (required if multiple instances exist)
@@ -735,13 +735,13 @@ enum AgentAction {
             add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// Agent to update (repeatable; default: every agent)
+        /// Agent to update (repeatable; default: every agent in the VM image)
         #[arg(long, value_enum)]
         agent: Vec<Agent>,
     },
     /// Report installed and latest coding-agent versions without changing them.
     ///
-    /// With no --agent selector, Claude Code, Codex, and Grok Build are reported.
+    /// With no --agent selector, every agent included in the VM image is reported.
     /// The VM must be running.
     Status {
         /// Instance name (required if multiple instances exist)
@@ -750,7 +750,7 @@ enum AgentAction {
             add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// Agent to report (repeatable; default: every agent)
+        /// Agent to report (repeatable; default: every agent in the VM image)
         #[arg(long, value_enum)]
         agent: Vec<Agent>,
     },

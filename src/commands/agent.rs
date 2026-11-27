@@ -69,8 +69,8 @@ pub(crate) struct AgentSelection {
 }
 
 impl AgentSelection {
-    /// Build a canonical non-empty selection. Omitting `--agent` means all
-    /// supported agents; repeated selectors are deduplicated.
+    /// Build a canonical non-empty selection. An omitted `--agent` is narrowed
+    /// to the VM image by `for_instance`; repeated selectors are deduplicated.
     pub(crate) fn new(mut agents: Vec<Agent>) -> Self {
         let explicit = !agents.is_empty();
         if agents.is_empty() {
@@ -450,6 +450,61 @@ mod tests {
         assert_eq!(
             AgentSelection::new(vec![Agent::Claude]).agents(),
             &[Agent::Claude]
+        );
+    }
+
+    #[test]
+    fn instance_selection_defaults_to_image_and_rejects_absent_agent() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = config::Instance {
+            name: config::InstanceName::new("codex-only").unwrap(),
+            index: config::InstanceIndex::new(0).unwrap(),
+            dir: root.path().to_path_buf(),
+            image: config::ImageName::new("codex-only").unwrap(),
+            firecracker_control: config::FirecrackerControlMode::Vsock,
+        };
+        inst.save().unwrap();
+        assert_eq!(
+            AgentSelection::new(Vec::new())
+                .for_instance(&inst)
+                .unwrap()
+                .agents(),
+            &Agent::ALL
+        );
+
+        let mut template: crate::setup::TemplateConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": crate::setup::TEMPLATE_VERSION,
+                "created": "2026-01-01T00:00:00Z",
+                "install_script_hash": crate::sha256_hash::Sha256Hash::of("fixture"),
+                "profiles": [],
+                "extra_packages": [],
+                "post_install_hash": null,
+            }))
+            .unwrap();
+        template.agents = crate::agents::AgentSet::new(vec![Agent::Codex]).unwrap();
+        inst.set_source_template(template).unwrap();
+
+        assert_eq!(
+            AgentSelection::new(Vec::new())
+                .for_instance(&inst)
+                .unwrap()
+                .agents(),
+            &[Agent::Codex]
+        );
+        assert_eq!(
+            AgentSelection::new(vec![Agent::Codex])
+                .for_instance(&inst)
+                .unwrap()
+                .agents(),
+            &[Agent::Codex]
+        );
+        assert!(
+            AgentSelection::new(vec![Agent::Claude])
+                .for_instance(&inst)
+                .unwrap_err()
+                .to_string()
+                .contains("does not include Claude Code")
         );
     }
 
