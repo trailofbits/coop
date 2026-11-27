@@ -2995,7 +2995,8 @@ mod tests {
     fn image_builder_name_is_outside_project_namespace() {
         let project_vm = lima_name_for(&InstanceName::new("builder").unwrap());
         assert_eq!(project_vm, "coop-builder");
-        let builder = builder_name(&LimaBuilderId::new("0123456789abcdefghijklmno").unwrap());
+        let builder =
+            builder_name(&LimaBuilderId::new("0123456789abcdef0123456789abcdef").unwrap());
         assert!(!builder.starts_with(LIMA_PREFIX));
         assert!(is_coop_lima_name(OsStr::new(&builder), Some(&builder)));
         assert!(!is_coop_lima_name(OsStr::new(&builder), None));
@@ -3014,7 +3015,7 @@ mod tests {
         let first = ensure_builder_id(&cfg).unwrap();
         let second = ensure_builder_id(&cfg).unwrap();
         assert_eq!(first, second);
-        assert_eq!(builder_name(&first).len(), BUILDER_PREFIX.len() + 25);
+        assert_eq!(builder_name(&first).len(), BUILDER_PREFIX.len() + 32);
         assert!(!builder_name(&first).starts_with(LIMA_PREFIX));
 
         let content = fs::read_to_string(&path).unwrap();
@@ -3059,6 +3060,10 @@ mod tests {
             "0".repeat(26),
             format!("{}A", "0".repeat(24)),
             format!("{}_", "0".repeat(24)),
+            "0".repeat(33),
+            format!("{}A", "0".repeat(31)),
+            format!("{}_", "0".repeat(31)),
+            format!("{}g", "0".repeat(31)),
         ] {
             fs::write(&path, format!("[lima]\nbuilder_id = '{invalid}'\n")).unwrap();
             assert!(CoopConfig::load(&path).is_err(), "accepted {invalid}");
@@ -3166,7 +3171,7 @@ mod tests {
         let root = crate::test_support::private_tempdir().unwrap();
         let control = root.path().join("lima");
         let data = root.path().join("data");
-        let name = "cb-0123456789abcdefghijklmno";
+        let name = "cb-0123456789abcdef0123456789abcdef";
         let builder = control.join(name);
         crate::fs_util::private_dir(&builder).unwrap();
         fs::create_dir(&data).unwrap();

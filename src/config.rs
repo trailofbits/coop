@@ -864,19 +864,24 @@ impl NetworkHostToolsConfig {
 }
 
 /// Stable random identity for the Lima image builder in one coop installation.
-/// Base-36 keeps all 128 random bits in a lowercase Lima-safe component.
+/// New IDs use 32 lowercase hex digits. Saved 25-character IDs remain valid
+/// so setup can still find and clean up their builder VMs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct LimaBuilderId(String);
 
 impl LimaBuilderId {
     pub fn new(value: &str) -> Result<Self> {
-        if value.len() != 25
-            || !value
+        let hex = value.len() == 32
+            && value
                 .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
-        {
-            bail!("lima.builder_id must be exactly 25 lowercase letters or digits");
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        let legacy = value.len() == 25
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase());
+        if !hex && !legacy {
+            bail!("lima.builder_id must be 32 lowercase hex digits or a 25-character legacy ID");
         }
         Ok(Self(value.to_owned()))
     }
@@ -884,18 +889,7 @@ impl LimaBuilderId {
     pub fn generate() -> Result<Self> {
         let mut bytes = [0_u8; 16];
         getrandom::fill(&mut bytes).context("Cannot generate Lima builder identity")?;
-        Self::from_number(u128::from_be_bytes(bytes))
-    }
-
-    fn from_number(mut number: u128) -> Result<Self> {
-        let mut encoded = [b'0'; 25];
-        let alphabet = b"0123456789abcdefghijklmnopqrstuvwxyz";
-        for digit in encoded.iter_mut().rev() {
-            *digit = alphabet[(number % 36) as usize];
-            number /= 36;
-        }
-        let value = std::str::from_utf8(&encoded).context("Invalid Lima builder encoding")?;
-        Self::new(value)
+        Ok(Self(format!("{:032x}", u128::from_be_bytes(bytes))))
     }
 
     pub fn as_str(&self) -> &str {
@@ -3704,12 +3698,15 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn lima_builder_id_encoding_roundtrip() {
-        let id = LimaBuilderId::from_number(u128::MAX).unwrap();
-        assert_eq!(id.as_str(), "f5lxx1zz5pnorynqglhzmsp33");
-        assert_eq!(String::from(id.clone()), "f5lxx1zz5pnorynqglhzmsp33");
+    fn lima_builder_id_hex_generation_and_legacy_read() {
+        let id = LimaBuilderId::generate().unwrap();
+        assert_eq!(id.as_str().len(), 32);
+        assert_eq!(LimaBuilderId::new(id.as_str()).unwrap(), id);
+        assert_eq!(LimaBuilderId::new(&String::from(id.clone())).unwrap(), id);
         assert_eq!(
-            LimaBuilderId::new(&String::from(id)).unwrap().as_str(),
+            LimaBuilderId::new("f5lxx1zz5pnorynqglhzmsp33")
+                .unwrap()
+                .as_str(),
             "f5lxx1zz5pnorynqglhzmsp33"
         );
     }
