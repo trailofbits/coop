@@ -737,25 +737,15 @@ const GUEST_HOSTS_ALIAS_IP: &str = "127.0.1.1";
 /// few hundred bytes.
 const MAX_GUEST_HOSTS_BYTES: usize = 64 * 1024;
 
-/// One byte under Linux's `HOST_NAME_MAX` of 64, which POSIX counts without
-/// the terminator. A 57-character instance name is already pathological, so
-/// the spare byte is free — and the clamp holds even where the limit is read
-/// as including the terminator.
+/// One byte under Linux's `HOST_NAME_MAX` of 64. `InstanceName` is limited to
+/// 58 ASCII bytes, so the `coop-` prefix always fits without truncation.
 const MAX_GUEST_HOSTNAME_LEN: usize = 63;
 
-/// The guest hostname for an instance: `claude-<name>`, clamped to fit
-/// `HOST_NAME_MAX`.
-///
-/// Instance names allow 64 characters, so the prefixed form reaches 71 — past
-/// the kernel's limit. An over-long name cannot reach
-/// the running hostname intact, so `/etc/hostname` and the `/etc/hosts` alias
-/// would then name different things. Deriving both from this one value is what
-/// keeps them equal.
+/// The guest hostname for an instance: `coop-<name>`. The validated name
+/// guarantees this is a portable static hostname that fits `HOST_NAME_MAX`.
 fn guest_hostname(name: &InstanceName) -> String {
-    // `truncate` is a byte index, and `InstanceName` is validated ASCII, so
-    // every index is a char boundary.
-    let mut hostname = format!("claude-{name}");
-    hostname.truncate(MAX_GUEST_HOSTNAME_LEN);
+    let hostname = format!("coop-{name}");
+    debug_assert!(hostname.len() <= MAX_GUEST_HOSTNAME_LEN);
     hostname
 }
 
@@ -764,7 +754,7 @@ fn guest_hostname(name: &InstanceName) -> String {
 ///
 /// `sudo` resolves the machine's own hostname on every invocation, so a
 /// hostname with no hosts entry makes it print `unable to resolve host` ahead
-/// of each `sudo` command in the guest. The template ships `claude-vm`
+/// of each `sudo` command in the guest. The template ships `coop-vm`
 /// (`scripts/guest/guest-config.sh`) while each instance gets its own name, so
 /// the two files have to move together.
 #[cfg(target_os = "linux")]
@@ -4128,44 +4118,44 @@ mod tests {
     }
 
     #[test]
-    fn hosts_with_hostname_replaces_stale_guest_alias() {
+    fn hosts_with_hostname_replaces_legacy_guest_alias() {
         let existing = "127.0.0.1 localhost\n127.0.1.1 claude-vm\n::1 localhost\n";
         assert_eq!(
-            hosts_with_hostname(existing, "claude-auditor-1"),
-            "127.0.0.1 localhost\n127.0.1.1 claude-auditor-1\n::1 localhost\n"
+            hosts_with_hostname(existing, "coop-auditor-1"),
+            "127.0.0.1 localhost\n127.0.1.1 coop-auditor-1\n::1 localhost\n"
         );
     }
 
     #[test]
     fn hosts_with_hostname_adds_missing_guest_alias() {
         assert_eq!(
-            hosts_with_hostname("127.0.0.1 localhost\n", "claude-auditor-1"),
-            "127.0.0.1 localhost\n127.0.1.1 claude-auditor-1\n"
+            hosts_with_hostname("127.0.0.1 localhost\n", "coop-auditor-1"),
+            "127.0.0.1 localhost\n127.0.1.1 coop-auditor-1\n"
         );
     }
 
     #[test]
     fn hosts_with_hostname_replaces_the_whole_matched_line() {
         assert_eq!(
-            hosts_with_hostname("127.0.1.1 claude-vm claude-vm.local # old\n", "claude-a"),
-            "127.0.1.1 claude-a\n"
+            hosts_with_hostname("127.0.1.1 coop-vm coop-vm.local # old\n", "coop-a"),
+            "127.0.1.1 coop-a\n"
         );
     }
 
     #[test]
     fn hosts_with_hostname_collapses_duplicate_aliases() {
-        let existing = "127.0.1.1 claude-vm\n127.0.0.1 localhost\n127.0.1.1 claude-vm\n";
+        let existing = "127.0.1.1 coop-vm\n127.0.0.1 localhost\n127.0.1.1 coop-vm\n";
         assert_eq!(
-            hosts_with_hostname(existing, "claude-a"),
-            "127.0.1.1 claude-a\n127.0.0.1 localhost\n"
+            hosts_with_hostname(existing, "coop-a"),
+            "127.0.1.1 coop-a\n127.0.0.1 localhost\n"
         );
     }
 
     #[test]
     fn hosts_with_hostname_normalizes_a_missing_trailing_newline() {
         assert_eq!(
-            hosts_with_hostname("127.0.0.1 localhost", "claude-a"),
-            "127.0.0.1 localhost\n127.0.1.1 claude-a\n"
+            hosts_with_hostname("127.0.0.1 localhost", "coop-a"),
+            "127.0.0.1 localhost\n127.0.1.1 coop-a\n"
         );
     }
 
@@ -4173,24 +4163,24 @@ mod tests {
     /// to be a usable hosts file — not one holding only the guest alias.
     #[test]
     fn hosts_with_hostname_synthesizes_a_default_from_blank_input() {
-        let expected = "127.0.0.1 localhost\n127.0.1.1 claude-a\n";
-        assert_eq!(hosts_with_hostname("", "claude-a"), expected);
-        assert_eq!(hosts_with_hostname(" \n\n", "claude-a"), expected);
+        let expected = "127.0.0.1 localhost\n127.0.1.1 coop-a\n";
+        assert_eq!(hosts_with_hostname("", "coop-a"), expected);
+        assert_eq!(hosts_with_hostname(" \n\n", "coop-a"), expected);
     }
 
     #[test]
     fn hosts_with_hostname_preserves_comments_and_blank_lines() {
         let existing = "# managed by post-install\n\n10.0.0.5 registry.internal\n127.0.1.1 old\n";
         assert_eq!(
-            hosts_with_hostname(existing, "claude-a"),
-            "# managed by post-install\n\n10.0.0.5 registry.internal\n127.0.1.1 claude-a\n"
+            hosts_with_hostname(existing, "coop-a"),
+            "# managed by post-install\n\n10.0.0.5 registry.internal\n127.0.1.1 coop-a\n"
         );
     }
 
     #[test]
     fn hosts_with_hostname_is_idempotent() {
-        let once = hosts_with_hostname("127.0.0.1 localhost\n127.0.1.1 claude-vm\n", "claude-a");
-        assert_eq!(hosts_with_hostname(&once, "claude-a"), once);
+        let once = hosts_with_hostname("127.0.0.1 localhost\n127.0.1.1 coop-vm\n", "coop-a");
+        assert_eq!(hosts_with_hostname(&once, "coop-a"), once);
     }
 
     #[cfg(target_os = "linux")]
@@ -4206,10 +4196,10 @@ mod tests {
         fs::set_permissions(etc.join("hosts"), fs::Permissions::from_mode(0o600)).unwrap();
         fs::hard_link(etc.join("hosts"), root.path().join("original")).unwrap();
 
-        patch_guest_hosts(root.path(), "claude-a").unwrap();
+        patch_guest_hosts(root.path(), "coop-a").unwrap();
         assert_eq!(
             fs::read_to_string(etc.join("hosts")).unwrap(),
-            "127.0.0.1 localhost\n127.0.1.1 claude-a\n10.0.0.5 registry\n"
+            "127.0.0.1 localhost\n127.0.1.1 coop-a\n10.0.0.5 registry\n"
         );
         assert_eq!(
             fs::metadata(etc.join("hosts"))
@@ -4249,11 +4239,11 @@ mod tests {
         symlink(&sentinel, etc.join("hostname")).unwrap();
         symlink(&sentinel, etc.join("systemd/network/10-eth0.network")).unwrap();
 
-        patch_guest_network_files(root.path(), "claude-a", "172.16.0.2".parse().unwrap()).unwrap();
+        patch_guest_network_files(root.path(), "coop-a", "172.16.0.2".parse().unwrap()).unwrap();
         assert_eq!(fs::read_to_string(&sentinel).unwrap(), "untouched");
         assert_eq!(
             fs::read_to_string(etc.join("hostname")).unwrap(),
-            "claude-a\n"
+            "coop-a\n"
         );
         assert!(
             fs::read_to_string(etc.join("systemd/network/10-eth0.network"))
@@ -4263,7 +4253,7 @@ mod tests {
         assert!(
             fs::read_to_string(etc.join("hosts"))
                 .unwrap()
-                .contains("127.0.1.1 claude-a")
+                .contains("127.0.1.1 coop-a")
         );
     }
 
@@ -4414,7 +4404,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            patch_guest_network_files(root.path(), "claude-a", "172.16.0.2".parse().unwrap())
+            patch_guest_network_files(root.path(), "coop-a", "172.16.0.2".parse().unwrap())
                 .is_err()
         );
         assert_eq!(fs::read_to_string(&sentinel).unwrap(), "untouched");
@@ -4445,11 +4435,11 @@ mod tests {
                 "non-utf8" => fs::write(&hosts, [0xff]).unwrap(),
                 _ => {}
             }
-            patch_guest_hosts(root.path(), "claude-a").unwrap();
+            patch_guest_hosts(root.path(), "coop-a").unwrap();
             assert!(fs::symlink_metadata(&hosts).unwrap().is_file(), "{kind}");
             assert_eq!(
                 fs::read_to_string(&hosts).unwrap(),
-                "127.0.0.1 localhost\n127.0.1.1 claude-a\n",
+                "127.0.0.1 localhost\n127.0.1.1 coop-a\n",
                 "{kind}"
             );
             assert_eq!(
@@ -4469,12 +4459,12 @@ mod tests {
         let root = crate::test_support::private_tempdir().unwrap();
         let other = crate::test_support::private_tempdir().unwrap();
         symlink(other.path(), root.path().join("etc")).unwrap();
-        assert!(patch_guest_hosts(root.path(), "claude-a").is_err());
+        assert!(patch_guest_hosts(root.path(), "coop-a").is_err());
         assert_eq!(fs::read_dir(other.path()).unwrap().count(), 0);
 
         fs::remove_file(root.path().join("etc")).unwrap();
         fs::create_dir_all(root.path().join("etc/hosts")).unwrap();
-        assert!(patch_guest_hosts(root.path(), "claude-a").is_err());
+        assert!(patch_guest_hosts(root.path(), "coop-a").is_err());
         assert_eq!(fs::read_dir(root.path().join("etc")).unwrap().count(), 1);
     }
 
@@ -4486,29 +4476,28 @@ mod tests {
     fn guest_hostname_prefixes_the_instance_name() {
         assert_eq!(
             guest_hostname(&instance_name("auditor-1")),
-            "claude-auditor-1"
+            "coop-auditor-1"
         );
-    }
-
-    /// Asserted against literals, not `MAX_GUEST_HOSTNAME_LEN` — comparing the
-    /// output length to the constant that produced it passes for any bound.
-    #[test]
-    fn guest_hostname_clamps_the_longest_instance_name() {
-        let longest = instance_name(&"n".repeat(64));
         assert_eq!(
-            guest_hostname(&longest),
-            format!("claude-{}", "n".repeat(56))
+            guest_hostname(&instance_name("Dev-Box-01")),
+            "coop-Dev-Box-01"
         );
     }
 
-    /// The exact-fit boundary: 56 characters is the longest name that survives
-    /// the clamp untouched, so this pins which names the fix still reaches.
+    #[test]
+    fn guest_hostname_preserves_the_longest_instance_name() {
+        let longest = instance_name(&"n".repeat(58));
+        assert_eq!(guest_hostname(&longest), format!("coop-{}", "n".repeat(58)));
+    }
+
+    /// The exact-fit boundary pins the guest hostname length independently of
+    /// the constant used by production code.
     #[test]
     fn guest_hostname_leaves_an_exactly_fitting_name_intact() {
-        let name = "n".repeat(56);
+        let name = "n".repeat(58);
         assert_eq!(
             guest_hostname(&instance_name(&name)),
-            format!("claude-{name}")
+            format!("coop-{name}")
         );
         assert_eq!(guest_hostname(&instance_name(&name)).len(), 63);
     }

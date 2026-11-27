@@ -516,6 +516,17 @@ test_invalid_names() {
     else
         fail "rejects spaces in name" "should have failed"
     fi
+
+    local invalid_name
+    for invalid_name in _vm test_vm vm-_one vm_-one vm--one vm-; do
+        if coop_fails start "$invalid_name" --no-agents \
+            && [[ "$HARNESS_ERR" == *"Instance name"* ]]; then
+            pass "rejects nonportable name ($invalid_name)"
+        else
+            fail "rejects nonportable name ($invalid_name)" \
+                "expected an instance-name validation error"
+        fi
+    done
 }
 
 # ── Guest-memory floor (issue #404) ───────────────────────────
@@ -808,6 +819,28 @@ EOF
         exit 1
     fi
     assert_lima_headless "after creation"
+
+    # The explicit name reaches the backend consumer unchanged. This checks
+    # more than constructor validation: Lima must create its prefixed VM, and
+    # Firecracker must boot with the matching guest hostname.
+    if [[ "$(uname -s)" == Darwin ]]; then
+        if limactl list --json | python3 -c \
+            'import json, sys; assert any(json.loads(line).get("name") == sys.argv[1] for line in sys.stdin if line.strip())' \
+            "coop-$INSTANCE"; then
+            pass "portable name reaches Lima instance"
+        else
+            fail "portable name reaches Lima instance" "expected prefixed VM name"
+        fi
+    else
+        local guest_name
+        guest_name=$(guest_exec hostname) || guest_name=""
+        if [[ "$guest_name" == "coop-$INSTANCE" ]]; then
+            pass "portable name reaches Firecracker guest hostname"
+        else
+            fail "portable name reaches Firecracker guest hostname" \
+                "expected the coop-derived hostname"
+        fi
+    fi
 
     if [[ "$(uname -s)" == Linux ]]; then
         local instance_state="$HOME/.coop/instances/$INSTANCE/instance.json"
