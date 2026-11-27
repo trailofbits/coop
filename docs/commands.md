@@ -170,6 +170,7 @@ coop setup [FLAGS]
 | `--vcpus <N>` | Number of vCPUs (overrides config) |
 | `--mem <MiB>` | Memory in MiB (overrides config) |
 | `--rebuild` | Force rebuild of template rootfs |
+| `--agent <agent>` | Install `claude`, `codex`, or `grok` in the image (repeatable). New images default to all three; an existing image keeps its recorded set when omitted. Changing the set requires `--rebuild`. |
 | `--profile <list>` | Comma-separated install profiles: `python`, `node`, `c`, `fuzz`, `rust`, `go` |
 | `--extra-packages <list>` | Comma-separated extra apt packages to install (Linux/Firecracker only; Lima refuses this option) |
 | `--post-install <path>` | Path to a post-install script to run in the chroot (Linux/Firecracker only; Lima refuses this option) |
@@ -437,11 +438,20 @@ coop status my-project
 
 With `--json`, a bare `coop status` emits a JSON array and `coop status NAME`
 emits a single object. Each carries the common fields — `name`, `state`
-(`running`/`stopped`), `image`, `backend` (`firecracker`/`lima`), `network`
+(`running`/`stopped`), `image`, `agents`, `restore_pending`,
+`model_apply_pending`, `backend` (`firecracker`/`lima`), `network`
 (`open`/`isolated` for Firecracker or `null` for Lima), and `usage` (raw MiB /
 load, or `null` when stopped or the query fails). The rich
 single-instance text report (guest IP, PID, SSH port, …) is text-only. JSON goes
 to stdout; tracing stays on stderr, so `coop status --json | jq` stays clean.
+
+`agents` is the set recorded when this VM's disk was copied or restored.
+`restore_pending` identifies an interrupted disk replacement or reprovision;
+retry `coop restore VM --image IMAGE --reprovision` to complete it before
+starting or connecting to the VM.
+`model_apply_pending` means a live model change did not finish; restart the VM
+normally to reapply it before launching an agent. `coop shell` and `coop exec`
+remain available for diagnosis when only a model change is pending.
 
 ```
 $ coop status my-project --json
@@ -449,6 +459,9 @@ $ coop status my-project --json
   "name": "my-project",
   "state": "running",
   "image": "default",
+  "agents": ["claude", "codex", "grok"],
+  "restore_pending": null,
+  "model_apply_pending": false,
   "backend": "firecracker",
   "network": "isolated",
   "usage": { "load_1m": 0.12, "mem_used_mib": 512, "mem_total_mib": 2048,
@@ -473,8 +486,9 @@ coop agent update [NAME] [--agent <agent>]...
 | `NAME` | Instance name (required if multiple instances exist) |
 | `--agent <agent>` | Agent to update: `claude`, `codex`, or `grok` (repeatable) |
 
-With no `--agent` selector, every agent is updated. Repeat `--agent` to update
-more than one agent. The VM must be running. The command starts the requested
+With no `--agent` selector, every agent included in the VM image is updated.
+Repeat `--agent` to update more than one agent. An explicit agent absent from
+the image is rejected. The VM must be running. The command starts the requested
 updates immediately without a confirmation prompt.
 
 `coop agent update --agent codex` re-runs OpenAI's native installer as the guest
@@ -488,8 +502,8 @@ settings and whether they run. `coop agent update --agent claude` /
 `--agent grok` run `claude update` / `grok update` now, synchronously.
 
 ```
-coop agent update                                      # every agent, resolved instance
-coop agent update my-project                           # every agent, instance "my-project"
+coop agent update                                      # every agent in the image, resolved instance
+coop agent update my-project                           # every agent in the image, instance "my-project"
 coop agent update --agent codex                        # Codex only
 coop agent update --agent claude --agent grok          # Claude Code and Grok Build
 ```
@@ -509,7 +523,8 @@ coop agent status [NAME] [--agent <agent>]...
 | `NAME` | Instance name (required if multiple instances exist) |
 | `--agent <agent>` | Agent to report: `claude`, `codex`, or `grok` (repeatable) |
 
-With no `--agent` selector, every agent is reported. The VM must be running.
+With no `--agent` selector, every agent included in the VM image is reported.
+An explicit agent absent from the image is rejected. The VM must be running.
 
 ```
 $ coop agent status my-project
@@ -535,8 +550,8 @@ coop model [NAME] [local|remote]
 | `local` | Route this VM's agents at a host-side local model server |
 | `remote` | Restore cloud defaults (Anthropic / OpenAI) |
 
-With no subcommand, `model` prints the current mode and the endpoint each tool
-(Claude, Codex) resolves to:
+With no subcommand, `model` prints the current mode and the endpoint each
+installed Claude or Codex tool resolves to:
 
 ```
 $ coop model my-project
@@ -553,20 +568,25 @@ that has neither, and only in an interactive terminal, coop prompts for a host
 URL, model name, and optional auth token, then saves that endpoint for the
 instance. (A non-interactive run declines the prompt.) If no tool ends up with
 an endpoint, the command fails. Claude and Codex are independent: you can put
-one on a local model and leave the other on cloud.
+one on a local model and leave the other on cloud. A Grok-only image has no
+local-model integration, so `model local` reports how to use a Claude or Codex
+image instead.
 
 Interactive input is bounded: model names accept up to 1 KiB, URLs up to 8
 KiB, and tokens up to 64 KiB. Token input is not echoed. The endpoint workflow
 requires a terminal because its confirmation, URL, and model prompts are
 interactive.
 
-`coop model NAME remote` switches back to cloud defaults for both tools. Saved
+`coop model NAME remote` switches back to cloud defaults for installed tools. Saved
 endpoints are kept, so a later `local` does not re-prompt.
 
 Switching never requires a VM restart — coop rewrites the guest config live over
 SSH when the VM is running, or saves it to apply on the next start. An
 already-running `claude`/`codex` reads its config at launch, so relaunch the
 agent (for example `coop claude NAME`) to pick up the change.
+If a live apply fails or the VM stops mid-apply, `coop model` and `coop status`
+report a pending change. Restart normally to reapply it before launching an
+agent. `coop shell` and `coop exec` remain available for diagnosis.
 
 ```
 coop model
@@ -779,7 +799,7 @@ workspace directory in bulk, use [`push`](#push) / [`pull`](#pull) instead.
 
 ### `images`
 
-List or delete golden images. Without flags, prints every image with its profiles, creation date, and size.
+List or delete golden images. Without flags, prints every image with its installed agents, profiles, creation date, and size.
 
 ```
 coop images [FLAGS]
@@ -795,7 +815,8 @@ coop images
 coop images --delete old-image
 ```
 
-With `--json`, each element is `{ "name", "profiles", "created", "size_bytes" }`.
+With `--json`, each element is `{ "name", "agents", "profiles", "created", "size_bytes" }`.
+If image metadata is unreadable, `agents` is `null` rather than a guessed set.
 Absence is modelled honestly: `profiles` is `[]` (not `"none"`), `created` is
 `null` (not `"unknown"`), and `size_bytes` is the raw byte count (the text path's
 `"8.0 GiB"` is presentation only).

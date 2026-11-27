@@ -1016,6 +1016,7 @@ mod tests {
             firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
+        inst.save().unwrap();
         let mut process = std::process::Command::new("/bin/sleep")
             .arg("30")
             .spawn()
