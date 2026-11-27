@@ -109,12 +109,8 @@ impl ModelState {
         if self.is_default() {
             // A missing file already encodes the default; don't leave a
             // stale snapshot behind.
-            if let Err(e) = crate::fs_util::remove_private_if_exists(&path) {
-                tracing::debug!(
-                    "Failed to remove default model state {} (non-fatal): {e}",
-                    path.display()
-                );
-            }
+            crate::fs_util::remove_private_if_exists(&path)
+                .context("Failed to clear default model state")?;
             return Ok(());
         }
         let json = serde_json::to_string_pretty(self).context("Failed to serialize model state")?;
