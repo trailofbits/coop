@@ -292,7 +292,7 @@ Claude Code auto-updates in the background by default — it checks for a newer 
 To force an update immediately rather than waiting for the background updater:
 
 ```bash
-coop agent update --claude
+coop agent update --agent claude
 ```
 
 This runs `claude update` synchronously inside the guest as the guest user. It is a convenience for when you want the newest version right now; for the recurring stale-agent problem, Codex is the one that needs attention (see [Updating Codex](codex-integration.md#updating-codex)). See [`agent update`](commands.md#agent-update).
