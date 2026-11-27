@@ -13,13 +13,13 @@
 //!   installer wrapper ([`guest::SCRIPT_CODEX`]) with `COOP_FORCE_INSTALL=1`
 //!   to refresh the package or migrate an older direct-binary installation.
 //!   The guest user can also run `codex update` directly.
-//! - **Claude Code** lives in the guest user's `~/.local/bin` and already
-//!   auto-updates in the background. `coop agent update --agent claude` just runs
-//!   `claude update` synchronously as the guest user — a convenience, not a
-//!   fix.
-//! - **Grok Build** lives in the guest user's `~/.grok/bin` and already
-//!   auto-updates in the background. `coop agent update --agent grok` runs
-//!   `grok update` synchronously as the guest user.
+//! - **Claude Code** lives in the guest user's `~/.local/bin`.
+//!   `coop agent update --agent claude` runs `claude update` as the guest user.
+//! - **Grok Build** lives in the guest user's `~/.grok/bin`.
+//!   `coop agent update --agent grok` runs `grok update` as the guest user.
+//!
+//! Both tools support automatic updates, but coop does not inspect their
+//! settings or verify that a background update succeeded.
 
 use std::io::Write as _;
 
@@ -162,9 +162,8 @@ enum UpdateOutcome {
 enum CheckStatus {
     UpToDate,
     UpdateAvailable,
-    /// Claude Code and Grok Build update themselves in the background —
-    /// coop does not track a "latest" for them.
-    AutoUpdates,
+    /// Coop does not look up a latest release for Claude Code or Grok Build.
+    LatestNotChecked,
     /// Installed or latest version could not be determined.
     Unknown,
 }
@@ -223,13 +222,6 @@ fn run_updates(session: &SshSession, selection: &AgentSelection) -> Result<()> {
         match update_one(session, agent) {
             Ok(outcome) => {
                 writeln!(out, "{}", outcome_line(agent, &outcome))?;
-                if matches!(agent, Agent::Claude | Agent::Grok) {
-                    writeln!(
-                        out,
-                        "  note: {} also auto-updates in the background.",
-                        agent.display()
-                    )?;
-                }
             }
             Err(e) => {
                 failed = true;
@@ -346,7 +338,7 @@ fn check_status(
     latest: Option<&AgentVersion>,
 ) -> CheckStatus {
     match agent {
-        Agent::Claude | Agent::Grok => CheckStatus::AutoUpdates,
+        Agent::Claude | Agent::Grok => CheckStatus::LatestNotChecked,
         Agent::Codex => match (installed, latest) {
             (Some(i), Some(l)) if i < l => CheckStatus::UpdateAvailable,
             (Some(_), Some(_)) => CheckStatus::UpToDate,
@@ -396,7 +388,7 @@ fn check_line(row: &CheckRow) -> String {
                 "update available — run: coop agent update --agent codex".to_string(),
             )
         }
-        CheckStatus::AutoUpdates => (installed, "auto-updates in background".to_string()),
+        CheckStatus::LatestNotChecked => (installed, "latest version not checked".to_string()),
         CheckStatus::Unknown => (installed, "could not determine latest version".to_string()),
     };
     let label = row.agent.display();
@@ -501,18 +493,18 @@ mod tests {
     // ── check classification ───────────────────────────────────
 
     #[test]
-    fn claude_always_reports_auto_updates() {
+    fn claude_latest_is_not_checked() {
         assert_eq!(
             check_status(Agent::Claude, Some(&ver("1.2.3")), None),
-            CheckStatus::AutoUpdates
+            CheckStatus::LatestNotChecked
         );
     }
 
     #[test]
-    fn grok_reports_auto_updates() {
+    fn grok_latest_is_not_checked() {
         assert_eq!(
             check_status(Agent::Grok, Some(&ver("1.0.24")), None),
-            CheckStatus::AutoUpdates
+            CheckStatus::LatestNotChecked
         );
     }
 
@@ -578,32 +570,34 @@ mod tests {
     }
 
     #[test]
-    fn check_line_auto_updates_notes_background() {
+    fn check_line_claude_does_not_claim_auto_update() {
         let row = CheckRow {
             agent: Agent::Claude,
             installed: Some(ver("1.2.3")),
             latest: None,
-            status: CheckStatus::AutoUpdates,
+            status: CheckStatus::LatestNotChecked,
         };
         let line = check_line(&row);
         assert!(line.contains("Claude Code"), "{line}");
         assert!(line.contains("1.2.3"), "{line}");
-        assert!(line.contains("auto-updates in background"), "{line}");
+        assert!(line.contains("latest version not checked"), "{line}");
+        assert!(!line.contains("auto-update"), "{line}");
         assert!(!line.contains("up to date"), "{line}");
     }
 
     #[test]
-    fn check_line_auto_updates_names_grok_build() {
+    fn check_line_grok_does_not_claim_auto_update() {
         let row = CheckRow {
             agent: Agent::Grok,
             installed: Some(ver("1.0.24")),
             latest: None,
-            status: CheckStatus::AutoUpdates,
+            status: CheckStatus::LatestNotChecked,
         };
         let line = check_line(&row);
         assert!(line.contains("Grok Build"), "{line}");
         assert!(line.contains("1.0.24"), "{line}");
-        assert!(line.contains("auto-updates in background"), "{line}");
+        assert!(line.contains("latest version not checked"), "{line}");
+        assert!(!line.contains("auto-update"), "{line}");
         assert!(!line.contains("up to date"), "{line}");
     }
 
@@ -627,7 +621,7 @@ mod tests {
                 agent: Agent::Claude,
                 installed: Some(ver("1.2.3")),
                 latest: None,
-                status: CheckStatus::AutoUpdates,
+                status: CheckStatus::LatestNotChecked,
             },
             CheckRow {
                 agent: Agent::Codex,
@@ -639,7 +633,7 @@ mod tests {
                 agent: Agent::Grok,
                 installed: Some(ver("1.0.24")),
                 latest: None,
-                status: CheckStatus::AutoUpdates,
+                status: CheckStatus::LatestNotChecked,
             },
         ];
         let lines = check_report(&rows);
