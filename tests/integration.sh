@@ -1642,8 +1642,9 @@ test_exec() {
         fi
         sleep 0.1
     done
-    wait "$stream_pid" || true
-    if [[ "$streamed" -eq 1 && "$(cat "$stream_done")" -eq 0 ]]; then
+    local stream_status=0
+    wait "$stream_pid" || stream_status=$?
+    if [[ "$streamed" -eq 1 && "$stream_status" -eq 0 && -f "$stream_done" && "$(cat "$stream_done")" == 0 ]]; then
         pass "exec streams stdout and stderr before guest exit"
     else
         fail "exec streams stdout and stderr before guest exit" \
