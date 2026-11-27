@@ -10,19 +10,26 @@ use crate::cmd::Cmd;
 use crate::{backend, config, github_pat, prompt, update, workspace};
 
 pub(crate) fn cmd_init(config_path: &Path) -> Result<()> {
-    if config_path.exists() {
-        bail!(
-            "Config file already exists at {}. \
-             Edit it directly or remove it first.",
-            config_path.display()
-        );
+    let parent = config_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create {}", parent.display()))?;
+    let mut starter = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("Failed to create a starter config in {}", parent.display()))?;
+    crate::fs_util::clear_private_acl(starter.as_file())?;
+    starter.write_all(include_bytes!("../../config.example.toml"))?;
+    if let Err(error) = starter.persist_noclobber(config_path) {
+        if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+            bail!(
+                "Config file already exists at {}. Edit it directly or remove it first.",
+                config_path.display()
+            );
+        }
+        return Err(error.error)
+            .with_context(|| format!("Failed to create {}", config_path.display()));
     }
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
-    }
-    std::fs::write(config_path, include_str!("../../config.example.toml"))
-        .with_context(|| format!("Failed to write {}", config_path.display()))?;
     writeln!(
         std::io::stdout(),
         "Created {}. Edit to customize, or leave as-is for defaults.",
@@ -495,5 +502,66 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = std::path::Path::new("/nonexistent/path/config.toml");
         assert!(super::config_path_is_under_data_dir(config, tmp.path()));
+    }
+
+    #[test]
+    fn init_publishes_a_private_config_once() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested").join("config.toml");
+        super::cmd_init(&path).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            include_bytes!("../../config.example.toml")
+        );
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        fs::write(&path, "user configuration").unwrap();
+        assert!(super::cmd_init(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"user configuration");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn init_removes_inherited_read_acls() {
+        use std::process::Command;
+
+        let root = crate::test_support::private_tempdir().unwrap();
+        assert!(
+            Command::new("chmod")
+                .arg("+a")
+                .arg("everyone allow read,file_inherit,directory_inherit")
+                .arg(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let inherited = tempfile::NamedTempFile::new_in(root.path()).unwrap();
+        let listing = Command::new("ls")
+            .arg("-le")
+            .arg(inherited.path())
+            .output()
+            .unwrap();
+        assert!(listing.status.success());
+        assert!(String::from_utf8_lossy(&listing.stdout).contains("allow"));
+
+        let path = root.path().join("config.toml");
+        super::cmd_init(&path).unwrap();
+        let listing = Command::new("ls").arg("-le").arg(&path).output().unwrap();
+        assert!(listing.status.success());
+        assert!(!String::from_utf8_lossy(&listing.stdout).contains("allow"));
+    }
+
+    #[test]
+    fn init_preserves_an_existing_dangling_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("missing");
+        let path = tmp.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(super::cmd_init(&path).is_err());
+        assert_eq!(std::fs::read_link(&path).unwrap(), target);
+        assert!(!target.exists());
     }
 }

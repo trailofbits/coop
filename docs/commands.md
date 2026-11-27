@@ -392,7 +392,8 @@ Firecracker jail generations and per-instance VMM identity. Templates and the
 kernel are preserved unless you pass `--all`.
 
 ```
-coop destroy [NAME] [FLAGS]
+coop destroy [NAME]
+coop destroy --all
 ```
 
 | Flag | Description |
@@ -419,7 +420,7 @@ coop list
 
 ### `status`
 
-Print instance status. Without a name, lists every instance with its state, selected network mode, image, backend, and resource usage (for running instances). With a name, prints detailed status for that instance.
+Print instance status. Without a name, shows the backend and groups instances into running and stopped tables, alphabetized by name within each group. Both tables show the image and, on Firecracker, the selected network mode. The running table also shows 1-minute load average and memory and disk usage. With a name, prints detailed status for that instance.
 
 ```
 coop status [NAME]
@@ -465,47 +466,57 @@ stale in long-running VMs and in new VMs created from an old image. To refresh
 the image itself instead, rebuild it with `coop setup --rebuild`.
 
 ```
-coop agent update [NAME] [--claude] [--codex] [--grok] [--check] [-y]
+coop agent update [NAME] [--agent <agent>]...
 ```
 
 | Argument / Flag | Description |
 |-----------------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--claude` | Update Claude Code |
-| `--codex` | Update Codex |
-| `--grok` | Update Grok Build |
-| `--check` | Only report installed vs. latest versions — change nothing |
-| `-y`, `--yes` | Skip the confirmation prompt |
+| `--agent <agent>` | Agent to update: `claude`, `codex`, or `grok` (repeatable) |
 
-With no agent flag, every agent is updated; passing every flag is the same as
-passing none. The VM must be running.
+With no `--agent` selector, every agent is updated. Repeat `--agent` to update
+more than one agent. The VM must be running. The command starts the requested
+updates immediately without a confirmation prompt.
 
-`coop agent update --codex` re-runs OpenAI's native installer as the guest
+`coop agent update --agent codex` re-runs OpenAI's native installer as the guest
 user, including when migrating an older direct-binary installation. The full
 package stays in the user's home directory, with `/usr/local/bin/codex` linked
 to `~/.local/bin/codex` and `/usr/local/bin/codex-code-mode-host` linked to the
 same native release. The guest user can also run `codex update` directly
 without sudo.
-Claude Code and Grok Build already auto-update in the background;
-`coop agent update --claude` / `--grok` run `claude update` / `grok update`
-now, synchronously — a convenience rather than a fix.
-
-`--check` reports each agent's installed version and, for Codex, the latest
-release on GitHub, changing nothing:
+Claude Code and Grok Build support automatic updates, depending on their
+settings and whether they run. `coop agent update --agent claude` /
+`--agent grok` run `claude update` / `grok update` now, synchronously.
 
 ```
-$ coop agent update my-project --check
-Claude Code  1.2.3            up to date (auto-updates in background)
-Codex        0.4.1 → 0.5.0    update available — run: coop agent update --codex
-Grok Build   1.0.24           up to date (auto-updates in background)
+coop agent update                                      # every agent, resolved instance
+coop agent update my-project                           # every agent, instance "my-project"
+coop agent update --agent codex                        # Codex only
+coop agent update --agent claude --agent grok          # Claude Code and Grok Build
 ```
 
+### `agent status`
+
+Report each selected agent's installed version and, for Codex, the latest
+release on GitHub. This command changes nothing. For Claude Code and Grok
+Build, it does not check the latest version or whether automatic updates ran.
+
 ```
-coop agent update                 # every agent, resolved instance
-coop agent update my-project      # every agent, instance "my-project"
-coop agent update --codex         # Codex only
-coop agent update --grok          # Grok Build only
-coop agent update --check         # report versions, change nothing
+coop agent status [NAME] [--agent <agent>]...
+```
+
+| Argument / Flag | Description |
+|-----------------|-------------|
+| `NAME` | Instance name (required if multiple instances exist) |
+| `--agent <agent>` | Agent to report: `claude`, `codex`, or `grok` (repeatable) |
+
+With no `--agent` selector, every agent is reported. The VM must be running.
+
+```
+$ coop agent status my-project
+Claude Code  1.2.3            latest version not checked
+Codex        0.4.1 → 0.5.0    update available — run: coop agent update --agent codex
+Grok Build   1.0.24           latest version not checked
 ```
 
 ### `model`

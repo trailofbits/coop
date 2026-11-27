@@ -82,7 +82,7 @@ pub fn run_setup_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
     );
     if let Some(vm) = opts.vm {
         eprintln!(
-            "\nPAT entry stored. Binding to VM {vm} is the next write; if it fails, retry with: coop github assign-pat --vm {vm} --repo {repo}"
+            "\nPAT entry stored. Binding to VM {vm} is the next write; if it fails, follow the recovery instructions in the error."
         );
     } else {
         eprintln!(
