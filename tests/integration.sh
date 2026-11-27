@@ -5098,9 +5098,9 @@ test_restart_rejects_ignored_flags() {
 
     # Creation-time flags no longer exist on `coop start`; clap rejects them as
     # unknown arguments. (`--mount`, `--git-repo`, `--vcpus`, `--mem`, `--disk`,
-    # `--image`, `--exclude-git`, `--profile` all live on `coop up`.)
+    # `--image`, `--exclude-local-config`, `--profile` all live on `coop up`.)
     local flag
-    for flag in "--mount $mount_dir" "--disk 20" "--vcpus 4" --exclude-git; do
+    for flag in "--mount $mount_dir" "--disk 20" "--vcpus 4" --exclude-local-config; do
         # shellcheck disable=SC2086
         if coop_fails start "$INSTANCE" --no-agents $flag; then
             pass "start ${flag%% *} rejected by clap"
@@ -6241,6 +6241,47 @@ EOF
 
     rm -rf "$ws_tmpdir"
     ws_tmpdir=""
+}
+
+test_workspace_exclude_local_config() {
+    echo ""
+    echo "=== Phase: workspace transfer without local config ==="
+
+    local inst_name="${INSTANCE}-exclude-local-config"
+    local workspace="$tmpdir/$inst_name-ws"
+    mkdir -p "$workspace/.claude"
+    git init -q "$workspace"
+    printf '{}\n' > "$workspace/.claude/settings.json"
+    printf 'initial\n' > "$workspace/keep.txt"
+
+    if ! coop up "$workspace" --name "$inst_name" --copy --no-agents --exclude-local-config; then
+        fail "up --exclude-local-config copies the workspace" "stderr: $HARNESS_ERR"
+        return
+    fi
+    STARTED_INSTANCES+=("$inst_name")
+    local GUEST_INSTANCE="$inst_name"
+    local check_transfer='test "$(cat /workspace/keep.txt)" = "$1" &&
+        test ! -e /workspace/.git && test ! -e /workspace/.claude'
+
+    if guest_exec sh -c "$check_transfer" sh initial; then
+        pass "up --exclude-local-config copies ordinary files and omits .git and .claude"
+    else
+        fail "up --exclude-local-config copies ordinary files and omits .git and .claude" \
+            "unexpected guest contents: $(guest_stderr)"
+    fi
+
+    printf 'pushed\n' > "$workspace/keep.txt"
+    if ! coop push "$inst_name" --dir "$workspace" --force --exclude-local-config; then
+        fail "push --exclude-local-config copies the workspace" "stderr: $HARNESS_ERR"
+    elif guest_exec sh -c "$check_transfer" sh pushed; then
+        pass "push --exclude-local-config updates ordinary files and omits .git and .claude"
+    else
+        fail "push --exclude-local-config updates ordinary files and omits .git and .claude" \
+            "unexpected guest contents: $(guest_stderr)"
+    fi
+
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
 }
 
 # Copy/pull must not synthesize AppleDouble sidecars from macOS metadata.
@@ -9521,21 +9562,31 @@ test_guest_user_validation() {
     fi
 }
 
-test_pull_cli_validation() {
+test_workspace_filter_cli() {
     echo ""
-    echo "=== Phase: pull CLI validation ==="
+    echo "=== Phase: workspace filter CLI validation ==="
 
-    if coop_fails pull --exclude-git; then
-        if grep -qi "unexpected\|unknown\|unrecognized\|--exclude-git" <<< "$HARNESS_ERR"; then
-            pass "pull --exclude-git is rejected as an unknown flag"
+    # Invalid config stops both commands before they can start or contact a VM.
+    local config="$tmpdir/invalid-workspace-filter-config.toml"
+    printf '[incomplete\n' > "$config"
+    local command
+    for command in up push; do
+        if RUST_LOG=coop=warn coop_fails --config "$config" "$command" --exclude-git &&
+            [[ "$HARNESS_ERR" == *"--exclude-git is deprecated and will be removed"* ]]; then
+            pass "$command accepts --exclude-git and warns about its removal"
         else
-            fail "pull --exclude-git is rejected as an unknown flag" \
-                "unexpected error: $HARNESS_ERR"
+            fail "$command accepts --exclude-git and warns about its removal" "stderr: $HARNESS_ERR"
         fi
-    else
-        fail "pull --exclude-git is rejected as an unknown flag" \
-            "pull unexpectedly accepted a no-op flag"
-    fi
+    done
+
+    local flag
+    for flag in --exclude-git --exclude-local-config; do
+        if coop_fails pull "$flag" && [[ "$HARNESS_ERR" == *"unexpected argument '$flag'"* ]]; then
+            pass "pull $flag is rejected as an unknown flag"
+        else
+            fail "pull $flag is rejected as an unknown flag" "stderr: $HARNESS_ERR"
+        fi
+    done
 }
 
 # ── Alternate guest user lifecycle (--full only) ──────────────
@@ -9764,7 +9815,7 @@ EOF
     run_timed_test test_completions
     run_timed_test test_removed_devcontainer_cli
     run_timed_test test_guest_user_validation
-    run_timed_test test_pull_cli_validation
+    run_timed_test test_workspace_filter_cli
 
     # Setup + primary instance
     run_timed_test test_setup
@@ -9862,6 +9913,7 @@ EOF
         run_timed_test test_host_mount_custom_guest_path
         run_timed_test test_port_forwards
         run_timed_test test_workspace_sync
+        run_timed_test test_workspace_exclude_local_config
         run_timed_test test_appledouble_sidecars
         run_timed_test test_multi_instance
         run_timed_test test_custom_profiles
