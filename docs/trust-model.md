@@ -29,8 +29,7 @@ cross this boundary; the VM does not make their data safe for host tools.
 - **Pulled files and live mounts.** Guest-authored names, symlinks, contents,
   and metadata can affect host paths and tools. Pull staging and `.git` filters
   are defense in depth; transferred files remain untrusted when a host tool
-  later discovers them. A repository pulled by an older vulnerable release
-  needs independent host inspection. See [workspaces](workspaces.md).
+  later discovers them. See [workspaces](workspaces.md).
 - **Guest disks and output.** `coop commit` can make modified disk contents a
   future image template. Guest command output is data, never host shell source.
   Linux setup and disk operations must preserve the checked filesystem boundary.
@@ -180,8 +179,7 @@ accepts a correctly signed bundle published with release-content permission
 and cannot revoke one already obtained by a client; API verification has a
 narrower publication path. Neither path authenticates every upstream build
 input. The separately compiled test source does not make production update
-origins runtime-selectable. See [update security details](update-security.md)
-and [architecture](ARCHITECTURE.md#coop-update).
+origins runtime-selectable. See [architecture](ARCHITECTURE.md#coop-update).
 
 ## Documented, accepted trade-offs
 

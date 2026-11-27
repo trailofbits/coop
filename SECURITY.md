@@ -18,7 +18,7 @@ Include the following elements:
 - The coop version (`coop --version`) and host platform (Linux/Firecracker or
   macOS/Lima).
 - A description of the issue and the impact you expect it to have.
-- A proof of concept working for the latest main commit (at the submission time)=
+- A proof of concept working for the latest main commit (at the submission time).
 - Steps to reproduce and the affected code path.
 - Optional: a suggested remediation or directly a patch.
 

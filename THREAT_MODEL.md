@@ -45,5 +45,5 @@ Of note, control of the host account running coop is outside this model's isolat
 The disclosure scope and exclusions are in [`SECURITY.md`](SECURITY.md#scope).
 
 Review this model when a new boundary-crossing feature or secret is added.
-Changes listed under [explicit confirmation](docs/trust-model.md#changes-requiring-explicit-confirmation_
+Changes listed under [explicit confirmation](docs/trust-model.md#changes-requiring-explicit-confirmation)
 need human review before merge.
