@@ -1238,7 +1238,7 @@ pub struct NetworkConfig {
 /// ```
 ///
 /// The plain string `"pat"` form is equivalent to a table with `mode = "pat"`
-/// and no `pat` entries — lookup will fail at start-time until an entry is added.
+/// and no `pat` entries. An unbound VM starts without a configured PAT.
 #[derive(Debug, Clone)]
 pub enum GitHubAuth {
     Auto,

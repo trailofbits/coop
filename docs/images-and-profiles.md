@@ -100,12 +100,17 @@ coop setup --profile python,node,rust
 |---------|---------------------|
 | `python` | `python3`, `python3-pip`, `python3-venv` |
 | `node` | `nodejs` (NodeSource repository added via pre-install script) |
-| `c` | `clang`, `llvm`, `gdb`, `valgrind`, `cmake`. Installs plugin: `clangd-lsp@claude-plugins-official` |
+| `c` | `clang`, `llvm`, `gdb`, `valgrind`, `cmake`. Declares Claude plugin `clangd-lsp@claude-plugins-official` (installed on Lima when Claude is in the image) |
 | `fuzz` | `clang`, `llvm`, `afl++`, `lcov` |
-| `rust` | Rust toolchain via post-install script (not apt). Installs plugin: `rust-analyzer-lsp@claude-plugins-official` |
+| `rust` | Rust toolchain via post-install script (not apt). Declares Claude plugin `rust-analyzer-lsp@claude-plugins-official` (installed on Lima when Claude is in the image) |
 | `go` | `golang` |
 
-Plugins listed above are baked into the golden image during `coop setup` and do not need to be listed separately in config.
+On Lima, setup installs profile plugins into images that include Claude.
+Firecracker currently does not install plugins declared by selected profiles:
+selecting `c` or `rust` there installs the toolchain but not its Claude plugin.
+Firecracker first-boot installation reads `[claude].marketplaces` and
+`[claude].plugins` from `config.toml`; list a profile plugin there explicitly
+to install it. Images without Claude skip Claude plugins on either backend.
 
 ## Custom profiles
 
@@ -200,8 +205,8 @@ By default, coop builds an image called `default`. Build multiple images with di
 coop setup --profile python --image py-dev
 coop setup --profile python,node,rust --image polyglot
 
-coop up . --image py-dev
-coop up . --image polyglot
+coop up ./my-project --image py-dev
+coop up ./my-project --new-instance --name polyglot-vm --image polyglot
 ```
 
 Each named image lives in its own directory under `~/.coop/images/<name>/` with independent versioning and staleness tracking.
@@ -253,14 +258,14 @@ The `coop start` in that recipe does not re-sync `/workspace` or reinstall plugi
 
 coop records what went into each template in a `template-config.json` file alongside the image. This config contains:
 
-- **Version number**: a monotonic counter that increments when base install logic changes. A newer coop version triggers a rebuild.
+- **Version number**: metadata recording the base install logic version. Changing this number alone does not trigger a rebuild.
 - **Install script hash**: SHA-256 of the composed install recipe (base + profile + Linux/Firecracker extra packages). Changing profiles or extra packages changes this hash.
 - **Post-install script hash**: SHA-256 of the Linux/Firecracker post-install script content, if one was provided.
 - **Agent set, profile list, and extra packages**: the exact inputs used to build the template; explicit extra packages are Linux/Firecracker only.
 - **Marketplaces and plugins**: the marketplace sources and plugins that were baked into the template. On VM startup, coop compares this list against the current config and only installs the delta (marketplaces or plugins added since the template was built).
 - **Creation timestamp**: when the template was built.
 
-On every `coop setup`, coop computes the current recipe hash and compares it to the stored config. If the hashes differ, a current, complete template is stale and coop rebuilds it. A missing or unreadable config file for an existing disk requires an explicit `--rebuild`, because coop cannot recover its agent set. Plain setup refuses an interrupted publication on either backend and an older Firecracker image whose metadata lacks the vsock listener capability, regardless of recipe hashes. For a base image, use `coop setup --image NAME --rebuild`; rebuilding a committed checkpoint discards its contents. An interrupted commit can instead be retried from its source instance with `coop commit --image NAME --force`.
+On Firecracker, `coop setup` compares the install recipe and post-install script hashes with the stored config. On Lima, it compares the provision-script hash, guest user, selected agents, and baked marketplace and plugin lists. A change detected by these checks rebuilds a current, complete base image; the version number is not compared. Use `--rebuild` for changes outside these checks. A missing or unreadable config file for an existing disk requires an explicit `--rebuild`, because coop cannot recover its agent set. Plain setup refuses an interrupted publication on either backend and an older Firecracker image whose metadata lacks the vsock listener capability, regardless of recipe hashes. For a base image, use `coop setup --image NAME --rebuild`; rebuilding a committed checkpoint discards its contents. An interrupted commit can instead be retried from its source instance with `coop commit --image NAME --force`.
 
 On Linux/Firecracker, when you omit `--profile` and `--extra-packages`, `coop
 setup` reuses the values from the existing template config. Running `coop setup`

@@ -18,7 +18,7 @@ repository = "https://github.com/trailofbits/coop"
 name = "coop"
 version.workspace = true
 edition.workspace = true
-description = "Isolated VM environment for running Claude Code"
+description = "Isolated VM environments for coding agents"
 license.workspace = true
 repository.workspace = true
 

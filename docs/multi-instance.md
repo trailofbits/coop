@@ -46,28 +46,12 @@ version before upgrading.
 
 ## Addressing instances
 
-Most commands accept an optional instance name. Resolution follows three cases:
-
-- **Zero instances exist.** The command fails with a message to run `coop up`.
-- **Exactly one instance exists.** The name is optional. coop auto-selects it.
-- **Multiple instances exist.** The name is required. coop lists the available names in the error if you omit it.
-
-```
-# With one instance, these are equivalent:
-coop shell
-coop shell my-project
-
-# With multiple instances, you must specify:
-coop shell my-project
-coop shell another-project
-```
-
-This applies to `shell`, `stop`, `destroy`, `status <name>`, `logs`, `push`,
-`pull`, `exec`, `editor` (including `--web`), `resize`,
-`model`, `claude`, and `codex`.
-
-`coop editor --web` resolves the optional name using all registered instances,
-then requires the selected VM to be running.
+With one running VM and several stopped VMs, bare `coop shell` connects to
+the running VM. With two running VMs, give the name, for example
+`coop shell my-project`. Bare `coop start` similarly selects the only stopped
+VM. Commands such as `coop destroy` and `coop editor --web` select from all
+registered instances. Browser editing then requires the selected VM to be
+running. See [instance name resolution](commands.md#instance-name-resolution).
 
 ## Checking status
 

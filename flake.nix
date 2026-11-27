@@ -1,5 +1,5 @@
 {
-  description = "Isolated VM environments for running Claude Code and Codex";
+  description = "Isolated VM environments for coding agents";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
