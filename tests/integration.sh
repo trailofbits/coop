@@ -9736,7 +9736,7 @@ test_guest_user_alt() {
     local inst_name="${INSTANCE}-altuser"
     local alt_user="vscode"
 
-    # Setup a separate image whose `template_config.json` should record
+    # Setup a separate image whose `template-config.json` should record
     # guest_user=vscode and whose first boot should create the vscode
     # account at uid 1000.
     if coop setup -y --image "$img_name" --guest-user "$alt_user"; then
@@ -9746,17 +9746,17 @@ test_guest_user_alt() {
         return
     fi
 
-    # template_config.json must serialize the configured user — this is
+    # template-config.json must serialize the configured user — this is
     # what start/shell/exec read on subsequent invocations.
     local tc_path="$HOME/.coop/images/$img_name/template-config.json"
     if [[ -f "$tc_path" ]]; then
         if grep -q "\"guest_user\": *\"$alt_user\"" "$tc_path"; then
-            pass "template_config.json records guest_user=$alt_user"
+            pass "template-config.json records guest_user=$alt_user"
         else
-            fail "template_config.json records guest_user=$alt_user" "contents: $(cat "$tc_path")"
+            fail "template-config.json records guest_user=$alt_user" "contents: $(cat "$tc_path")"
         fi
     else
-        skip "template_config.json records guest_user=$alt_user" "config at $tc_path not found"
+        skip "template-config.json records guest_user=$alt_user" "config at $tc_path not found"
     fi
 
     # Create an instance from the alt-user image — no `--guest-user` flag
