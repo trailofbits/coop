@@ -80,6 +80,9 @@ pub(crate) struct InstanceStatus<'a> {
     pub name: &'a config::InstanceName,
     pub state: InstanceState,
     pub image: &'a config::ImageName,
+    pub agents: crate::agents::AgentSet,
+    pub restore_pending: Option<crate::restore_intent::RestorePhase>,
+    pub model_apply_pending: bool,
     pub backend: BackendKind,
     pub network: Option<config::FirecrackerNetworkMode>,
     pub usage: Option<backend::ResourceUsage>,
@@ -103,6 +106,7 @@ pub(crate) struct InstanceSummary<'a> {
 pub(crate) struct ImageInfo<'a> {
     pub name: &'a config::ImageName,
     pub profiles: &'a [String],
+    pub agents: Option<&'a crate::agents::AgentSet>,
     pub created: Option<&'a str>,
     pub size_bytes: u64,
 }
@@ -177,6 +181,9 @@ mod tests {
             name: &name,
             state: InstanceState::Running,
             image: &image,
+            agents: crate::agents::AgentSet::default(),
+            restore_pending: None,
+            model_apply_pending: false,
             backend: BackendKind::of(&backend::PlatformBackend::new()),
             network: Some(config::FirecrackerNetworkMode::Isolated),
             usage: Some(backend::ResourceUsage {
@@ -193,6 +200,9 @@ mod tests {
                 "name": "web",
                 "state": "running",
                 "image": "default",
+                "agents": ["claude", "codex", "grok"],
+                "restore_pending": null,
+                "model_apply_pending": false,
                 "backend": platform_backend_token(),
                 "network": "isolated",
                 "usage": {
@@ -214,6 +224,9 @@ mod tests {
             name: &name,
             state: InstanceState::Stopped,
             image: &image,
+            agents: crate::agents::AgentSet::default(),
+            restore_pending: None,
+            model_apply_pending: false,
             backend: BackendKind::of(&backend::PlatformBackend::new()),
             network: None,
             usage: None,
@@ -242,12 +255,13 @@ mod tests {
         let view = ImageInfo {
             name: &name,
             profiles: &[],
+            agents: None,
             created: None,
             size_bytes: 0,
         };
         assert_eq!(
             to_value(&view),
-            json!({ "name": "default", "profiles": [], "created": Value::Null, "size_bytes": 0 })
+            json!({ "name": "default", "profiles": [], "agents": Value::Null, "created": Value::Null, "size_bytes": 0 })
         );
     }
 
@@ -258,6 +272,7 @@ mod tests {
         let view = ImageInfo {
             name: &name,
             profiles: &profiles,
+            agents: Some(&crate::agents::AgentSet::default()),
             created: Some("2026-06-01T12:00:00Z"),
             size_bytes: 8_589_934_592,
         };
@@ -266,6 +281,7 @@ mod tests {
             json!({
                 "name": "default",
                 "profiles": ["python", "node"],
+                "agents": ["claude", "codex", "grok"],
                 "created": "2026-06-01T12:00:00Z",
                 "size_bytes": 8_589_934_592u64
             })

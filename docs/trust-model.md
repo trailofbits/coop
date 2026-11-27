@@ -91,6 +91,14 @@ subprocess or let those aliases configure a host SSH wrapper.
   reaches the proxy via stdin. Resolution failure aborts boot. A per-VM
   override can select a different host credential. See
   [credential proxy](credential-proxy.md).
+- **Selective agent images.** Each copied image records which agents coop
+  installed. Boot and session preparation resolve credentials and start proxies
+  only for those agents. Proxy teardown checks a recorded process start identity
+  before signaling; Linux also pins the process with pidfd. macOS retains a
+  narrow PID reuse window between the identity check and signal. A live legacy
+  PID-only record is kept for manual inspection rather than signaled. A pending
+  model apply blocks agent launch until bootstrap or restart succeeds; stopping
+  a VM cancels that generation before proxy cleanup.
 - **Codex ChatGPT mode.** Guest keyring storage avoids copying host `auth.json`
   but leaves a refreshable credential accessible to the guest. Bootstrap removes
   stale guest `auth.json`; the managed launcher refuses a missing keyring

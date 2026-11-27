@@ -2317,12 +2317,47 @@ impl CoopConfig {
         Ok(())
     }
 
+    pub(crate) fn validate_and_warn_for_agents(
+        &self,
+        agents: &crate::agents::AgentSet,
+    ) -> Result<()> {
+        for warning in self.validate_for_agents(agents)? {
+            tracing::warn!("{warning}");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_host_only_and_warn(&self) -> Result<()> {
+        for warning in self.validate_with_target(None)? {
+            tracing::warn!("{warning}");
+        }
+        Ok(())
+    }
+
     /// Validate config values, returning all problems found.
     ///
     /// Checks numeric bounds, IP/CIDR parsing, and path accessibility.
     /// Returns `Ok(warnings)` where warnings are non-fatal observations,
     /// or `Err` with all fatal validation errors joined.
     pub fn validate(&self) -> Result<Vec<String>> {
+        self.validate_for_agents(&crate::agents::AgentSet::default())
+    }
+
+    pub(crate) fn validate_for_agents(
+        &self,
+        agents: &crate::agents::AgentSet,
+    ) -> Result<Vec<String>> {
+        self.validate_with_target(Some(agents))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "host and selected-agent environmental checks share one error aggregation"
+    )]
+    fn validate_with_target(
+        &self,
+        agents: Option<&crate::agents::AgentSet>,
+    ) -> Result<Vec<String>> {
         let mut errors: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
 
@@ -2407,7 +2442,8 @@ impl CoopConfig {
             }
         }
 
-        if let ConfigDir::Custom(ref path) = self.claude.config_dir
+        if agents.is_some_and(|set| set.contains(crate::agents::AgentId::Claude))
+            && let ConfigDir::Custom(ref path) = self.claude.config_dir
             && !path.is_dir()
         {
             errors.push(format!(
@@ -2416,7 +2452,8 @@ impl CoopConfig {
             ));
         }
 
-        if let ConfigDir::Custom(ref path) = self.codex.config_dir
+        if agents.is_some_and(|set| set.contains(crate::agents::AgentId::Codex))
+            && let ConfigDir::Custom(ref path) = self.codex.config_dir
             && !path.is_dir()
         {
             errors.push(format!(
@@ -2425,7 +2462,8 @@ impl CoopConfig {
             ));
         }
 
-        if let ConfigDir::Custom(ref path) = self.grok.config_dir
+        if agents.is_some_and(|set| set.contains(crate::agents::AgentId::Grok))
+            && let ConfigDir::Custom(ref path) = self.grok.config_dir
             && !path.is_dir()
         {
             errors.push(format!(
@@ -2434,15 +2472,23 @@ impl CoopConfig {
             ));
         }
 
-        check_proxy_auth(&self.proxy, self.codex.auth, &mut errors);
+        if agents.is_some_and(|set| set.contains(crate::agents::AgentId::Codex)) {
+            check_proxy_auth(&self.proxy, self.codex.auth, &mut errors);
+        }
 
-        check_local_marketplaces(
-            "claude.marketplaces",
-            &self.claude.marketplaces,
-            &mut errors,
-        );
-        check_local_marketplaces("codex.marketplaces", &self.codex.marketplaces, &mut errors);
-        check_local_marketplaces("grok.marketplaces", &self.grok.marketplaces, &mut errors);
+        if agents.is_some_and(|set| set.contains(crate::agents::AgentId::Claude)) {
+            check_local_marketplaces(
+                "claude.marketplaces",
+                &self.claude.marketplaces,
+                &mut errors,
+            );
+        }
+        if agents.is_some_and(|set| set.contains(crate::agents::AgentId::Codex)) {
+            check_local_marketplaces("codex.marketplaces", &self.codex.marketplaces, &mut errors);
+        }
+        if agents.is_some_and(|set| set.contains(crate::agents::AgentId::Grok)) {
+            check_local_marketplaces("grok.marketplaces", &self.grok.marketplaces, &mut errors);
+        }
 
         // `[claude.local_model]` / `[codex.local_model]` invariants
         // (http(s) scheme, present host, non-empty model) are enforced by
@@ -2967,6 +3013,9 @@ struct InstanceMeta {
     index: InstanceIndex,
     #[serde(default = "default_image_name")]
     image: ImageName,
+    /// The source image contract copied with this instance's disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    template_config: Option<crate::setup::TemplateConfig>,
     #[serde(default = "legacy_firecracker_control_mode")]
     firecracker_control: FirecrackerControlMode,
 }
@@ -3064,11 +3113,34 @@ impl Instance {
         self.dir.join("instance.json")
     }
 
-    fn save(&self) -> Result<()> {
+    pub(crate) fn save(&self) -> Result<()> {
+        let previous = match self.load_meta() {
+            Ok(meta) => Some(meta),
+            Err(error)
+                if error
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                None
+            }
+            Err(error) => return Err(error).context("Cannot preserve existing instance contract"),
+        };
+        let template_config = previous
+            .filter(|meta| meta.image == self.image)
+            .and_then(|meta| meta.template_config);
+        self.save_with_template(template_config)
+    }
+
+    fn save_with_template(
+        &self,
+        template_config: Option<crate::setup::TemplateConfig>,
+    ) -> Result<()> {
         let meta = InstanceMeta {
             name: self.name.clone(),
             index: self.index,
             image: self.image.clone(),
+            template_config,
             firecracker_control: self.firecracker_control,
         };
         let json =
@@ -3078,11 +3150,57 @@ impl Instance {
         Ok(())
     }
 
+    fn load_meta(&self) -> Result<InstanceMeta> {
+        let directory = crate::fs_util::PrivateDir::open_existing(&self.dir)?;
+        let content = directory.read_to_string(OsStr::new("instance.json"))?;
+        serde_json::from_str(&content).context("Failed to parse instance.json")
+    }
+
+    pub(crate) fn source_template(&self, cfg: &CoopConfig) -> Result<crate::setup::TemplateConfig> {
+        if let Some(template) = self.load_meta()?.template_config {
+            return Ok(template);
+        }
+        let mut template = crate::setup::TemplateConfig::load_for(cfg, &self.image)?;
+        // Legacy instances predate selection and contain all three agents,
+        // even when their source image has since been rebuilt with a subset.
+        template.agents = crate::agents::AgentSet::default();
+        Ok(template)
+    }
+
+    pub(crate) fn source_guest_user(&self, cfg: &CoopConfig) -> Result<crate::guest::GuestUser> {
+        Ok(self.load_meta()?.template_config.map_or_else(
+            || crate::backend::persisted_guest_user(cfg, &self.image),
+            |template| template.guest_user,
+        ))
+    }
+
+    /// Legacy instances predate selective images and always contain all agents.
+    pub(crate) fn agents(&self) -> Result<crate::agents::AgentSet> {
+        Ok(self
+            .load_meta()?
+            .template_config
+            .map_or_else(crate::agents::AgentSet::default, |template| template.agents))
+    }
+
+    pub(crate) fn set_source_template(&self, template: crate::setup::TemplateConfig) -> Result<()> {
+        self.save_with_template(Some(template))
+    }
+
+    pub(crate) fn set_image_with_template(
+        &mut self,
+        image: ImageName,
+        template: crate::setup::TemplateConfig,
+    ) -> Result<()> {
+        self.image = image;
+        self.save_with_template(Some(template))
+    }
+
     /// Update the recorded origin image and persist `instance.json`.
     ///
     /// Used by `coop restore`: after the disk is replaced with image
     /// `image`'s template, the instance's lineage (and the guest-user
     /// lookup that keys off it) must track the restored image.
+    #[cfg(test)]
     pub(crate) fn set_image(&mut self, image: ImageName) -> Result<()> {
         self.image = image;
         self.save()
@@ -3676,6 +3794,50 @@ mod tests {
             data_dir: ConfigPath::new(tmp.path()),
             ..CoopConfig::default()
         }
+    }
+
+    #[test]
+    fn legacy_instance_commit_source_retains_all_agents_after_image_rebuild() {
+        use crate::agents::{AgentId, AgentSet};
+
+        let root = crate::test_support::private_tempdir().unwrap();
+        let cfg = CoopConfig {
+            data_dir: ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("source").unwrap();
+        crate::fs_util::private_dir(&cfg.image_dir(&image)).unwrap();
+        let mut template: crate::setup::TemplateConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": crate::setup::TEMPLATE_VERSION,
+                "created": "2026-01-01T00:00:00Z",
+                "install_script_hash": crate::sha256_hash::Sha256Hash::of("fixture"),
+                "profiles": [],
+                "extra_packages": [],
+                "post_install_hash": null,
+            }))
+            .unwrap();
+        template.agents = AgentSet::new(vec![AgentId::Codex]).unwrap();
+        template.save_for(&cfg, &image).unwrap();
+
+        let inst = Instance {
+            name: InstanceName::new("legacy").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("legacy"),
+            image,
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
+        };
+        crate::fs_util::private_dir(&inst.dir).unwrap();
+        inst.save().unwrap();
+        assert_eq!(inst.agents().unwrap(), AgentSet::default());
+        assert_eq!(
+            inst.source_template(&cfg).unwrap().agents,
+            AgentSet::default()
+        );
+
+        inst.set_source_template(template.clone()).unwrap();
+        assert_eq!(inst.agents().unwrap(), template.agents);
+        assert_eq!(inst.source_template(&cfg).unwrap().agents, template.agents);
     }
 
     #[test]
@@ -6382,6 +6544,23 @@ rsync = "/run/current-system/sw/bin/rsync"
         assert!(
             err.to_string().contains("codex.marketplaces"),
             "expected codex marketplace error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn target_validation_ignores_uninstalled_agent_paths() {
+        let mut cfg = CoopConfig::default();
+        cfg.claude.marketplaces = vec!["/nonexistent/claude-plugins".into()];
+        cfg.grok.marketplaces = vec!["/nonexistent/grok-plugins".into()];
+        let codex = crate::agents::AgentSet::new(vec![crate::agents::AgentId::Codex]).unwrap();
+        assert!(cfg.validate_for_agents(&codex).is_ok());
+        assert!(cfg.validate().is_err());
+        cfg.codex.marketplaces = vec!["/nonexistent/codex-plugins".into()];
+        assert!(
+            cfg.validate_for_agents(&codex)
+                .unwrap_err()
+                .to_string()
+                .contains("codex.marketplaces")
         );
     }
 
