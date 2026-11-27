@@ -1348,8 +1348,8 @@ fn run_on_descriptors(
             }
         }
     }
-    // SAFETY: pre_exec uses only fcntl and prctl on descriptors and a filter
-    // prepared before fork. It does not allocate or acquire locks.
+    // SAFETY: pre_exec uses only async-signal-safe fcntl, prctl, getpid, and
+    // kill calls with data prepared before fork. It does not allocate or lock.
     unsafe {
         command.pre_exec(move || {
             for fd in &fds {
@@ -1361,9 +1361,7 @@ fn run_on_descriptors(
                 install_disk_tool_syscall_filter(filter)?;
             }
             if matches!(tool, DiskTool::FsckLaunchProbe) {
-                let socket = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
-                if socket >= 0 {
-                    libc::close(socket);
+                if libc::kill(libc::getpid(), 0) == 0 {
                     return Err(io::Error::from_raw_os_error(libc::EACCES));
                 }
                 let error = io::Error::last_os_error();
