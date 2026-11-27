@@ -8,7 +8,7 @@ A template is a fully provisioned ext4 root filesystem. The build process:
 
 1. Creates an ext4 disk image (default 8 GiB, configurable with `--template-size`)
 2. Provisions a base Ubuntu system (a downloaded Firecracker CI squashfs on Firecracker, Ubuntu 24.04 cloud image on Lima)
-3. Installs base packages, Docker, GitHub CLI, Claude Code, Codex, and Grok Build
+3. Installs base packages, Docker, GitHub CLI, and the selected coding agents
 4. Applies requested profiles and, on Linux/Firecracker, extra packages
 5. On Linux/Firecracker, runs a requested `--post-install` script
 
@@ -21,11 +21,38 @@ it again if it is missing, changed, or fails to unpack. Each build attempts to
 remove the previous working tree before unpacking. Cleanup failures are
 non-fatal, so extraction can retain stale files from an earlier build.
 
-## What every template includes
+## Choose coding agents
 
-Every template installs these packages regardless of profile selection.
+New images include Claude Code, Codex, and Grok Build by default. Repeat
+`--agent` to build a smaller image (at least one agent is required):
 
-**Base packages:** `openssh-server`, `dbus-user-session`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `util-linux`, `jq`, `rsync`, `unzip`, `zip`, `file`, `gnome-keyring`, `less`, `libsecret-tools`
+```bash
+coop setup --image codex-dev --agent codex
+coop setup --image pair-dev --agent claude --agent codex
+coop up . --image codex-dev
+```
+
+The order of repeated selectors does not matter; duplicates are ignored.
+Omitting `--agent` when setting up an existing image preserves its recorded
+selection, including on a rebuild. To change it, pass the new selection with
+`--rebuild`, or choose a new image name. An instance keeps the agent set from
+the image disk it copied, even if that image is later rebuilt or deleted. To
+use a different set in an existing VM, restore it from an image with that set
+(`coop restore VM --image IMAGE --reprovision` replaces its guest disk), or
+create a new VM from the image. Save guest-only work before restoring.
+`coop images` and `coop status` show the recorded set. Commands that launch,
+update, or configure an absent agent reject it with recovery guidance. The
+set describes agents installed by coop, not tools installed later by hand in
+the guest. A committed image inherits its source VM's recorded set.
+`--no-agents` at VM start only skips boot-time agent setup; it does not change
+the image contents.
+
+## Base packages and selected agents
+
+Every template installs the base packages, Docker, and GitHub CLI regardless
+of profile selection. The agent tools below are installed only when selected.
+
+**Base packages:** `openssh-server`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `util-linux`, `jq`, `rsync`, `unzip`, `zip`, `file`, `less`. Images containing Codex also install `dbus-user-session`, `gnome-keyring`, and `libsecret-tools` for account authentication.
 
 **Docker:** `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`
 
@@ -40,11 +67,11 @@ user's home directory. `~/.local/bin/codex` is the native launcher;
 host is exposed at `/usr/local/bin/codex-code-mode-host`; both system links
 track native package updates. The guest user can run `codex update` directly
 without sudo.
-The image also installs `/usr/local/bin/codex-account`, a wrapper used by
+An image containing Codex also installs `/usr/local/bin/codex-account`, a wrapper used by
 `[codex] auth = "chatgpt"` to run Codex with a D-Bus session and guest Linux
 Secret Service storage. The wrapper and its three supporting packages
 (`dbus-user-session`, `gnome-keyring`, `libsecret-tools`) are installed in every
-image, not gated on the `auth` setting: an image is built once and reused across
+image containing Codex, regardless of the `auth` setting: an image is built once and reused across
 configs, so gating them would let a later `auth = "chatgpt"` edit meet an image
 that cannot serve it. When that mode is not configured the wrapper simply execs
 Codex, so it costs nothing at run time.
@@ -126,7 +153,9 @@ coop up --profile node,python
 
 coop runs the same recipe-hash staleness check used by `coop setup`. If the
 derived image is missing or stale, it is built or rebuilt first; if it is
-current, startup reuses it.
+current, startup reuses it. A new profile-derived image includes all three
+agents; an existing one keeps its recorded selection. For a predictable
+subset, use `coop setup --image NAME --agent AGENT` and `coop up --image NAME`.
 
 Explicitly named images are not affected by this shorthand. To choose the
 image name yourself, build it with `setup` and start a project from that image:
@@ -189,7 +218,7 @@ default              profiles: python, node              created: 2026-03-20T14:
 polyglot             profiles: python, node, rust        created: 2026-03-22T09:15:00Z     size: 6.1 GiB
 ```
 
-Output includes the image name, installed profiles, creation timestamp, and disk size.
+Output includes the image name, installed agents and profiles, creation timestamp, and disk size.
 
 Delete a named image:
 
@@ -229,11 +258,11 @@ coop records what went into each template in a `template-config.json` file along
 - **Version number**: a monotonic counter that increments when base install logic changes. A change to this template version triggers a rebuild for ordinary base images.
 - **Install script hash**: SHA-256 of the composed install recipe (base + profile + Linux/Firecracker extra packages). Changing profiles or extra packages changes this hash.
 - **Post-install script hash**: SHA-256 of the Linux/Firecracker post-install script content, if one was provided.
-- **Profile list and extra packages**: the exact inputs used to build the template; explicit extra packages are Linux/Firecracker only.
+- **Agent set, profile list, and extra packages**: the exact inputs used to build the template; explicit extra packages are Linux/Firecracker only.
 - **Marketplaces and plugins**: the marketplace sources and plugins that were baked into the template. On VM startup, coop compares this list against the current config and only installs the delta (marketplaces or plugins added since the template was built).
 - **Creation timestamp**: when the template was built.
 
-On every `coop setup`, coop computes the current recipe hash and compares it to the stored config. If the hashes differ, a current, complete template is stale and coop rebuilds it. A missing config file (orphaned image) also triggers a rebuild. Plain setup refuses an interrupted publication on either backend and an older Firecracker image whose metadata lacks the vsock listener capability, regardless of recipe hashes. For a base image, use `coop setup --image NAME --rebuild`; rebuilding a committed checkpoint discards its contents. An interrupted commit can instead be retried from its source instance with `coop commit --image NAME --force`.
+On every `coop setup`, coop computes the current recipe hash and compares it to the stored config. If the hashes differ, a current, complete template is stale and coop rebuilds it. A missing or unreadable config file for an existing disk requires an explicit `--rebuild`, because coop cannot recover its agent set. Plain setup refuses an interrupted publication on either backend and an older Firecracker image whose metadata lacks the vsock listener capability, regardless of recipe hashes. For a base image, use `coop setup --image NAME --rebuild`; rebuilding a committed checkpoint discards its contents. An interrupted commit can instead be retried from its source instance with `coop commit --image NAME --force`.
 
 On Linux/Firecracker, when you omit `--profile` and `--extra-packages`, `coop
 setup` reuses the values from the existing template config. Running `coop setup`

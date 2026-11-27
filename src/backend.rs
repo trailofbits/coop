@@ -1050,10 +1050,15 @@ fn parse_meminfo_kib(value: &str) -> Option<u64> {
 /// minted earlier. Setup first rejects backend-unsupported explicit inputs.
 /// Warnings are dropped here; they are surfaced once at the handler via
 /// [`CoopConfig::validate_and_warn`].
+#[cfg(test)]
 pub fn boot_preflight(cfg: &CoopConfig) -> Result<()> {
+    boot_preflight_for_agents(cfg, &crate::agents::AgentSet::default())
+}
+
+pub fn boot_preflight_for_agents(cfg: &CoopConfig, agents: &crate::agents::AgentSet) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     crate::firecracker_install::require_managed_path(&cfg.firecracker_bin)?;
-    cfg.validate().map(drop)
+    cfg.validate_for_agents(agents).map(drop)
 }
 
 fn setup_preflight(
@@ -1066,7 +1071,8 @@ fn setup_preflight(
         &opts.extra_packages,
         opts.post_install.as_ref(),
     )?;
-    boot_preflight(cfg)
+    let agents = crate::setup::preflight_setup_agent_selection(cfg, opts)?;
+    boot_preflight_for_agents(cfg, &agents)
 }
 
 /// VM backend for managing guest lifecycle.
@@ -1280,7 +1286,7 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
     if inst.probe_liveness()? {
         bail!("Instance '{}' is already running", inst.name);
     }
-    boot_preflight(cfg)?;
+    boot_preflight_for_agents(cfg, &inst.agents()?)?;
     crate::firecracker_install::configured_firecracker(&cfg.firecracker_bin)?;
     crate::firecracker_service::require_system_manager()?;
     crate::firecracker_jail::require_jail_tools()?;
@@ -1368,7 +1374,7 @@ pub(crate) fn legacy_firecracker_tcp_target(
     cfg: &CoopConfig,
     inst: &Instance,
 ) -> Result<SshTarget> {
-    let guest_user = persisted_guest_user(cfg, &inst.image);
+    let guest_user = persisted_instance_guest_user(cfg, inst)?;
     Ok(SshTarget::tcp(
         Hostname::from(inst.guest_ip()),
         cfg.ssh_port,
@@ -1383,7 +1389,7 @@ pub(crate) fn firecracker_ssh_target(cfg: &CoopConfig, inst: &Instance) -> Resul
     match inst.firecracker_control() {
         FirecrackerControlMode::LegacyTcp => legacy_firecracker_tcp_target(cfg, inst),
         FirecrackerControlMode::Vsock | FirecrackerControlMode::VsockIsolated => {
-            let guest_user = persisted_guest_user(cfg, &inst.image);
+            let guest_user = persisted_instance_guest_user(cfg, inst)?;
             let guest_port =
                 NonZeroU32::new(22).context("fixed SSH vsock port must be non-zero")?;
             SshTarget::firecracker_vsock(
@@ -1451,7 +1457,7 @@ impl VmBackend for FirecrackerBackend {
         if inst.probe_liveness()? {
             bail!("Instance '{}' is already running", inst.name);
         }
-        boot_preflight(cfg)?;
+        boot_preflight_for_agents(cfg, &inst.agents()?)?;
         crate::firecracker_install::configured_firecracker(&cfg.firecracker_bin)?;
         crate::firecracker_service::require_system_manager()?;
         crate::firecracker_jail::require_jail_tools()?;
@@ -1473,6 +1479,7 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        crate::restore_intent::ensure_contract_ready(inst)?;
         let _operation = lock_instance_operation(inst)?;
         crate::config::validate_firecracker_modes(
             inst.firecracker_control(),
@@ -1488,6 +1495,7 @@ impl VmBackend for FirecrackerBackend {
         stopped: StoppedInstance,
     ) -> Result<InstanceOperationGuard> {
         let inst = stopped.instance();
+        crate::restore_intent::ensure_contract_ready(inst)?;
         crate::config::validate_firecracker_modes(
             inst.firecracker_control(),
             inst.firecracker_network(),
@@ -1504,6 +1512,7 @@ impl VmBackend for FirecrackerBackend {
     ) -> Result<(StoppedInstance, StopOutcome)> {
         let (inst, _target) = running.into_parts();
         let operation = lock_instance_operation(&inst)?;
+        crate::model_apply::cancel(&inst)?;
         crate::web_editor::stop(&inst)?;
         let outcome = if inst.probe_liveness()? {
             let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
@@ -1530,6 +1539,8 @@ impl VmBackend for FirecrackerBackend {
 
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
+        crate::model_apply::cancel(inst)?;
+        crate::proxy::stop_checked(inst)?;
         let _selection = crate::github_assignment::lock_selection(inst)?;
         if inst.probe_liveness()? {
             crate::web_editor::stop(inst)?;
@@ -1771,13 +1782,14 @@ impl VmBackend for LimaBackend {
         mounts: &[crate::config::Mount],
     ) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
-        boot_preflight(cfg)?;
+        boot_preflight_for_agents(cfg, &inst.agents()?)?;
         crate::lima::create_and_start(cfg, inst, disk_gib, mounts)
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        crate::restore_intent::ensure_contract_ready(inst)?;
         let _operation = lock_instance_operation(inst)?;
-        boot_preflight(cfg)?;
+        boot_preflight_for_agents(cfg, &inst.agents()?)?;
         crate::lima::start_existing(cfg, inst)
     }
 
@@ -1786,7 +1798,8 @@ impl VmBackend for LimaBackend {
         cfg: &CoopConfig,
         stopped: StoppedInstance,
     ) -> Result<InstanceOperationGuard> {
-        boot_preflight(cfg)?;
+        crate::restore_intent::ensure_contract_ready(stopped.instance())?;
+        boot_preflight_for_agents(cfg, &stopped.instance().agents()?)?;
         crate::lima::start_existing(cfg, stopped.instance())?;
         Ok(stopped.into_operation_guard())
     }
@@ -1798,6 +1811,7 @@ impl VmBackend for LimaBackend {
     ) -> Result<(StoppedInstance, StopOutcome)> {
         let (inst, _target) = running.into_parts();
         let operation = lock_instance_operation(&inst)?;
+        crate::model_apply::cancel(&inst)?;
         crate::web_editor::stop(&inst)?;
         let outcome = match crate::lima::probe_state(&inst)? {
             Some(crate::lima::LimaState::Running) => {
@@ -1813,6 +1827,8 @@ impl VmBackend for LimaBackend {
 
     fn destroy_instance(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
+        crate::model_apply::cancel(inst)?;
+        crate::proxy::stop_checked(inst)?;
         let _selection = crate::github_assignment::lock_selection(inst)?;
         crate::web_editor::stop(inst)?;
         crate::lima::destroy(inst)?;
@@ -2033,6 +2049,14 @@ pub(crate) struct CredentialForwardingPolicy {
     openai_proxy_active: bool,
     codex_account_auth: bool,
     network: crate::config::FirecrackerNetworkMode,
+    selected: SelectedAgents,
+}
+
+#[derive(Clone, Copy)]
+struct SelectedAgents {
+    claude: bool,
+    codex: bool,
+    grok: bool,
 }
 
 impl CredentialForwardingPolicy {
@@ -2047,7 +2071,22 @@ impl CredentialForwardingPolicy {
             openai_proxy_active,
             codex_account_auth: cfg.codex.auth.uses_chatgpt_account(),
             network,
+            selected: SelectedAgents {
+                claude: true,
+                codex: true,
+                grok: true,
+            },
         }
+    }
+
+    pub(crate) fn with_agents(mut self, agents: &crate::agents::AgentSet) -> Self {
+        use crate::agents::AgentId;
+        self.selected = SelectedAgents {
+            claude: agents.contains(AgentId::Claude),
+            codex: agents.contains(AgentId::Codex),
+            grok: agents.contains(AgentId::Grok),
+        };
+        self
     }
 
     pub(crate) fn suppression_reason(
@@ -2093,28 +2132,33 @@ fn populate_builtin_credentials(
     policy: CredentialForwardingPolicy,
     env: &mut EnvForward,
 ) -> Result<()> {
-    if policy
-        .suppression_reason("ANTHROPIC_API_KEY", ForwardingSource::Configured)
-        .is_some()
-    {
-        tracing::debug!("proxy mode: not forwarding ANTHROPIC_API_KEY into the guest");
-    } else if let Some(key) = &cfg.claude.api_key {
-        let resolved = crate::config::resolve_cmd_value(key.expose())
-            .context("Failed to resolve claude.api_key")?;
-        env.set("ANTHROPIC_API_KEY", resolved)?;
-    } else if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        env.set("ANTHROPIC_API_KEY", key)?;
+    if policy.selected.claude {
+        if policy
+            .suppression_reason("ANTHROPIC_API_KEY", ForwardingSource::Configured)
+            .is_some()
+        {
+            tracing::debug!("proxy mode: not forwarding ANTHROPIC_API_KEY into the guest");
+        } else if let Some(key) = &cfg.claude.api_key {
+            let resolved = crate::config::resolve_cmd_value(key.expose())
+                .context("Failed to resolve claude.api_key")?;
+            env.set("ANTHROPIC_API_KEY", resolved)?;
+        } else if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            env.set("ANTHROPIC_API_KEY", key)?;
+        }
     }
 
-    if let Some(reason) = policy.suppression_reason("OPENAI_API_KEY", ForwardingSource::Configured)
-    {
-        tracing::debug!("{}: not forwarding OPENAI_API_KEY into the guest", reason);
-    } else if let Some(key) = &cfg.codex.api_key {
-        let resolved = crate::config::resolve_cmd_value(key.expose())
-            .context("Failed to resolve codex.api_key")?;
-        env.set("OPENAI_API_KEY", resolved)?;
-    } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        env.set("OPENAI_API_KEY", key)?;
+    if policy.selected.codex {
+        if let Some(reason) =
+            policy.suppression_reason("OPENAI_API_KEY", ForwardingSource::Configured)
+        {
+            tracing::debug!("{}: not forwarding OPENAI_API_KEY into the guest", reason);
+        } else if let Some(key) = &cfg.codex.api_key {
+            let resolved = crate::config::resolve_cmd_value(key.expose())
+                .context("Failed to resolve codex.api_key")?;
+            env.set("OPENAI_API_KEY", resolved)?;
+        } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            env.set("OPENAI_API_KEY", key)?;
+        }
     }
 
     if policy
@@ -2124,12 +2168,14 @@ fn populate_builtin_credentials(
         tracing::debug!("isolated network mode: not resolving or forwarding XAI_API_KEY");
         tracing::debug!("isolated network mode: not resolving or forwarding GITHUB_TOKEN");
     } else {
-        if let Some(key) = &cfg.grok.api_key {
-            let resolved = crate::config::resolve_cmd_value(key.expose())
-                .context("Failed to resolve grok.api_key")?;
-            env.set("XAI_API_KEY", resolved)?;
-        } else if let Ok(key) = std::env::var("XAI_API_KEY") {
-            env.set("XAI_API_KEY", key)?;
+        if policy.selected.grok {
+            if let Some(key) = &cfg.grok.api_key {
+                let resolved = crate::config::resolve_cmd_value(key.expose())
+                    .context("Failed to resolve grok.api_key")?;
+                env.set("XAI_API_KEY", resolved)?;
+            } else if let Ok(key) = std::env::var("XAI_API_KEY") {
+                env.set("XAI_API_KEY", key)?;
+            }
         }
         if let Some(token) =
             resolve_github_token(cfg.github.as_ref(), selection, &HostGitHubTokenSources)?
@@ -2156,12 +2202,17 @@ pub(crate) fn prepare_env_forwarding_for_network(
     // User-specified env_forward vars from process environment, plus
     // host names referenced by Grok stdio MCP `env` mappings (those
     // become `${NAME}` in the guest config and must exist there).
-    let grok_mcp_env_names = grok.stdio_env_host_names();
+    let grok_mcp_env_names = if policy.selected.grok {
+        grok.stdio_env_host_names()
+    } else {
+        Vec::new()
+    };
     for name in claude
         .env_forward
         .iter()
-        .chain(codex.env_forward.iter())
-        .chain(grok.env_forward.iter())
+        .filter(|_| policy.selected.claude)
+        .chain(codex.env_forward.iter().filter(|_| policy.selected.codex))
+        .chain(grok.env_forward.iter().filter(|_| policy.selected.grok))
         .chain(grok_mcp_env_names.iter())
     {
         if let Some(reason) = policy.suppression_reason(name.as_str(), ForwardingSource::Configured)
@@ -2229,9 +2280,18 @@ pub fn bootstrap_agents(
         setup_github_auth(session)?;
     }
 
-    bootstrap_claude(session, cfg, inst, mode, guest_host)?;
-    bootstrap_codex(session, cfg, inst, mode, guest_host)?;
-    bootstrap_grok(session, cfg, inst, mode, inst.firecracker_network())?;
+    let agents = inst.agents()?;
+    for agent in agents.iter() {
+        match agent {
+            crate::agents::AgentId::Claude => {
+                bootstrap_claude(session, cfg, inst, mode, guest_host)?;
+            }
+            crate::agents::AgentId::Codex => bootstrap_codex(session, cfg, inst, mode, guest_host)?,
+            crate::agents::AgentId::Grok => {
+                bootstrap_grok(session, cfg, inst, mode, inst.firecracker_network())?;
+            }
+        }
+    }
 
     Ok(())
 }
@@ -2257,7 +2317,7 @@ fn bootstrap_claude(
     guest_host: &str,
 ) -> Result<()> {
     let claude = &cfg.claude;
-    let claude_bin = persisted_guest_user(cfg, &inst.image).claude_bin();
+    let claude_bin = persisted_instance_guest_user(cfg, inst)?.claude_bin();
 
     if let BootMode::FirstBoot = mode {
         let needs_claude_cli = !claude.marketplaces.is_empty()
@@ -2316,7 +2376,8 @@ fn bootstrap_claude(
         if let BootMode::FirstBoot = mode {
             // Compute delta: only install marketplaces/plugins not already
             // baked into the golden image
-            let (missing_marketplaces, missing_plugins) = compute_plugin_delta(cfg, &inst.image);
+            let (missing_marketplaces, missing_plugins) =
+                compute_plugin_delta_for_instance(cfg, inst);
 
             if !missing_marketplaces.is_empty() {
                 install_marketplaces(session, &claude_bin, &missing_marketplaces)?;
@@ -2335,7 +2396,8 @@ fn bootstrap_claude(
         Ok(())
     })();
     if result.is_err() && proxy.is_some() {
-        crate::proxy::stop_provider(inst, crate::proxy::Provider::Anthropic);
+        crate::proxy::stop_provider_checked(inst, crate::proxy::Provider::Anthropic)
+            .context("Claude bootstrap failed and proxy cleanup is incomplete")?;
     }
     result
 }
@@ -2459,7 +2521,7 @@ fn bootstrap_codex(
         if let BootMode::FirstBoot = mode {
             let codex_bin = crate::guest::codex_bin();
             let (missing_marketplaces, missing_plugins) =
-                compute_codex_plugin_delta(cfg, &inst.image);
+                compute_codex_plugin_delta_for_instance(cfg, inst);
 
             if !missing_marketplaces.is_empty() {
                 install_codex_marketplaces(session, &codex_bin, &missing_marketplaces)?;
@@ -2478,7 +2540,8 @@ fn bootstrap_codex(
         Ok(())
     })();
     if result.is_err() && proxy.is_some() {
-        crate::proxy::stop_provider(inst, crate::proxy::Provider::Openai);
+        crate::proxy::stop_provider_checked(inst, crate::proxy::Provider::Openai)
+            .context("Codex bootstrap failed and proxy cleanup is incomplete")?;
     }
     result
 }
@@ -2497,7 +2560,7 @@ fn bootstrap_grok(
     network: crate::config::FirecrackerNetworkMode,
 ) -> Result<()> {
     let grok = &cfg.grok;
-    let grok_bin = persisted_guest_user(cfg, &inst.image).grok_bin();
+    let grok_bin = persisted_instance_guest_user(cfg, inst)?.grok_bin();
 
     if let BootMode::FirstBoot = mode {
         let needs_grok_cli = !grok.marketplaces.is_empty()
@@ -2523,7 +2586,8 @@ fn bootstrap_grok(
     write_workspace_folder_trust(&session.target)?;
 
     if let BootMode::FirstBoot = mode {
-        let (missing_marketplaces, missing_plugins) = compute_grok_plugin_delta(cfg, &inst.image);
+        let (missing_marketplaces, missing_plugins) =
+            compute_grok_plugin_delta_for_instance(cfg, inst);
 
         if !missing_marketplaces.is_empty() {
             install_grok_marketplaces(session, &grok_bin, &missing_marketplaces)?;
@@ -2656,6 +2720,15 @@ pub fn persisted_guest_user(cfg: &CoopConfig, image: &ImageName) -> crate::guest
         .unwrap_or_default()
 }
 
+/// The instance snapshot pins the guest identity to the copied disk. Legacy
+/// instances retain the historical source-image lookup and fallback.
+pub fn persisted_instance_guest_user(
+    cfg: &CoopConfig,
+    inst: &Instance,
+) -> Result<crate::guest::GuestUser> {
+    inst.source_guest_user(cfg)
+}
+
 /// Pure core of the `FirstBoot` install delta: the wanted marketplaces and
 /// plugins that are not already baked into the golden image. A missing
 /// baked list (legacy/orphaned image) is passed as an empty slice, so the
@@ -2724,29 +2797,92 @@ fn compute_grok_plugin_delta(cfg: &CoopConfig, image: &ImageName) -> (Vec<String
     )
 }
 
+fn compute_plugin_delta_for_instance(
+    cfg: &CoopConfig,
+    inst: &Instance,
+) -> (Vec<String>, Vec<String>) {
+    let (baked_m, baked_p) = inst
+        .source_template(cfg)
+        .ok()
+        .map(|tc| (tc.marketplaces, tc.plugins))
+        .unwrap_or_default();
+    plugin_delta(
+        &cfg.claude.marketplaces,
+        &cfg.claude.plugins,
+        &baked_m,
+        &baked_p,
+    )
+}
+
+fn compute_codex_plugin_delta_for_instance(
+    cfg: &CoopConfig,
+    inst: &Instance,
+) -> (Vec<String>, Vec<String>) {
+    let (baked_m, baked_p) = inst
+        .source_template(cfg)
+        .ok()
+        .map(|tc| (tc.codex_marketplaces, tc.codex_plugins))
+        .unwrap_or_default();
+    plugin_delta(
+        &cfg.codex.marketplaces,
+        &cfg.codex.plugins,
+        &baked_m,
+        &baked_p,
+    )
+}
+
+fn compute_grok_plugin_delta_for_instance(
+    cfg: &CoopConfig,
+    inst: &Instance,
+) -> (Vec<String>, Vec<String>) {
+    let (baked_m, baked_p) = inst
+        .source_template(cfg)
+        .ok()
+        .map(|tc| (tc.grok_marketplaces, tc.grok_plugins))
+        .unwrap_or_default();
+    plugin_delta(
+        &cfg.grok.marketplaces,
+        &cfg.grok.plugins,
+        &baked_m,
+        &baked_p,
+    )
+}
+
 /// Reject first-boot agent work that would require guest IP egress before an
 /// isolated Firecracker VM is started. Prepared images and local marketplace
 /// directories remain usable; pending remote installs fail with recovery
 /// guidance instead of hanging in a guest that has no network device.
+#[cfg(test)]
 pub(crate) fn preflight_isolated_first_boot(cfg: &CoopConfig, image: &ImageName) -> Result<()> {
+    preflight_isolated_first_boot_for_agents(cfg, image, &crate::agents::AgentSet::default())
+}
+
+pub(crate) fn preflight_isolated_first_boot_for_agents(
+    cfg: &CoopConfig,
+    image: &ImageName,
+    agents: &crate::agents::AgentSet,
+) -> Result<()> {
     let tool_deltas = [
         (
-            "Claude",
+            crate::agents::AgentId::Claude,
             compute_plugin_delta(cfg, image),
             &cfg.claude.marketplaces,
         ),
         (
-            "Codex",
+            crate::agents::AgentId::Codex,
             compute_codex_plugin_delta(cfg, image),
             &cfg.codex.marketplaces,
         ),
         (
-            "Grok Build",
+            crate::agents::AgentId::Grok,
             compute_grok_plugin_delta(cfg, image),
             &cfg.grok.marketplaces,
         ),
     ];
     for (tool, (marketplaces, plugins), configured_marketplaces) in tool_deltas {
+        if !agents.contains(tool) {
+            continue;
+        }
         let remote_marketplace = marketplaces
             .iter()
             .any(|entry| !Path::new(entry).is_absolute());
@@ -2757,9 +2893,10 @@ pub(crate) fn preflight_isolated_first_boot(cfg: &CoopConfig, image: &ImageName)
                     .any(|entry| !Path::new(entry).is_absolute()));
         if remote_marketplace || plugin_needs_remote_source {
             bail!(
-                "{tool} has pending remote marketplace/plugin installation, which is unavailable \
+                "{} has pending remote marketplace/plugin installation, which is unavailable \
                  in isolated network mode. Prepare the image while networking is open, use a \
-                 local absolute-path marketplace, or switch the stopped VM to open networking"
+                 local absolute-path marketplace, or switch the stopped VM to open networking",
+                tool.display(),
             );
         }
     }
@@ -3857,7 +3994,7 @@ fn start_agent_proxy(
         // Not in proxy mode for this provider: ensure no proxy from a previous
         // boot (e.g. before a switch to local mode, or after the config was
         // removed) keeps running against this instance.
-        crate::proxy::stop_provider(inst, provider);
+        crate::proxy::stop_provider_checked(inst, provider)?;
         return Ok(None);
     };
     Ok(Some(crate::proxy::start_provider(
@@ -5028,6 +5165,7 @@ mod tests {
             firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
+        inst.save().unwrap();
         let cfg = CoopConfig::default();
         let backend = FirecrackerBackend::new();
         let target = backend.ssh_target(&cfg, &inst).unwrap();
@@ -5179,7 +5317,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn persisted_firecracker_control_mode_selects_one_transport_without_fallback() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let cfg = CoopConfig {
             data_dir: crate::config::ConfigPath::new(root.path()),
             ..CoopConfig::default()
@@ -5191,6 +5329,8 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             image: ImageName::new("default").unwrap(),
             firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
+        crate::fs_util::private_dir(&inst.dir).unwrap();
+        inst.save().unwrap();
 
         let tcp = firecracker_ssh_target(&cfg, &inst).unwrap();
         assert_eq!(tcp.connection_description(), "172.16.0.2:22");
@@ -5529,6 +5669,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let opts = SetupOptions {
             skip_confirm: true,
             rebuild: false,
+            agents: None,
             profiles: Vec::new(),
             extra_packages: vec!["ripgrep".to_string()],
             post_install: Some(root.path().join("setup.sh")),
@@ -8289,6 +8430,45 @@ url = "https://example.com/m"
         assert!(
             forwarded.contains("ANTHROPIC_API_KEY"),
             "non-proxy mode should still forward the configured key"
+        );
+    }
+
+    #[test]
+    fn absent_agents_never_resolve_builtin_credential_commands() {
+        use crate::agents::{AgentId, AgentSet};
+
+        let mut cfg = CoopConfig {
+            github: None,
+            ..CoopConfig::default()
+        };
+        cfg.claude.api_key = Some(crate::config::Secret::new("cmd:exit 23".to_string()));
+        cfg.grok.api_key = Some(crate::config::Secret::new("cmd:exit 23".to_string()));
+        let codex = AgentSet::new(vec![AgentId::Codex]).unwrap();
+        let policy = CredentialForwardingPolicy::new(
+            &cfg,
+            false,
+            false,
+            crate::config::FirecrackerNetworkMode::Open,
+        )
+        .with_agents(&codex);
+        let env = prepare_env_forwarding_for_network(
+            &cfg,
+            &crate::github_assignment::GitHubSelection::Off,
+            policy,
+        )
+        .unwrap();
+        assert!(!env.contains("ANTHROPIC_API_KEY"));
+        assert!(!env.contains("XAI_API_KEY"));
+
+        cfg.codex.api_key = Some(crate::config::Secret::new("cmd:exit 23".to_string()));
+        assert!(
+            prepare_env_forwarding_for_network(
+                &cfg,
+                &crate::github_assignment::GitHubSelection::Off,
+                policy,
+            )
+            .is_err(),
+            "the installed agent's resolver must still run and fail"
         );
     }
 

@@ -210,6 +210,7 @@ pub(crate) fn cmd_images(
                     .config
                     .as_ref()
                     .map_or(&[][..], |c| c.profiles.as_slice()),
+                agents: img.config.as_ref().map(|c| &c.agents),
                 created: img.config.as_ref().map(|c| c.created.as_str()),
                 size_bytes: dir_size_bytes(&img.dir),
             })
@@ -237,10 +238,15 @@ pub(crate) fn cmd_images(
             .as_ref()
             .map_or("unknown", |c| c.created.as_str());
         let size = format_dir_size(dir_size_bytes(&img.dir));
+        let agents = img
+            .config
+            .as_ref()
+            .map_or_else(|| "unknown".to_string(), |c| c.agents.names());
         writeln!(
             std::io::stdout(),
-            "{:<20} profiles: {:<30} created: {:<24} size: {}",
+            "{:<20} agents: {:<20} profiles: {:<30} created: {:<24} size: {}",
             img.name,
+            agents,
             profiles,
             created,
             size,

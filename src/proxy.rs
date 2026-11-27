@@ -30,7 +30,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::backend::SshTarget;
 use crate::codex_token::CodexTokenMetadata;
@@ -210,8 +210,15 @@ fn start_provider_with(
     launch_tunnel: impl FnOnce(u16) -> Result<()>,
 ) -> Result<ProxyHandle> {
     ensure_auth_supported(provider, upstream.auth)?;
-    // A failed replacement must not leave the previous credential usable.
-    stop_provider(inst, provider);
+    {
+        let _transition = lock_transition(inst)?;
+        crate::model_apply::ensure_transition_current(inst)?;
+        // Remove an old credential before resolving a replacement. A failing
+        // resolver must not leave the previous credential available to the guest.
+        stop_provider_unlocked(inst, provider)?;
+    }
+    // A cmd: resolver may be interactive. Keep it outside the short proxy
+    // transition lock so a concurrent stop can cancel and clean up.
     let credential = resolve_cmd_value(upstream.credential.expose()).with_context(|| {
         format!(
             "Failed to resolve the {} proxy credential — aborting VM start (fail-closed); \
@@ -241,6 +248,11 @@ fn start_provider_with(
         metadata.as_ref(),
     )?;
 
+    let _transition = lock_transition(inst)?;
+    crate::model_apply::ensure_transition_current(inst)?;
+    // A failed replacement must not leave the previous credential usable.
+    stop_provider_unlocked(inst, provider)?;
+
     launch_proxy(listen, &json)?;
     // Persist the capability token for providers that forward it via env on
     // later sessions (Codex); Claude reads its token from the returned handle
@@ -249,14 +261,18 @@ fn start_provider_with(
     if provider.persists_token()
         && let Err(e) = write_token_file(inst, provider, &token)
     {
-        stop_provider(inst, provider);
-        return Err(e);
+        return Err(e).context(stop_provider_unlocked(inst, provider).err().map_or_else(
+            || "Proxy startup rolled back".to_string(),
+            |cleanup| format!("Proxy startup rollback is incomplete: {cleanup:#}"),
+        ));
     }
     // Expose the loopback proxy into the guest. If the tunnel fails, tear the
     // proxy back down so we don't leave it orphaned (fail closed).
     if let Err(e) = launch_tunnel(port) {
-        stop_provider(inst, provider);
-        return Err(e);
+        return Err(e).context(stop_provider_unlocked(inst, provider).err().map_or_else(
+            || "Proxy startup rolled back".to_string(),
+            |cleanup| format!("Proxy startup rollback is incomplete: {cleanup:#}"),
+        ));
     }
     tracing::info!(
         "Started {} credential proxy on {listen} (guest → 127.0.0.1:{port})",
@@ -271,25 +287,67 @@ fn start_provider_with(
 
 /// Tear down the proxy process, tunnel, and token file for one `provider`.
 /// Best-effort, safe to call when none were started.
+#[cfg(test)]
 pub fn stop_provider(inst: &Instance, provider: Provider) {
-    let name = provider.name();
-    kill_pid_file(&pid_path(inst, name), "proxy");
-    kill_pid_file(&fwd_pid_path(inst, name), "proxy tunnel");
-    let token = token_path(inst, name);
-    if token.exists()
-        && let Err(e) = fs::remove_file(&token)
-    {
-        tracing::debug!(
-            "Failed to remove proxy token file {} (non-fatal): {e}",
-            token.display()
+    if let Err(error) = stop_provider_checked(inst, provider) {
+        tracing::warn!(
+            "Could not confirm {} proxy teardown for '{}': {error:#}",
+            provider.name(),
+            inst.name
         );
     }
 }
 
-/// Tear down every provider's proxy for `inst` (stop/destroy). Best-effort.
-pub fn stop(inst: &Instance) {
+pub fn stop_provider_checked(inst: &Instance, provider: Provider) -> Result<()> {
+    let _transition = lock_transition(inst)?;
+    crate::model_apply::ensure_transition_current(inst)?;
+    stop_provider_unlocked(inst, provider)
+}
+
+fn lock_transition(inst: &Instance) -> Result<crate::fs_util::FileLock> {
+    crate::fs_util::lock_sibling_bounded(
+        &inst.dir.join("proxy-transition"),
+        std::time::Duration::from_secs(30),
+    )
+}
+
+fn stop_provider_unlocked(inst: &Instance, provider: Provider) -> Result<()> {
+    let name = provider.name();
+    let proxy = stop_pid_file_checked(&pid_path(inst, name), "proxy");
+    let tunnel = stop_pid_file_checked(&fwd_pid_path(inst, name), "proxy tunnel");
+    if let Err(error) = proxy {
+        if let Err(other) = tunnel {
+            bail!("{error:#}; {other:#}");
+        }
+        return Err(error);
+    }
+    tunnel?;
+    let token = token_path(inst, name);
+    match fs::remove_file(&token) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to remove {}", token.display()));
+        }
+    }
+    Ok(())
+}
+
+pub fn stop_checked(inst: &Instance) -> Result<()> {
+    let mut errors = Vec::new();
     for provider in Provider::ALL {
-        stop_provider(inst, provider);
+        if let Err(error) = stop_provider_checked(inst, provider) {
+            errors.push(format!("{}: {error:#}", provider.name()));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "Credential proxy cleanup is incomplete for VM '{}': {}. Inspect the recorded host processes and retry",
+            inst.name,
+            errors.join("; ")
+        )
     }
 }
 
@@ -372,35 +430,227 @@ fn ensure_proxy_protocol(address: SocketAddr, provider: Provider) -> Result<()> 
 }
 
 fn ensure_pid_file_live(path: &Path, label: &str) -> Result<()> {
-    let contents = fs::read_to_string(path)
+    let record = read_process_record(path)?
         .with_context(|| format!("{label} state is missing at {}", path.display()))?;
-    let pid = contents
-        .trim()
-        .parse::<i32>()
-        .with_context(|| format!("{label} state is malformed at {}", path.display()))?;
+    let (pid, expected_start) = match record {
+        ProcessRecord::Managed(record) => (record.pid, Some(record.start_identity)),
+        ProcessRecord::Legacy(pid) => (pid, None),
+    };
     anyhow::ensure!(
         pid > 0,
         "{label} state has an invalid PID at {}",
         path.display()
     );
-    // SAFETY: signal 0 performs a liveness/permission probe without changing
-    // the parsed positive process ID's state.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return Ok(());
+    let observed = process_start_identity(pid)?;
+    anyhow::ensure!(observed.is_some(), "{label} process {pid} is not running");
+    if let Some(expected) = expected_start {
+        anyhow::ensure!(
+            observed == Some(expected),
+            "{label} process {pid} no longer matches its recorded start identity"
+        );
     }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::EPERM) {
-        return Ok(());
-    }
-    Err(error).with_context(|| format!("{label} process {pid} is not running"))
+    Ok(())
 }
 
 // ── process supervision ──────────────────────────────────────
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ManagedProcessRecord {
+    pid: i32,
+    start_identity: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ProcessRecord {
+    Managed(ManagedProcessRecord),
+    Legacy(i32),
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_identity(pid: i32) -> Result<Option<u64>> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = match fs::read_to_string(&path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("Failed to read {path}")),
+    };
+    // The comm field is parenthesized and may itself contain spaces or ')'.
+    let (_, tail) = stat
+        .rsplit_once(") ")
+        .context("Malformed /proc process stat")?;
+    let mut fields = tail.split_whitespace();
+    if fields.next() == Some("Z") {
+        return Ok(None);
+    }
+    let start = tail
+        .split_whitespace()
+        .nth(19)
+        .context("Missing process start time")?;
+    Ok(Some(start.parse().context("Malformed process start time")?))
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_identity(pid: i32) -> Result<Option<u64>> {
+    use std::mem::{MaybeUninit, size_of};
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = i32::try_from(size_of::<libc::proc_bsdinfo>())?;
+    // SAFETY: info points to a writable proc_bsdinfo buffer of exactly size bytes.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read == 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(error).context("Could not inspect process identity");
+    }
+    anyhow::ensure!(read == size, "Incomplete process identity record");
+    // SAFETY: proc_pidinfo wrote the complete struct (read == size).
+    let info = unsafe { info.assume_init() };
+    if info.pbi_status == libc::SZOMB {
+        return Ok(None);
+    }
+    Ok(Some((info.pbi_start_tvsec << 20) | info.pbi_start_tvusec))
+}
+
+fn write_process_record(path: &Path, pid: u32) -> Result<()> {
+    let pid = i32::try_from(pid)?;
+    let start_identity =
+        process_start_identity(pid)?.context("New process exited before recording its identity")?;
+    let json = serde_json::to_string(&ManagedProcessRecord {
+        pid,
+        start_identity,
+    })?;
+    crate::fs_util::atomic_write_json(path, &json)
+}
+
+fn read_process_record(path: &Path) -> Result<Option<ProcessRecord>> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}", path.display()));
+        }
+    };
+    let record = serde_json::from_str::<ProcessRecord>(&content)
+        .with_context(|| format!("Malformed process record at {}", path.display()))?;
+    Ok(Some(record))
+}
+
+#[cfg(target_os = "linux")]
+fn signal_managed_process(pid: i32, start_identity: u64) -> Result<()> {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+
+    // Pin the process before checking identity. A PID reused after the check
+    // cannot redirect pidfd_send_signal to a different process.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(error).context("Failed to pin managed process for teardown");
+    }
+    // SAFETY: pidfd_open returned a new owned file descriptor.
+    let fd = unsafe { OwnedFd::from_raw_fd(i32::try_from(raw)?) };
+    anyhow::ensure!(
+        process_start_identity(pid)? == Some(start_identity),
+        "Managed process PID {pid} changed identity before teardown"
+    );
+    let sent = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            std::os::fd::AsRawFd::as_raw_fd(&fd),
+            libc::SIGTERM,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if sent < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).context("Failed to signal pinned managed process");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn signal_managed_process(pid: i32, start_identity: u64) -> Result<()> {
+    anyhow::ensure!(
+        process_start_identity(pid)? == Some(start_identity),
+        "Managed process PID {pid} changed identity before teardown"
+    );
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).context("Failed to signal managed process");
+        }
+    }
+    Ok(())
+}
+
+fn stop_pid_file_checked(path: &Path, label: &str) -> Result<()> {
+    let Some(record) = read_process_record(path)? else {
+        return Ok(());
+    };
+    let (pid, recorded_start) = match record {
+        ProcessRecord::Managed(record) => (record.pid, Some(record.start_identity)),
+        ProcessRecord::Legacy(pid) => (pid, None),
+    };
+    anyhow::ensure!(pid > 0, "Invalid {label} PID in {}", path.display());
+    let observed = process_start_identity(pid)?;
+    if let Some(observed) = observed {
+        let Some(recorded_start) = recorded_start else {
+            bail!(
+                "Live legacy {label} PID {pid} at {} has no start identity; inspect the host process, terminate it only if it belongs to coop, then retry",
+                path.display()
+            );
+        };
+        anyhow::ensure!(
+            observed == recorded_start,
+            "{label} PID {pid} at {} now belongs to a different process; inspect the host before retrying",
+            path.display()
+        );
+        signal_managed_process(pid, recorded_start)?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            // Reap a direct child when this CLI still owns it; ECHILD is normal
+            // for processes from a previous invocation.
+            let mut status = 0;
+            // SAFETY: WNOHANG does not block and status is a valid output pointer.
+            unsafe {
+                libc::waitpid(pid, &raw mut status, libc::WNOHANG);
+            }
+            match process_start_identity(pid)? {
+                None => break,
+                Some(start) if start != recorded_start => break,
+                Some(_) if Instant::now() >= deadline => {
+                    bail!(
+                        "{label} PID {pid} did not exit after SIGTERM; record retained at {}",
+                        path.display()
+                    );
+                }
+                Some(_) => std::thread::sleep(Duration::from_millis(25)),
+            }
+        }
+    }
+    fs::remove_file(path)
+        .with_context(|| format!("Failed to remove {label} record {}", path.display()))
+}
+
 fn spawn_proxy(inst: &Instance, name: &str, listen: SocketAddr, json: &str) -> Result<()> {
     // A previous run may have crashed without stop cleanup; kill any leftover
     // before binding so we don't race it for the same port.
-    kill_pid_file(&pid_path(inst, name), "stale proxy");
+    stop_pid_file_checked(&pid_path(inst, name), "stale proxy")?;
 
     let bin = locate_proxy_binary()?;
     let log_path = inst.dir.join(format!("proxy-{name}.log"));
@@ -440,7 +690,7 @@ fn spawn_proxy(inst: &Instance, name: &str, listen: SocketAddr, json: &str) -> R
 
     let pid = child.id();
     let pid_path = pid_path(inst, name);
-    if let Err(e) = fs::write(&pid_path, pid.to_string()) {
+    if let Err(e) = write_process_record(&pid_path, pid) {
         // Without a pid file `stop_provider` can never reap this proxy, and the
         // std `Child` destructor does not kill it — so a running proxy holding
         // the real credential would be orphaned. Kill it before failing.
@@ -575,7 +825,7 @@ fn reverse_forward_request_args(
 /// target. An acknowledged forwarding request makes a bind clash on the guest
 /// a startup failure rather than a silently dead tunnel.
 fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: u16) -> Result<()> {
-    kill_pid_file(&fwd_pid_path(inst, name), "stale proxy tunnel");
+    stop_pid_file_checked(&fwd_pid_path(inst, name), "stale proxy tunnel")?;
 
     let control_dir = create_tunnel_control_dir()?;
     let control_path = control_dir.path().join("ssh.sock");
@@ -633,7 +883,7 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
         await_forwarding_ack(request, deadline)?;
 
         let path = fwd_pid_path(inst, name);
-        fs::write(&path, child.id().to_string())
+        write_process_record(&path, child.id())
             .with_context(|| format!("Failed to write proxy tunnel pid file {}", path.display()))?;
         Ok(())
     })();
@@ -708,21 +958,26 @@ fn await_forwarding_ack(mut request: std::process::Child, deadline: Instant) -> 
     result
 }
 
-/// SIGTERM the process named by a PID file and remove the file. Best-effort;
-/// safe when the file is absent or malformed.
+/// Test-only cleanup for a direct child after a forwarding assertion. Handle
+/// both managed and legacy records so a failed assertion cannot strand it.
+#[cfg(test)]
 fn kill_pid_file(path: &Path, label: &str) {
-    let Ok(contents) = fs::read_to_string(path) else {
+    let Ok(Some(record)) = read_process_record(path) else {
         return;
     };
-    match contents.trim().parse::<i32>() {
-        Ok(pid) if pid > 0 => {
+    let pid = match record {
+        ProcessRecord::Managed(record) => record.pid,
+        ProcessRecord::Legacy(pid) => pid,
+    };
+    match pid {
+        pid if pid > 0 => {
             // Safety: `kill` with a parsed positive pid and a constant signal.
             unsafe {
                 libc::kill(pid, libc::SIGTERM);
             }
             tracing::debug!("Sent SIGTERM to {label} (pid {pid})");
         }
-        _ => tracing::debug!("Ignoring malformed pid file {}", path.display()),
+        _ => tracing::debug!("Ignoring invalid pid file {}", path.display()),
     }
     if let Err(e) = fs::remove_file(path) {
         tracing::debug!(
@@ -1101,7 +1356,8 @@ mod tests {
                 .contains("Expected a Codex personal access token")
         );
         assert!(!format!("{error:#}").contains("sk-wrong-type"));
-        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
+        assert!(!pid_path(&inst, Provider::Openai.name()).exists());
+        assert!(!fwd_pid_path(&inst, Provider::Openai.name()).exists());
     }
 
     struct StaleProvider {
@@ -1118,7 +1374,7 @@ mod tests {
                 .iter()
                 .zip(&children)
             {
-                fs::write(path, child.id().to_string()).unwrap();
+                write_process_record(path, child.id()).unwrap();
             }
             write_token_file(inst, Provider::Openai, "stale-capability").unwrap();
             Self { children }
@@ -1134,9 +1390,19 @@ mod tests {
             }
             let deadline = Instant::now() + Duration::from_secs(5);
             for child in &mut self.children {
-                while child.try_wait().unwrap().is_none() {
-                    assert!(Instant::now() < deadline, "stale process still running");
-                    std::thread::sleep(Duration::from_millis(10));
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => break,
+                        Ok(None) => {
+                            assert!(Instant::now() < deadline, "stale process still running");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => {
+                            assert_eq!(error.raw_os_error(), Some(libc::ECHILD), "{error}");
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1416,10 +1682,10 @@ mod tests {
             "ambient SSH configuration added an unexpected remote forward"
         );
         let pid = forward_master_pid(&fixture);
-        assert_eq!(
-            fs::read_to_string(fwd_pid_path(&inst, "test")).unwrap(),
-            pid.to_string()
-        );
+        assert!(matches!(
+            read_process_record(&fwd_pid_path(&inst, "test")).unwrap(),
+            Some(ProcessRecord::Managed(record)) if record.pid == pid
+        ));
         assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
 
         // Send through the guest listener and receive at the host destination.
@@ -1504,6 +1770,53 @@ mod tests {
 
         stop_provider(&inst, Provider::Openai);
         assert_eq!(read_capability_token(&inst, Provider::Openai), None);
+    }
+
+    #[test]
+    fn live_legacy_pid_record_is_retained_until_owner_resolves_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut inst = inst_with_index(0);
+        inst.dir = tmp.path().to_path_buf();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let path = pid_path(&inst, "openai");
+        fs::write(&path, child.id().to_string()).unwrap();
+        write_token_file(&inst, Provider::Openai, "capability").unwrap();
+
+        let error = stop_provider_checked(&inst, Provider::Openai).unwrap_err();
+        assert!(error.to_string().contains("no start identity"));
+        assert!(path.exists());
+        assert!(token_path(&inst, "openai").exists());
+        assert!(child.try_wait().unwrap().is_none());
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        stop_provider_checked(&inst, Provider::Openai).unwrap();
+        assert!(!path.exists());
+        assert!(!token_path(&inst, "openai").exists());
+    }
+
+    #[test]
+    fn mismatched_managed_pid_record_never_signals_process() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut inst = inst_with_index(0);
+        inst.dir = tmp.path().to_path_buf();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let path = pid_path(&inst, "openai");
+        let identity = process_start_identity(i32::try_from(child.id()).unwrap())
+            .unwrap()
+            .unwrap();
+        let record = ManagedProcessRecord {
+            pid: i32::try_from(child.id()).unwrap(),
+            start_identity: identity + 1,
+        };
+        fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+
+        let error = stop_provider_checked(&inst, Provider::Openai).unwrap_err();
+        assert!(error.to_string().contains("different process"));
+        assert!(path.exists());
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]
