@@ -33,11 +33,16 @@ Once a directory has more than one instance, `coop up ./my-project` can no longe
 
 Instance names must satisfy all of the following:
 
-- 1 to 64 characters long
-- Does not start with `-`
-- Characters limited to `a-z`, `A-Z`, `0-9`, `-`, `_`
+- 1 to 58 characters long
+- ASCII letters (`a-z`, `A-Z`) and digits (`0-9`), with single `-` separators between alphanumeric runs
 
 Names that violate these rules are rejected when provided or loaded.
+Workspace and repository basenames are normalized to this form when coop
+generates a name. If a generated name is already in use, coop appends a
+collision suffix such as `-2`. This is a breaking change: saved instances with
+underscores, adjacent hyphens, trailing hyphens, or names longer than 58
+characters no longer load. Destroy those instances with the previous coop
+version before upgrading.
 
 ## Addressing instances
 

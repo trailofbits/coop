@@ -483,9 +483,9 @@ package stays in the user's home directory, with `/usr/local/bin/codex` linked
 to `~/.local/bin/codex` and `/usr/local/bin/codex-code-mode-host` linked to the
 same native release. The guest user can also run `codex update` directly
 without sudo.
-Claude Code and Grok Build already auto-update in the background;
-`coop agent update --agent claude` / `--agent grok` run `claude update` /
-`grok update` now, synchronously — a convenience rather than a fix.
+Claude Code and Grok Build support automatic updates, depending on their
+settings and whether they run. `coop agent update --agent claude` /
+`--agent grok` run `claude update` / `grok update` now, synchronously.
 
 ```
 coop agent update                                      # every agent, resolved instance
@@ -497,7 +497,8 @@ coop agent update --agent claude --agent grok          # Claude Code and Grok Bu
 ### `agent status`
 
 Report each selected agent's installed version and, for Codex, the latest
-release on GitHub. This command changes nothing.
+release on GitHub. This command changes nothing. For Claude Code and Grok
+Build, it does not check the latest version or whether automatic updates ran.
 
 ```
 coop agent status [NAME] [--agent <agent>]...
@@ -512,9 +513,9 @@ With no `--agent` selector, every agent is reported. The VM must be running.
 
 ```
 $ coop agent status my-project
-Claude Code  1.2.3            up to date (auto-updates in background)
+Claude Code  1.2.3            latest version not checked
 Codex        0.4.1 → 0.5.0    update available — run: coop agent update --agent codex
-Grok Build   1.0.24           up to date (auto-updates in background)
+Grok Build   1.0.24           latest version not checked
 ```
 
 ### `model`
