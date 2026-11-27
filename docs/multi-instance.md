@@ -83,15 +83,24 @@ another-project  n/a
 
 ### All instances
 
-`coop status` with no arguments lists every instance in a richer table, including image, backend, and resource usage for running instances:
+`coop status` shows running instances first, followed by stopped instances.
+Each group is sorted alphabetically by name.
 
 ```
 $ coop status
-my-project       running    default    lima       load=0.42 mem=50% disk=25%
-another-project  stopped    default    lima
+lima · 1 running · 1 stopped
+
+Running
+NAME        IMAGE    LOAD (1M)  MEM  DISK
+my-project  default       0.42  50%   25%
+
+Stopped
+NAME             IMAGE
+another-project  default
 ```
 
-Each row shows the instance name, state (`running` or `stopped`), the image it was created from, the backend (`firecracker` or `lima`), and a resource usage summary for running instances: 1-minute load average, memory percentage, and disk percentage.
+On Firecracker, both tables include the selected network mode. A dash in a
+running instance's resource columns indicates that usage is unavailable.
 
 ### Single instance
 
