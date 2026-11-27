@@ -302,6 +302,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "indexmap",
+ "landlock",
  "libc",
  "mutants",
  "percent-encoding",

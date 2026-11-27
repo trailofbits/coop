@@ -32,6 +32,7 @@ credentials on the host.
 - A root-owned `/var/lib/coop` installation area for the verified Firecracker
   and jailer pair; `coop setup` creates it with `sudo`
 - `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)
+- Linux 6.2 or newer with Landlock ABI v3 and seccomp for host filesystem-tool isolation
 - Setup also checks trusted system paths for `setfacl` and `unsquashfs`, plus resolved `ssh`, `scp`, and `rsync` clients. Automatic installation of missing tools requires a trusted system `apt-get`; on non-FHS hosts, configure exact OpenSSH/rsync paths under `[ssh.host_tools]`. See [backend prerequisites](backends.md#prerequisites-1).
 
 ## Install
