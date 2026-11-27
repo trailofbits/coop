@@ -86,7 +86,7 @@ Existing `COMPLETE=<shell>` setup continues to work; only one setup is needed. R
 
 | Argument | Source |
 |----------|--------|
-| Running instance name (`shell`, `claude`, `codex`, `push`, `pull`, `exec`, `agent update`) | Running VMs in `~/.coop/instances/` |
+| Running instance name (`shell`, `claude`, `codex`, `push`, `pull`, `exec`, `agent update`, `agent status`) | Running VMs in `~/.coop/instances/` |
 | Stopped instance name (`start`) | Stopped VMs in `~/.coop/instances/` |
 | Other VM arguments (`stop`, `destroy`, `status`, `logs`, `editor` including `--web`, `resize`, `model`, and management commands) | All registered VMs in `~/.coop/instances/` |
 | `--image` (`up`, `setup`, `start` compatibility flag), `images --delete` | `~/.coop/images/` |

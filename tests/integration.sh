@@ -679,7 +679,7 @@ test_setup() {
     echo "=== Phase: setup ==="
 
     local args=(setup -y)
-    # The full suite exercises `agent update --codex`; force the initial image
+    # The full suite exercises `agent update --agent codex`; force the initial image
     # build so that test cannot silently reuse a pre-fix local template.
     if [[ "$FULL" == "1" ]]; then
         args+=(--rebuild)
@@ -1271,12 +1271,15 @@ test_status_running() {
         fi
     fi
 
-    # Multi-instance list: compact summary with valid percentages
-    # Format: "load=X.XX mem=NN% disk=NN%"
+    # The final two columns of the running row are memory and disk usage.
     if coop status; then
-        local mem_pct disk_pct
-        mem_pct=$(echo "$HARNESS_OUT" | sed -n 's/.*mem=\([0-9][0-9]*\)%.*/\1/p' | head -1)
-        disk_pct=$(echo "$HARNESS_OUT" | sed -n 's/.*disk=\([0-9][0-9]*\)%.*/\1/p' | head -1)
+        local mem_pct="" disk_pct="" usage
+        usage=$(sed -n '/^Running$/,/^Stopped$/p' <<<"$HARNESS_OUT" |
+            awk -v name="$INSTANCE" 'NF >= 5 && ($1 "") == (name "") { print $(NF-1), $NF }')
+        if [[ "$usage" =~ ^([0-9]+)%[[:space:]]+([0-9]+)%$ ]]; then
+            mem_pct=${BASH_REMATCH[1]}
+            disk_pct=${BASH_REMATCH[2]}
+        fi
         if [[ -n "$mem_pct" && "$mem_pct" -le 100 && -n "$disk_pct" && "$disk_pct" -le 100 ]]; then
             pass "status list shows resource summary (mem=${mem_pct}% disk=${disk_pct}%)"
         else
@@ -1341,7 +1344,7 @@ test_auto_resolve_running() {
     # Skip if other instances exist (pre-existing state from outside test).
 
     local running_count
-    running_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -c "running" || true)
+    running_count=$(RUST_LOG=off "$BINARY" list --json 2>/dev/null | grep -c '"state": "running"' || true)
 
     if [[ "$running_count" -ne 1 ]]; then
         skip "shell auto-resolves single running instance" "$running_count running (need exactly 1)"
@@ -1617,14 +1620,57 @@ test_exec() {
         fail "exec captures stdout" "got: $output"
     fi
 
-    # Verify non-zero exit code propagates
-    local rc=0
-    coop_exec false || rc=$?
-    if [[ $rc -ne 0 ]]; then
-        pass "exec propagates non-zero exit code"
+    local stream_stdout="$tmpdir/exec-stream-stdout"
+    local stream_done="$tmpdir/exec-stream-done"
+    : >"$tmpdir/guest_stderr"
+    (
+        local stream_rc=0
+        coop_exec sh -c \
+            'printf "stdout-before-exit\n"; printf "stderr-before-exit\n" >&2; sleep 5' \
+            >"$stream_stdout" || stream_rc=$?
+        printf '%s\n' "$stream_rc" >"$stream_done"
+    ) &
+    local stream_pid=$!
+    local streamed=0
+    local attempt
+    for attempt in {1..40}; do
+        if grep -qF "stdout-before-exit" "$stream_stdout" \
+                && grep -qF "stderr-before-exit" "$tmpdir/guest_stderr" \
+                && [[ ! -e "$stream_done" ]]; then
+            streamed=1
+            break
+        fi
+        sleep 0.1
+    done
+    local stream_status=0
+    wait "$stream_pid" || stream_status=$?
+    if [[ "$streamed" -eq 1 && "$stream_status" -eq 0 && -f "$stream_done" && "$(cat "$stream_done")" == 0 ]]; then
+        pass "exec streams stdout and stderr before guest exit"
     else
-        fail "exec propagates non-zero exit code" "expected non-zero, got 0"
+        fail "exec streams stdout and stderr before guest exit" \
+            "stdout: $(cat "$stream_stdout"); stderr: $(guest_stderr)"
     fi
+
+    if output=$(printf 'must-not-reach-guest\n' | coop_exec cat); then
+        if [[ -z "$output" ]]; then
+            pass "exec closes stdin"
+        else
+            fail "exec closes stdin" "guest received: $output"
+        fi
+    else
+        fail "exec closes stdin" "stderr: $(guest_stderr)"
+    fi
+
+    local runner rc
+    for runner in coop_exec guest_exec; do
+        rc=0
+        "$runner" sh -c 'exit 42' || rc=$?
+        if [[ $rc -eq 42 ]]; then
+            pass "$runner preserves guest exit status"
+        else
+            fail "$runner preserves guest exit status" "expected 42, got $rc"
+        fi
+    done
 }
 
 test_claude_bin_path() {
@@ -2458,7 +2504,7 @@ check_codex_self_update() {
 }
 
 # `coop agent update` refreshes the in-guest agent binaries (issue #402).
-# `--check` is cheap and network-tolerant (the Codex latest-version lookup
+# `agent status` is cheap and network-tolerant (the Codex latest-version lookup
 # degrades to "unknown" on failure, so the command still exits 0). The actual
 # Codex reinstall downloads the release inside the guest, so it is gated behind
 # --full.
@@ -2466,16 +2512,16 @@ test_agent_update() {
     echo ""
     echo "=== Phase: agent update ==="
 
-    if coop agent update "$INSTANCE" --check; then
+    if coop agent status "$INSTANCE"; then
         if echo "$HARNESS_OUT" | grep -q "Claude Code" \
             && echo "$HARNESS_OUT" | grep -q "Codex" \
             && echo "$HARNESS_OUT" | grep -q "Grok Build"; then
-            pass "agent update --check reports all agents"
+            pass "agent status reports all agents"
         else
-            fail "agent update --check reports all agents" "out: $HARNESS_OUT"
+            fail "agent status reports all agents" "out: $HARNESS_OUT"
         fi
     else
-        fail "agent update --check exits 0" "exit: $? stderr: $HARNESS_ERR"
+        fail "agent status exits 0" "exit: $? stderr: $HARNESS_ERR"
     fi
 
     if [[ "$FULL" == "1" ]]; then
@@ -2484,10 +2530,10 @@ test_agent_update() {
             return
         fi
 
-        if coop agent update "$INSTANCE" --codex -y; then
-            pass "agent update --codex exits 0"
+        if coop agent update "$INSTANCE" --agent codex; then
+            pass "agent update --agent codex exits 0"
         else
-            fail "agent update --codex exits 0" "exit: $? stderr: $HARNESS_ERR"
+            fail "agent update --agent codex exits 0" "exit: $? stderr: $HARNESS_ERR"
         fi
 
         # The reinstall must leave an executable, correctly versioned binary.
@@ -2531,25 +2577,25 @@ test_agent_update() {
         # shellcheck disable=SC2016 # Expand HOME in the guest.
         guest_exec sh -c 'rm -f "$HOME/.codex/coop-update-config.expected"'
     else
-        skip "agent update --codex" "use --full; downloads the release in-guest"
+        skip "agent update --agent codex" "use --full; downloads the release in-guest"
     fi
 }
 
-# `coop agent update` requires a running VM; against a stopped instance it must
+# `coop agent status` requires a running VM; against a stopped instance it must
 # fail with the shared "not running" guidance and a non-zero exit (issue #402).
-test_agent_update_stopped() {
+test_agent_status_stopped() {
     echo ""
-    echo "=== Phase: agent update (stopped instance) ==="
+    echo "=== Phase: agent status (stopped instance) ==="
 
-    if coop_fails agent update "$INSTANCE" --check; then
+    if coop_fails agent status "$INSTANCE"; then
         if echo "$HARNESS_ERR" | grep -qi "not running"; then
-            pass "agent update on a stopped instance fails with 'not running'"
+            pass "agent status on a stopped instance fails with 'not running'"
         else
-            fail "agent update on a stopped instance fails with 'not running'" \
+            fail "agent status on a stopped instance fails with 'not running'" \
                 "stderr: $HARNESS_ERR"
         fi
     else
-        fail "agent update on a stopped instance exits non-zero" "out: $HARNESS_OUT"
+        fail "agent status on a stopped instance exits non-zero" "out: $HARNESS_OUT"
     fi
 }
 
@@ -4117,7 +4163,7 @@ PYEOF
     else
         fail "stopped legacy fixture has root-owned mode-0755 sockets and no PID"
     fi
-    if coop status && grep -qE "^${INSTANCE}[[:space:]]+stopped" <<<"$HARNESS_OUT"; then
+    if coop status && sed -n '/^Stopped$/,$p' <<<"$HARNESS_OUT" | grep -E "^${INSTANCE}[[:space:]]" >/dev/null; then
         pass "bare status reports old stopped VM with stale sockets"
     else
         fail "bare status reports old stopped VM with stale sockets" \
@@ -4393,7 +4439,7 @@ test_auto_resolve_stopped() {
     # Skip if other instances are running (pre-existing state).
 
     local running_count
-    running_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -c "running" || true)
+    running_count=$(RUST_LOG=off "$BINARY" list --json 2>/dev/null | grep -c '"state": "running"' || true)
 
     if [[ "$running_count" -gt 0 ]]; then
         skip "shell rejects when only stopped instances exist" "$running_count still running"
@@ -4446,7 +4492,7 @@ test_list_empty() {
     # Assert what this phase actually owns: the just-destroyed `$INSTANCE`
     # is gone. The empty-state message is only asserted on a clean host.
     local instance_count
-    instance_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -cE "running|stopped" || true)
+    instance_count=$(RUST_LOG=off "$BINARY" list --json 2>/dev/null | grep -cE '"state": "(running|stopped)"' || true)
 
     if [[ "$instance_count" -gt 0 ]]; then
         if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} "; then
@@ -4487,7 +4533,7 @@ test_status_stopped() {
             fail "stopped instance appears in status list" "got: $HARNESS_OUT"
         fi
 
-        if echo "$HARNESS_OUT" | grep "$INSTANCE" | grep -qi "stopped"; then
+        if sed -n '/^Stopped$/,$p' <<<"$HARNESS_OUT" | grep -E "^${INSTANCE}[[:space:]]" >/dev/null; then
             pass "status list shows stopped state"
         else
             fail "status list shows stopped state" "got: $HARNESS_OUT"
@@ -5503,7 +5549,7 @@ test_auto_resolve_no_instances() {
     # Skip if other instances exist (pre-existing state).
 
     local instance_count
-    instance_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -cE "running|stopped" || true)
+    instance_count=$(RUST_LOG=off "$BINARY" list --json 2>/dev/null | grep -cE '"state": "(running|stopped)"' || true)
 
     if [[ "$instance_count" -gt 0 ]]; then
         skip "shell rejects when no instances exist" "$instance_count instances still present"
@@ -6345,9 +6391,9 @@ guest_ip_of() {
     '
 }
 
-# coop shell collapses nonzero guest statuses to exit 1. Send a validated
-# result on stdout instead; keep ping diagnostics on stderr. Only the host
-# helper uses 42 for no reply, so sudo/SSH failures cannot manufacture a pass.
+# The stdout token distinguishes a validated no-reply result from sudo or SSH
+# failure; keep ping diagnostics on stderr. Only the host helper uses 42 for no
+# reply, so infrastructure failures cannot manufacture a pass.
 guest_ping() {
     local result
     # shellcheck disable=SC2016 # Expanded by the guest shell, not the host.
@@ -6650,7 +6696,7 @@ CFGEOF
             "stderr: $(guest_stderr)"
     fi
     if seed_codex_update_config; then
-        if coop agent update "$inst_name" --codex -y; then
+        if coop agent update "$inst_name" --agent codex; then
             pass "agent update migrates the profile's system Codex installation"
         else
             fail "agent update migrates the profile's system Codex installation" \
@@ -9640,10 +9686,10 @@ test_guest_user_alt() {
     fi
 
     check_native_codex
-    if coop agent update "$inst_name" --codex -y; then
-        pass "agent update --codex uses the configured guest user"
+    if coop agent update "$inst_name" --agent codex; then
+        pass "agent update --agent codex uses the configured guest user"
     else
-        fail "agent update --codex uses the configured guest user" "stderr: $HARNESS_ERR"
+        fail "agent update --agent codex uses the configured guest user" "stderr: $HARNESS_ERR"
     fi
     check_native_codex
 
@@ -9823,7 +9869,7 @@ EOF
         run_timed_test test_stop_idempotency
         run_timed_test test_auto_resolve_stopped
         run_timed_test test_status_stopped
-        run_timed_test test_agent_update_stopped
+        run_timed_test test_agent_status_stopped
         run_timed_test test_list_stopped
         run_timed_test test_stopped_vm_completions
         run_timed_test test_resize_disk_size

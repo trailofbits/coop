@@ -135,7 +135,7 @@ fn fetch_self_release(source: &UpdateSource, requested: Option<&ReleaseTag>) -> 
 
 /// Fetch the `tag_name` of another repository's latest release.
 ///
-/// Used by `coop agent update` to compare the guest's installed Codex
+/// Used by `coop agent status` to compare the guest's installed Codex
 /// against the newest upstream tag. `repo` is a compile-time `owner/name`
 /// slug (e.g. `openai/codex`) — never user input — so it carries none of
 /// the path-traversal risk `coop update --version` guards against.
