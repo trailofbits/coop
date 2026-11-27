@@ -1620,14 +1620,57 @@ test_exec() {
         fail "exec captures stdout" "got: $output"
     fi
 
-    # Verify non-zero exit code propagates
-    local rc=0
-    coop_exec false || rc=$?
-    if [[ $rc -ne 0 ]]; then
-        pass "exec propagates non-zero exit code"
+    local stream_stdout="$tmpdir/exec-stream-stdout"
+    local stream_done="$tmpdir/exec-stream-done"
+    : >"$tmpdir/guest_stderr"
+    (
+        local stream_rc=0
+        coop_exec sh -c \
+            'printf "stdout-before-exit\n"; printf "stderr-before-exit\n" >&2; sleep 5' \
+            >"$stream_stdout" || stream_rc=$?
+        printf '%s\n' "$stream_rc" >"$stream_done"
+    ) &
+    local stream_pid=$!
+    local streamed=0
+    local attempt
+    for attempt in {1..40}; do
+        if grep -qF "stdout-before-exit" "$stream_stdout" \
+                && grep -qF "stderr-before-exit" "$tmpdir/guest_stderr" \
+                && [[ ! -e "$stream_done" ]]; then
+            streamed=1
+            break
+        fi
+        sleep 0.1
+    done
+    local stream_status=0
+    wait "$stream_pid" || stream_status=$?
+    if [[ "$streamed" -eq 1 && "$stream_status" -eq 0 && -f "$stream_done" && "$(cat "$stream_done")" == 0 ]]; then
+        pass "exec streams stdout and stderr before guest exit"
     else
-        fail "exec propagates non-zero exit code" "expected non-zero, got 0"
+        fail "exec streams stdout and stderr before guest exit" \
+            "stdout: $(cat "$stream_stdout"); stderr: $(guest_stderr)"
     fi
+
+    if output=$(printf 'must-not-reach-guest\n' | coop_exec cat); then
+        if [[ -z "$output" ]]; then
+            pass "exec closes stdin"
+        else
+            fail "exec closes stdin" "guest received: $output"
+        fi
+    else
+        fail "exec closes stdin" "stderr: $(guest_stderr)"
+    fi
+
+    local runner rc
+    for runner in coop_exec guest_exec; do
+        rc=0
+        "$runner" sh -c 'exit 42' || rc=$?
+        if [[ $rc -eq 42 ]]; then
+            pass "$runner preserves guest exit status"
+        else
+            fail "$runner preserves guest exit status" "expected 42, got $rc"
+        fi
+    done
 }
 
 test_claude_bin_path() {
@@ -6348,9 +6391,9 @@ guest_ip_of() {
     '
 }
 
-# coop shell collapses nonzero guest statuses to exit 1. Send a validated
-# result on stdout instead; keep ping diagnostics on stderr. Only the host
-# helper uses 42 for no reply, so sudo/SSH failures cannot manufacture a pass.
+# The stdout token distinguishes a validated no-reply result from sudo or SSH
+# failure; keep ping diagnostics on stderr. Only the host helper uses 42 for no
+# reply, so infrastructure failures cannot manufacture a pass.
 guest_ping() {
     local result
     # shellcheck disable=SC2016 # Expanded by the guest shell, not the host.

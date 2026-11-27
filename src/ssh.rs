@@ -173,57 +173,27 @@ fn run_interactive_impl(
     Ok(())
 }
 
-/// Run a command non-interactively over SSH (no PTY).
-///
-/// Propagates the remote command's exit code via the process exit code.
-pub fn run_command(session: &SshSession, command: &[String]) -> Result<()> {
-    let remote_cmd = join_escaped(command);
+#[derive(Debug, thiserror::Error)]
+#[error("SSH exited with status {0}")]
+pub struct SshExit(pub u8);
 
-    tracing::info!("Running (non-interactive): {remote_cmd}");
-
+/// Run a guest command without a PTY and stream both output channels.
+pub fn run_command(
+    session: &SshSession,
+    command: &[String],
+    stdin: std::process::Stdio,
+) -> Result<()> {
     let status = session
-        .command(&[], &remote_cmd)?
-        // `coop shell NAME -- COMMAND...` is the documented streaming command
-        // surface: preserve pipes even though it does not allocate a PTY.
-        .stdin(std::process::Stdio::inherit())
+        .command(&[], &join_escaped(command))?
+        .stdin(stdin)
         .status()
         .context("Failed to launch SSH")?;
 
-    if !status.success() {
-        anyhow::bail!("Remote command exited with status: {status}");
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(code) => Err(SshExit(u8::try_from(code)?).into()),
+        None => anyhow::bail!("SSH terminated without an exit code: {status}"),
     }
-
-    Ok(())
-}
-
-/// Run a command in the VM, capture output, and exit with the remote's code.
-///
-/// Stdout and stderr from the remote command are written to the local
-/// stdout/stderr respectively. The process exits with the remote
-/// command's exit code, making this suitable for scripting and CI.
-pub fn exec_command(session: &SshSession, command: &[String]) -> Result<()> {
-    let remote_cmd = join_escaped(command);
-
-    tracing::debug!("exec: {remote_cmd}");
-
-    let output = session
-        .command(&[], &remote_cmd)?
-        .output()
-        .context("Failed to launch SSH")?;
-
-    std::io::stdout()
-        .write_all(&output.stdout)
-        .context("Failed to write stdout")?;
-    std::io::stderr()
-        .write_all(&output.stderr)
-        .context("Failed to write stderr")?;
-
-    if !output.status.success() {
-        let code = output.status.code().unwrap_or(1);
-        anyhow::bail!("Remote command exited with status {code}");
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -338,8 +308,8 @@ mod tests {
             session
                 .exec(crate::remote_command::RemoteCommand::new().literal(check))
                 .expect("session exec");
-            run_command(&session, &args).expect("noninteractive");
-            exec_command(&session, &args).expect("captured");
+            run_command(&session, &args, std::process::Stdio::inherit()).expect("noninteractive");
+            run_command(&session, &args, std::process::Stdio::null()).expect("captured");
             run_interactive(&session, &args).expect("interactive");
             return;
         }
@@ -415,7 +385,8 @@ printf x >> {}
                 ),
                 env: crate::backend::EnvForward::default(),
             };
-            run_command(&session, &["cat".into()]).expect("streaming shell command");
+            run_command(&session, &["cat".into()], std::process::Stdio::inherit())
+                .expect("streaming shell command");
             assert_eq!(std::fs::read(result).expect("stdin result"), b"shell-stdin");
             return;
         }
