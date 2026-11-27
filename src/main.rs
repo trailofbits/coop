@@ -1,5 +1,6 @@
-//! Thin binary shim. All logic lives in the `coop` library crate so that fuzz
-//! targets and integration tests can depend on it directly.
+//! Binary entrypoint. Command dispatch lives in the `coop` library crate so that
+//! fuzz targets and integration tests can depend on it directly. This shim maps
+//! typed guest-command SSH failures to process exit codes.
 
 use std::process::ExitCode;
 

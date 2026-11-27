@@ -44,7 +44,8 @@ exclude_globs = [
   "src/cmd.rs",
   "src/ssh.rs",
   "src/vm.rs",
-  # Thin binary shim: `fn main() { coop::run() }`. All logic is in the lib.
+  # Binary-only guest exit-code mapping around `coop::run()` is covered by the
+  # CLI integration suite and cannot be reached by `cargo test --lib`.
   "src/main.rs",
 ]
 
