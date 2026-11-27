@@ -362,7 +362,9 @@ pub fn sync_mount_contents(
             RemoteCommand::new()
                 .literal("sudo mkdir -p ")
                 .arg(guest)
-                .literal(" && sudo chown ubuntu:ubuntu ")
+                .literal(" && sudo chown -- ")
+                .arg(format!("{}:", target.user()))
+                .literal(" ")
                 .arg(guest),
         )?;
 
