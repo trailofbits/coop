@@ -522,6 +522,38 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"user configuration");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn init_removes_inherited_read_acls() {
+        use std::process::Command;
+
+        let root = crate::test_support::private_tempdir().unwrap();
+        assert!(
+            Command::new("chmod")
+                .arg("+a")
+                .arg("everyone allow read,file_inherit,directory_inherit")
+                .arg(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let inherited = tempfile::NamedTempFile::new_in(root.path()).unwrap();
+        let listing = Command::new("ls")
+            .arg("-le")
+            .arg(inherited.path())
+            .output()
+            .unwrap();
+        assert!(listing.status.success());
+        assert!(String::from_utf8_lossy(&listing.stdout).contains("allow"));
+
+        let path = root.path().join("config.toml");
+        super::cmd_init(&path).unwrap();
+        let listing = Command::new("ls").arg("-le").arg(&path).output().unwrap();
+        assert!(listing.status.success());
+        assert!(!String::from_utf8_lossy(&listing.stdout).contains("allow"));
+    }
+
     #[test]
     fn init_preserves_an_existing_dangling_link() {
         let tmp = tempfile::tempdir().unwrap();
