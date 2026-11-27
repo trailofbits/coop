@@ -2197,6 +2197,15 @@ fn unique_instance_name(base: &str, instances: &[Instance]) -> Result<InstanceNa
     bail!("Could not find unique instance name for '{base}'")
 }
 
+/// How the name for a newly allocated instance is chosen.
+#[derive(Clone, Copy)]
+pub(crate) enum AllocationName<'a> {
+    Explicit(&'a InstanceName),
+    Workspace(&'a Path),
+    Generated(&'a InstanceName),
+    Index,
+}
+
 /// Expand a leading `~` in each marketplace entry that is a path.
 ///
 /// Marketplace entries can be a URL, a GitHub repo slug, or a host
@@ -2653,15 +2662,19 @@ impl CoopConfig {
         image: &ImageName,
         workspace_path: Option<&Path>,
     ) -> Result<Instance> {
-        self.allocate_for_provisioning(name, image, workspace_path)
+        let name = match (name, workspace_path) {
+            (Some(name), _) => AllocationName::Explicit(name),
+            (None, Some(path)) => AllocationName::Workspace(path),
+            (None, None) => AllocationName::Index,
+        };
+        self.allocate_for_provisioning(name, image)
             .map(|(inst, _lock)| inst)
     }
 
     pub(crate) fn allocate_for_provisioning(
         &self,
-        name: Option<&InstanceName>,
+        name: AllocationName<'_>,
         image: &ImageName,
-        workspace_path: Option<&Path>,
     ) -> Result<(Instance, crate::fs_util::FileLock)> {
         let _lock = lock_dir(&self.instances_dir())?;
 
@@ -2700,18 +2713,20 @@ impl CoopConfig {
                 .context("All 253 instance slots are in use")?,
         };
 
-        let name = if let Some(n) = name {
-            n.clone()
-        } else if let Some(ws) = workspace_path {
-            let basename = ws
-                .file_name()
-                .unwrap_or(OsStr::new("workspace"))
-                .to_string_lossy();
-            let base = sanitize_basename(&basename);
-            unique_instance_name(&base, &instances)?
-        } else {
-            let s = index.to_string();
-            InstanceName::new(&s).context("BUG: InstanceIndex produced invalid name")?
+        let name = match name {
+            AllocationName::Explicit(name) => name.clone(),
+            AllocationName::Workspace(path) => {
+                let basename = path
+                    .file_name()
+                    .unwrap_or(OsStr::new("workspace"))
+                    .to_string_lossy();
+                unique_instance_name(&sanitize_basename(&basename), &instances)?
+            }
+            AllocationName::Generated(base) => unique_instance_name(base.as_str(), &instances)?,
+            AllocationName::Index => {
+                let s = index.to_string();
+                InstanceName::new(&s).context("BUG: InstanceIndex produced invalid name")?
+            }
         };
 
         let dir = self.instances_dir().join(name.as_str());
@@ -4372,7 +4387,9 @@ mod tests {
             .join(format!("..{name}.provisioning.operation.lock"));
         std::os::unix::fs::symlink(cfg.instances_dir(), lock_path).unwrap();
 
-        let Err(error) = cfg.allocate_for_provisioning(Some(&name), &default_img(), None) else {
+        let Err(error) =
+            cfg.allocate_for_provisioning(AllocationName::Explicit(&name), &default_img())
+        else {
             panic!("invalid provisioning lock unexpectedly allowed allocation");
         };
 
@@ -4389,12 +4406,13 @@ mod tests {
         let cfg = test_config(&tmp);
         let busy_name = iname("busy");
         let (busy, _provisioning) = cfg
-            .allocate_for_provisioning(Some(&busy_name), &default_img(), None)
+            .allocate_for_provisioning(AllocationName::Explicit(&busy_name), &default_img())
             .unwrap();
         fs::remove_dir_all(&busy.dir).unwrap();
 
         let started = std::time::Instant::now();
-        let Err(error) = cfg.allocate_for_provisioning(Some(&busy_name), &default_img(), None)
+        let Err(error) =
+            cfg.allocate_for_provisioning(AllocationName::Explicit(&busy_name), &default_img())
         else {
             panic!("held provisioning lock unexpectedly allowed allocation");
         };
@@ -4408,7 +4426,7 @@ mod tests {
 
         let other_name = iname("other");
         let (other, _other_provisioning) = cfg
-            .allocate_for_provisioning(Some(&other_name), &default_img(), None)
+            .allocate_for_provisioning(AllocationName::Explicit(&other_name), &default_img())
             .unwrap();
         assert!(other.dir.is_dir());
     }
