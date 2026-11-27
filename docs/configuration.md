@@ -705,8 +705,8 @@ plugins = ["rust-analyzer-lsp@claude-plugins-official"]
 | `apt_packages` | array of strings | `[]` | Apt packages to install in the guest template. |
 | `pre_install` | string | unset | Shell commands to run before `apt-get install` (e.g., adding PPAs or GPG keys). |
 | `post_install` | string | unset | Shell commands to run after `apt-get install`. |
-| `marketplaces` | array of strings | `[]` | Plugin marketplace sources for this profile. Same format as `claude.marketplaces`. |
-| `plugins` | array of strings | `[]` | Plugins to install for this profile. Same format as `claude.plugins`. |
+| `marketplaces` | array of strings | `[]` | Claude plugin marketplace sources for this profile on Lima. Firecracker currently does not apply profile marketplace lists; add sources to `claude.marketplaces` there. |
+| `plugins` | array of strings | `[]` | Claude plugins for this profile on Lima when Claude is in the image. Firecracker currently does not apply profile plugin lists; add plugins to `claude.plugins` there. |
 
 Custom profiles compose with built-in ones (`python`, `node`, `c`, `fuzz`, `rust`, `go`). Combine them with commas: `coop setup --profile python,node,my-tools`.
 
