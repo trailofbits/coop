@@ -256,14 +256,10 @@ fn create_git_repo_instance(
         persisted_guest_env,
     };
 
-    let derived_name = opts
-        .name
-        .cloned()
-        .or_else(|| github_repo::git_repo_default_instance_name(repo_url));
     allocate_and_start(
         be,
         cfg,
-        derived_name.as_ref(),
+        opts.name,
         &opts.effective_image(),
         None,
         &start_opts,
@@ -735,7 +731,8 @@ fn allocate_and_start(
         be.validate_image_control(cfg, image, cfg.vm.firecracker_control)?;
         cfg.validate_and_warn_for_agents(&setup::TemplateConfig::load_for(cfg, image)?.agents)?;
     }
-    let (inst, _provisioning) = cfg.allocate_for_provisioning(name, image, workspace_path)?;
+    let (inst, _provisioning) =
+        allocate_up_instance(cfg, name, image, workspace_path, opts.git_repo)?;
     tracing::info!("Starting instance '{}' (index {})", inst.name, inst.index);
 
     let _guard = signal::install_handlers();
@@ -771,6 +768,26 @@ fn allocate_and_start(
     }
 
     result.map(|()| inst)
+}
+
+fn allocate_up_instance(
+    cfg: &config::CoopConfig,
+    name: Option<&config::InstanceName>,
+    image: &config::ImageName,
+    workspace_path: Option<&Path>,
+    repo_url: Option<&str>,
+) -> Result<(config::Instance, crate::fs_util::FileLock)> {
+    let generated_name = repo_url.and_then(github_repo::git_repo_default_instance_name);
+    let allocation_name = if let Some(name) = name {
+        config::AllocationName::Explicit(name)
+    } else if let Some(path) = workspace_path {
+        config::AllocationName::Workspace(path)
+    } else if let Some(name) = generated_name.as_ref() {
+        config::AllocationName::Generated(name)
+    } else {
+        config::AllocationName::Index
+    };
+    cfg.allocate_for_provisioning(allocation_name, image)
 }
 
 /// Find a stopped instance to restart, if applicable.
@@ -3936,6 +3953,47 @@ mod tests {
             data_dir: super::config::ConfigPath::new(dir),
             ..super::config::CoopConfig::default()
         }
+    }
+
+    #[test]
+    fn repo_names_colliding_after_normalization_get_unique_suffixes() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let cfg = cfg_with_data_dir(tmp.path().join("data"));
+        let image = super::config::default_image_name();
+
+        let (first, _first_provisioning) = super::allocate_up_instance(
+            &cfg,
+            None,
+            &image,
+            None,
+            Some("https://example.com/org/a_b.git"),
+        )
+        .unwrap();
+        let (second, _second_provisioning) = super::allocate_up_instance(
+            &cfg,
+            None,
+            &image,
+            None,
+            Some("https://example.com/org/a-b.git"),
+        )
+        .unwrap();
+
+        assert_eq!(first.name.as_str(), "a-b");
+        assert_eq!(second.name.as_str(), "a-b-2");
+        assert!(first.dir.is_dir());
+        assert!(second.dir.is_dir());
+
+        let explicit = super::config::InstanceName::new("a-b").unwrap();
+        let error = super::allocate_up_instance(
+            &cfg,
+            Some(&explicit),
+            &image,
+            None,
+            Some("https://example.com/org/a-b.git"),
+        )
+        .err()
+        .expect("explicit duplicate name must fail allocation");
+        assert!(error.to_string().contains("already exists"), "{error:#}");
     }
 
     #[cfg(target_os = "linux")]

@@ -20,10 +20,10 @@ DNS=8.8.4.4
 NETEOF
 
 echo '  [guest] Configuring hostname...'
-echo 'claude-vm' > /etc/hostname
+echo 'coop-vm' > /etc/hostname
 cat > /etc/hosts <<'HOSTEOF'
 127.0.0.1 localhost
-127.0.1.1 claude-vm
+127.0.1.1 coop-vm
 HOSTEOF
 
 echo '  [guest] Configuring serial console...'

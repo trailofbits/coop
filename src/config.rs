@@ -1963,7 +1963,10 @@ impl<'de> Deserialize<'de> for LocalModel {
 /// Permissive local servers (Ollama, LM Studio, vLLM) ignore the value.
 pub const LOCAL_MODEL_AUTH_FALLBACK: &str = "coop-local";
 
-const MAX_INSTANCE_NAME_LEN: usize = 64;
+// Firecracker prefixes `coop-` to the guest hostname and keeps it within
+// 63 bytes. Lima uses the same prefix and allows up to 76 bytes.
+const MAX_INSTANCE_NAME_LEN: usize = 58;
+const MAX_DERIVED_INSTANCE_NAME_LEN: usize = MAX_INSTANCE_NAME_LEN - 3;
 
 fn validate_instance_name(name: &str) -> Result<()> {
     if name.is_empty() {
@@ -1977,11 +1980,11 @@ fn validate_instance_name(name: &str) -> Result<()> {
     }
     if let Some(c) = name
         .chars()
-        .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_'))
+        .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-'))
     {
         let mut msg = format!(
             "Instance name contains invalid character '{c}' \
-             (allowed: a-z, A-Z, 0-9, '-', '_')"
+             (allowed: a-z, A-Z, 0-9, '-')"
         );
         if looks_like_path(name) {
             msg.push_str(
@@ -1994,6 +1997,12 @@ fn validate_instance_name(name: &str) -> Result<()> {
     if name.starts_with('-') {
         bail!("Instance name must not start with '-'");
     }
+    if name.ends_with('-') {
+        bail!("Instance name must not end with '-'");
+    }
+    if name.contains("--") {
+        bail!("Instance name must not contain adjacent '-' characters");
+    }
     Ok(())
 }
 
@@ -2005,8 +2014,8 @@ fn looks_like_path(name: &str) -> bool {
 }
 
 /// Validated instance name. Construction guarantees the name matches
-/// `[a-zA-Z0-9_][a-zA-Z0-9_-]{0,63}`, so downstream code (path construction,
-/// shell commands, SSH config blocks) can use it without re-checking.
+/// `[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*` with at most 58 bytes, so downstream code
+/// (path construction, shell commands, SSH config blocks) need not re-check it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InstanceName(String);
 
@@ -2150,26 +2159,28 @@ fn lock_dir(dir: &Path) -> Result<File> {
 
 /// Sanitize a directory basename for use as an instance name.
 ///
-/// Replaces characters outside `[a-zA-Z0-9_-]` with `-` and removes leading
-/// `-` characters. Returns `"workspace"` if the result would be empty.
-/// Truncates to 60 characters to leave room for collision suffixes.
+/// Replaces non-alphanumeric runs with one `-` and removes leading and trailing
+/// separators. Returns `"workspace"` if the result would be empty.
+/// Truncates to 55 characters to leave room for collision suffixes.
 fn sanitize_basename(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let sanitized = sanitized.trim_start_matches('-');
-    if sanitized.is_empty() {
-        return "workspace".to_string();
+    sanitize_instance_basename(name).unwrap_or_else(|| "workspace".to_string())
+}
+
+/// Derive a portable name from a workspace or repository basename.
+/// `None` lets callers choose their own fallback when no alphanumeric remains.
+pub(crate) fn sanitize_instance_basename(name: &str) -> Option<String> {
+    let mut sanitized = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            sanitized.push(c);
+        } else if !sanitized.is_empty() && !sanitized.ends_with('-') {
+            sanitized.push('-');
+        }
     }
-    let max = 60.min(sanitized.len());
-    sanitized[..max].to_string()
+    let sanitized = sanitized.trim_end_matches('-');
+    let max = MAX_DERIVED_INSTANCE_NAME_LEN.min(sanitized.len());
+    let sanitized = sanitized[..max].trim_end_matches('-');
+    (!sanitized.is_empty()).then(|| sanitized.to_string())
 }
 
 /// Find a unique instance name by appending `-2`, `-3`, etc. on collision.
@@ -2184,6 +2195,15 @@ fn unique_instance_name(base: &str, instances: &[Instance]) -> Result<InstanceNa
         }
     }
     bail!("Could not find unique instance name for '{base}'")
+}
+
+/// How the name for a newly allocated instance is chosen.
+#[derive(Clone, Copy)]
+pub(crate) enum AllocationName<'a> {
+    Explicit(&'a InstanceName),
+    Workspace(&'a Path),
+    Generated(&'a InstanceName),
+    Index,
 }
 
 /// Expand a leading `~` in each marketplace entry that is a path.
@@ -2688,15 +2708,19 @@ impl CoopConfig {
         image: &ImageName,
         workspace_path: Option<&Path>,
     ) -> Result<Instance> {
-        self.allocate_for_provisioning(name, image, workspace_path)
+        let name = match (name, workspace_path) {
+            (Some(name), _) => AllocationName::Explicit(name),
+            (None, Some(path)) => AllocationName::Workspace(path),
+            (None, None) => AllocationName::Index,
+        };
+        self.allocate_for_provisioning(name, image)
             .map(|(inst, _lock)| inst)
     }
 
     pub(crate) fn allocate_for_provisioning(
         &self,
-        name: Option<&InstanceName>,
+        name: AllocationName<'_>,
         image: &ImageName,
-        workspace_path: Option<&Path>,
     ) -> Result<(Instance, crate::fs_util::FileLock)> {
         let _lock = lock_dir(&self.instances_dir())?;
 
@@ -2735,18 +2759,20 @@ impl CoopConfig {
                 .context("All 253 instance slots are in use")?,
         };
 
-        let name = if let Some(n) = name {
-            n.clone()
-        } else if let Some(ws) = workspace_path {
-            let basename = ws
-                .file_name()
-                .unwrap_or(OsStr::new("workspace"))
-                .to_string_lossy();
-            let base = sanitize_basename(&basename);
-            unique_instance_name(&base, &instances)?
-        } else {
-            let s = index.to_string();
-            InstanceName::new(&s).context("BUG: InstanceIndex produced invalid name")?
+        let name = match name {
+            AllocationName::Explicit(name) => name.clone(),
+            AllocationName::Workspace(path) => {
+                let basename = path
+                    .file_name()
+                    .unwrap_or(OsStr::new("workspace"))
+                    .to_string_lossy();
+                unique_instance_name(&sanitize_basename(&basename), &instances)?
+            }
+            AllocationName::Generated(base) => unique_instance_name(base.as_str(), &instances)?,
+            AllocationName::Index => {
+                let s = index.to_string();
+                InstanceName::new(&s).context("BUG: InstanceIndex produced invalid name")?
+            }
         };
 
         let dir = self.instances_dir().join(name.as_str());
@@ -4523,7 +4549,9 @@ mod tests {
             .join(format!("..{name}.provisioning.operation.lock"));
         std::os::unix::fs::symlink(cfg.instances_dir(), lock_path).unwrap();
 
-        let Err(error) = cfg.allocate_for_provisioning(Some(&name), &default_img(), None) else {
+        let Err(error) =
+            cfg.allocate_for_provisioning(AllocationName::Explicit(&name), &default_img())
+        else {
             panic!("invalid provisioning lock unexpectedly allowed allocation");
         };
 
@@ -4540,12 +4568,13 @@ mod tests {
         let cfg = test_config(&tmp);
         let busy_name = iname("busy");
         let (busy, _provisioning) = cfg
-            .allocate_for_provisioning(Some(&busy_name), &default_img(), None)
+            .allocate_for_provisioning(AllocationName::Explicit(&busy_name), &default_img())
             .unwrap();
         fs::remove_dir_all(&busy.dir).unwrap();
 
         let started = std::time::Instant::now();
-        let Err(error) = cfg.allocate_for_provisioning(Some(&busy_name), &default_img(), None)
+        let Err(error) =
+            cfg.allocate_for_provisioning(AllocationName::Explicit(&busy_name), &default_img())
         else {
             panic!("held provisioning lock unexpectedly allowed allocation");
         };
@@ -4559,7 +4588,7 @@ mod tests {
 
         let other_name = iname("other");
         let (other, _other_provisioning) = cfg
-            .allocate_for_provisioning(Some(&other_name), &default_img(), None)
+            .allocate_for_provisioning(AllocationName::Explicit(&other_name), &default_img())
             .unwrap();
         assert!(other.dir.is_dir());
     }
@@ -4638,17 +4667,7 @@ mod tests {
 
     #[test]
     fn validate_name_accepts_valid() {
-        for name in [
-            "foo",
-            "my-project",
-            "test_vm",
-            "Dev-Box_01",
-            "a",
-            "A",
-            "0",
-            "_vm",
-            "_",
-        ] {
+        for name in ["foo", "my-project", "test-vm", "Dev-Box-01", "a", "A", "0"] {
             validate_instance_name(name).unwrap();
         }
     }
@@ -4658,6 +4677,17 @@ mod tests {
         for name in ["--all", "-vm", "-"] {
             let err = InstanceName::new(name).unwrap_err().to_string();
             assert!(err.contains("must not start with '-'"), "{err}");
+        }
+    }
+
+    #[test]
+    fn validate_name_rejects_nonportable_separators() {
+        for name in ["_vm", "test_vm", "_", "vm-_one", "vm_-one"] {
+            let err = InstanceName::new(name).unwrap_err().to_string();
+            assert!(err.contains("invalid character '_'"), "{err}");
+        }
+        for name in ["vm-", "vm--one"] {
+            assert!(InstanceName::new(name).is_err(), "accepted {name:?}");
         }
     }
 
@@ -4721,14 +4751,14 @@ mod tests {
 
     #[test]
     fn validate_name_rejects_too_long() {
-        let long = "a".repeat(65);
+        let long = "a".repeat(59);
         let err = validate_instance_name(&long).unwrap_err();
         assert!(err.to_string().contains("too long"));
     }
 
     #[test]
     fn validate_name_accepts_max_length() {
-        let max = "a".repeat(64);
+        let max = "a".repeat(58);
         validate_instance_name(&max).unwrap();
     }
 
@@ -5651,16 +5681,16 @@ skip = ["not-a-slug"]
 
     #[test]
     fn instance_name_roundtrip_serde() {
-        let name = InstanceName::new("_my-vm").unwrap();
+        let name = InstanceName::new("my-vm").unwrap();
         let json = serde_json::to_string(&name).unwrap();
-        assert_eq!(json, r#""_my-vm""#);
+        assert_eq!(json, r#""my-vm""#);
         let loaded: InstanceName = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded, name);
     }
 
     #[test]
     fn instance_name_rejects_invalid_on_deserialize() {
-        for json in [r#""../evil""#, r#""--all""#] {
+        for json in [r#""../evil""#, r#""--all""#, r#""test_vm""#] {
             assert!(serde_json::from_str::<InstanceName>(json).is_err());
         }
     }
@@ -7577,20 +7607,27 @@ rsync = "/run/current-system/sw/bin/rsync"
     #[test]
     fn sanitize_basename_removes_leading_hyphens() {
         assert_eq!(sanitize_basename(".hidden-project"), "hidden-project");
-        assert_eq!(sanitize_basename("--_project"), "_project");
-        assert_eq!(sanitize_basename("_project"), "_project");
+        assert_eq!(sanitize_basename("--_project"), "project");
+        assert_eq!(sanitize_basename("_project"), "project");
     }
 
     #[test]
     fn sanitize_basename_truncates_long_names() {
         let long = "a".repeat(100);
         let result = sanitize_basename(&long);
-        assert_eq!(result.len(), 60);
+        assert_eq!(result.len(), 55);
     }
 
     #[test]
-    fn sanitize_basename_preserves_hyphens_and_underscores() {
-        assert_eq!(sanitize_basename("my-project_v2"), "my-project_v2");
+    fn sanitize_basename_collapses_and_trims_separators() {
+        assert_eq!(sanitize_basename("my--project_v2-"), "my-project-v2");
+        assert_eq!(sanitize_basename("my-_project"), "my-project");
+        assert_eq!(sanitize_basename("my_-project"), "my-project");
+        assert_eq!(sanitize_basename("a".repeat(54).as_str()), "a".repeat(54));
+        assert_eq!(
+            sanitize_basename(&format!("{}-end", "a".repeat(54))),
+            "a".repeat(54)
+        );
     }
 
     #[test]
