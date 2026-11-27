@@ -1991,6 +1991,9 @@ fn validate_instance_name(name: &str) -> Result<()> {
         }
         bail!(msg);
     }
+    if name.starts_with('-') {
+        bail!("Instance name must not start with '-'");
+    }
     Ok(())
 }
 
@@ -2002,7 +2005,7 @@ fn looks_like_path(name: &str) -> bool {
 }
 
 /// Validated instance name. Construction guarantees the name matches
-/// `[a-zA-Z0-9_-]{1,64}`, so downstream code (path construction,
+/// `[a-zA-Z0-9_][a-zA-Z0-9_-]{0,63}`, so downstream code (path construction,
 /// shell commands, SSH config blocks) can use it without re-checking.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InstanceName(String);
@@ -2147,8 +2150,8 @@ fn lock_dir(dir: &Path) -> Result<File> {
 
 /// Sanitize a directory basename for use as an instance name.
 ///
-/// Replaces characters outside `[a-zA-Z0-9_-]` with `-`.
-/// Returns `"workspace"` if the result would be empty.
+/// Replaces characters outside `[a-zA-Z0-9_-]` with `-` and removes leading
+/// `-` characters. Returns `"workspace"` if the result would be empty.
 /// Truncates to 60 characters to leave room for collision suffixes.
 fn sanitize_basename(name: &str) -> String {
     let sanitized: String = name
@@ -2161,6 +2164,7 @@ fn sanitize_basename(name: &str) -> String {
             }
         })
         .collect();
+    let sanitized = sanitized.trim_start_matches('-');
     if sanitized.is_empty() {
         return "workspace".to_string();
     }
@@ -2684,6 +2688,16 @@ impl CoopConfig {
         image: &ImageName,
         workspace_path: Option<&Path>,
     ) -> Result<Instance> {
+        self.allocate_for_provisioning(name, image, workspace_path)
+            .map(|(inst, _lock)| inst)
+    }
+
+    pub(crate) fn allocate_for_provisioning(
+        &self,
+        name: Option<&InstanceName>,
+        image: &ImageName,
+        workspace_path: Option<&Path>,
+    ) -> Result<(Instance, crate::fs_util::FileLock)> {
         let _lock = lock_dir(&self.instances_dir())?;
 
         // A directory with unreadable metadata may own any index. Keep it
@@ -2755,8 +2769,11 @@ impl CoopConfig {
             image: image.clone(),
             firecracker_control,
         };
+        // Reserve provisioning before the name becomes visible. A stale or
+        // busy lock must not leave a VM registration that needs teardown.
+        let provisioning = crate::creation_hooks::try_lock_new_instance(&instance)?;
         instance.save()?;
-        Ok(instance)
+        Ok((instance, provisioning))
     }
 
     fn format_instance_list_or_none(&self) -> String {
@@ -4446,6 +4463,59 @@ mod tests {
         assert!(err.to_string().contains("already exists"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allocate_for_provisioning_does_not_publish_when_lock_cannot_open() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let cfg = test_config(&tmp);
+        let name = iname("lock-failure");
+        crate::fs_util::private_dir(&cfg.instances_dir()).unwrap();
+        let lock_path = cfg
+            .instances_dir()
+            .join(format!("..{name}.provisioning.operation.lock"));
+        std::os::unix::fs::symlink(cfg.instances_dir(), lock_path).unwrap();
+
+        let Err(error) = cfg.allocate_for_provisioning(Some(&name), &default_img(), None) else {
+            panic!("invalid provisioning lock unexpectedly allowed allocation");
+        };
+
+        assert!(
+            format!("{error:#}").contains("Failed to open operation lock"),
+            "{error:#}"
+        );
+        assert!(!cfg.instances_dir().join(name.as_str()).exists());
+    }
+
+    #[test]
+    fn allocate_for_provisioning_rejects_held_name_without_blocking_other_names() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let cfg = test_config(&tmp);
+        let busy_name = iname("busy");
+        let (busy, _provisioning) = cfg
+            .allocate_for_provisioning(Some(&busy_name), &default_img(), None)
+            .unwrap();
+        fs::remove_dir_all(&busy.dir).unwrap();
+
+        let started = std::time::Instant::now();
+        let Err(error) = cfg.allocate_for_provisioning(Some(&busy_name), &default_img(), None)
+        else {
+            panic!("held provisioning lock unexpectedly allowed allocation");
+        };
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "held provisioning lock did not reject immediately"
+        );
+        assert!(error.to_string().contains("Timed out waiting"), "{error:#}");
+        assert!(!busy.dir.exists());
+
+        let other_name = iname("other");
+        let (other, _other_provisioning) = cfg
+            .allocate_for_provisioning(Some(&other_name), &default_img(), None)
+            .unwrap();
+        assert!(other.dir.is_dir());
+    }
+
     #[test]
     fn instance_directory_probe_classifies_every_result() {
         let name = iname("probe");
@@ -4520,8 +4590,26 @@ mod tests {
 
     #[test]
     fn validate_name_accepts_valid() {
-        for name in ["foo", "my-project", "test_vm", "Dev-Box_01", "a", "A"] {
+        for name in [
+            "foo",
+            "my-project",
+            "test_vm",
+            "Dev-Box_01",
+            "a",
+            "A",
+            "0",
+            "_vm",
+            "_",
+        ] {
             validate_instance_name(name).unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_name_rejects_leading_hyphen() {
+        for name in ["--all", "-vm", "-"] {
+            let err = InstanceName::new(name).unwrap_err().to_string();
+            assert!(err.contains("must not start with '-'"), "{err}");
         }
     }
 
@@ -5515,17 +5603,18 @@ skip = ["not-a-slug"]
 
     #[test]
     fn instance_name_roundtrip_serde() {
-        let name = InstanceName::new("my-vm").unwrap();
+        let name = InstanceName::new("_my-vm").unwrap();
         let json = serde_json::to_string(&name).unwrap();
-        assert_eq!(json, r#""my-vm""#);
+        assert_eq!(json, r#""_my-vm""#);
         let loaded: InstanceName = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded, name);
     }
 
     #[test]
     fn instance_name_rejects_invalid_on_deserialize() {
-        let json = r#""../evil""#;
-        assert!(serde_json::from_str::<InstanceName>(json).is_err());
+        for json in [r#""../evil""#, r#""--all""#] {
+            assert!(serde_json::from_str::<InstanceName>(json).is_err());
+        }
     }
 
     #[test]
@@ -7433,8 +7522,15 @@ rsync = "/run/current-system/sw/bin/rsync"
     }
 
     #[test]
-    fn sanitize_basename_all_invalid_returns_dashes() {
-        assert_eq!(sanitize_basename("..."), "---");
+    fn sanitize_basename_all_invalid_returns_workspace() {
+        assert_eq!(sanitize_basename("..."), "workspace");
+    }
+
+    #[test]
+    fn sanitize_basename_removes_leading_hyphens() {
+        assert_eq!(sanitize_basename(".hidden-project"), "hidden-project");
+        assert_eq!(sanitize_basename("--_project"), "_project");
+        assert_eq!(sanitize_basename("_project"), "_project");
     }
 
     #[test]

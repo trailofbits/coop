@@ -47,10 +47,7 @@ mod restore_intent;
 mod secret_store;
 mod sha256_hash;
 // Lima is an interactive CLI workflow — stderr output is intentional user communication.
-#[cfg_attr(
-    all(not(target_os = "macos"), not(test)),
-    expect(dead_code, reason = "Lima-only")
-)]
+#[cfg(any(target_os = "macos", test))]
 #[expect(
     clippy::print_stderr,
     reason = "lima setup is interactive CLI — stderr is user communication"
@@ -73,6 +70,7 @@ mod setup;
 mod setup_tool;
 mod shell;
 mod ssh;
+pub use ssh::SshExit;
 #[cfg(test)]
 mod test_support;
 mod update;
@@ -391,8 +389,8 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// Also remove template, kernel, and Firecracker binary
-        #[arg(long)]
+        /// Destroy every instance and remove shared images, SSH keys, and backend data
+        #[arg(long, conflicts_with = "name")]
         all: bool,
     },
     /// List instances by name, state, and network mode
@@ -1574,6 +1572,33 @@ mod tests {
     }
 
     #[test]
+    fn destroy_all_conflicts_with_a_named_instance() {
+        for args in [
+            ["destroy", "example", "--all"],
+            ["destroy", "--all", "example"],
+        ] {
+            assert_eq!(
+                parse_err(&args).kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
+        }
+        assert!(matches!(
+            parse(&["destroy", "--all"]).command,
+            super::Commands::Destroy {
+                name: None,
+                all: true
+            }
+        ));
+        assert!(matches!(
+            parse(&["destroy", "example"]).command,
+            super::Commands::Destroy {
+                name: Some(_),
+                all: false
+            }
+        ));
+    }
+
+    #[test]
     fn codex_proxy_token_flag_requires_openai_and_excludes_api_key() {
         let cli = parse(&[
             "proxy",
@@ -2718,6 +2743,25 @@ mod tests {
             Some("worker-2")
         );
         assert!(new_instance);
+    }
+
+    #[test]
+    fn up_rejects_option_shaped_instance_name() {
+        let err = parse_err(&["up", "--name=--all"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("must not start with '-'"));
+    }
+
+    #[test]
+    fn up_accepts_leading_underscore_instance_name() {
+        let cli = parse(&["up", "--name", "_worker"]);
+        let super::Commands::Up { name, .. } = cli.command else {
+            panic!("expected Up variant");
+        };
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("_worker")
+        );
     }
 
     #[test]

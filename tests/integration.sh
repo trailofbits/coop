@@ -1381,12 +1381,15 @@ test_status_running() {
         fi
     fi
 
-    # Multi-instance list: compact summary with valid percentages
-    # Format: "load=X.XX mem=NN% disk=NN%"
+    # The final two columns of the running row are memory and disk usage.
     if coop status; then
-        local mem_pct disk_pct
-        mem_pct=$(echo "$HARNESS_OUT" | sed -n 's/.*mem=\([0-9][0-9]*\)%.*/\1/p' | head -1)
-        disk_pct=$(echo "$HARNESS_OUT" | sed -n 's/.*disk=\([0-9][0-9]*\)%.*/\1/p' | head -1)
+        local mem_pct="" disk_pct="" usage
+        usage=$(sed -n '/^Running$/,/^Stopped$/p' <<<"$HARNESS_OUT" |
+            awk -v name="$INSTANCE" 'NF >= 5 && ($1 "") == (name "") { print $(NF-1), $NF }')
+        if [[ "$usage" =~ ^([0-9]+)%[[:space:]]+([0-9]+)%$ ]]; then
+            mem_pct=${BASH_REMATCH[1]}
+            disk_pct=${BASH_REMATCH[2]}
+        fi
         if [[ -n "$mem_pct" && "$mem_pct" -le 100 && -n "$disk_pct" && "$disk_pct" -le 100 ]]; then
             pass "status list shows resource summary (mem=${mem_pct}% disk=${disk_pct}%)"
         else
@@ -1451,7 +1454,7 @@ test_auto_resolve_running() {
     # Skip if other instances exist (pre-existing state from outside test).
 
     local running_count
-    running_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -c "running" || true)
+    running_count=$(RUST_LOG=off "$BINARY" list --json 2>/dev/null | grep -c '"state": "running"' || true)
 
     if [[ "$running_count" -ne 1 ]]; then
         skip "shell auto-resolves single running instance" "$running_count running (need exactly 1)"
@@ -1727,14 +1730,57 @@ test_exec() {
         fail "exec captures stdout" "got: $output"
     fi
 
-    # Verify non-zero exit code propagates
-    local rc=0
-    coop_exec false || rc=$?
-    if [[ $rc -ne 0 ]]; then
-        pass "exec propagates non-zero exit code"
+    local stream_stdout="$tmpdir/exec-stream-stdout"
+    local stream_done="$tmpdir/exec-stream-done"
+    : >"$tmpdir/guest_stderr"
+    (
+        local stream_rc=0
+        coop_exec sh -c \
+            'printf "stdout-before-exit\n"; printf "stderr-before-exit\n" >&2; sleep 5' \
+            >"$stream_stdout" || stream_rc=$?
+        printf '%s\n' "$stream_rc" >"$stream_done"
+    ) &
+    local stream_pid=$!
+    local streamed=0
+    local attempt
+    for attempt in {1..40}; do
+        if grep -qF "stdout-before-exit" "$stream_stdout" \
+                && grep -qF "stderr-before-exit" "$tmpdir/guest_stderr" \
+                && [[ ! -e "$stream_done" ]]; then
+            streamed=1
+            break
+        fi
+        sleep 0.1
+    done
+    local stream_status=0
+    wait "$stream_pid" || stream_status=$?
+    if [[ "$streamed" -eq 1 && "$stream_status" -eq 0 && -f "$stream_done" && "$(cat "$stream_done")" == 0 ]]; then
+        pass "exec streams stdout and stderr before guest exit"
     else
-        fail "exec propagates non-zero exit code" "expected non-zero, got 0"
+        fail "exec streams stdout and stderr before guest exit" \
+            "stdout: $(cat "$stream_stdout"); stderr: $(guest_stderr)"
     fi
+
+    if output=$(printf 'must-not-reach-guest\n' | coop_exec cat); then
+        if [[ -z "$output" ]]; then
+            pass "exec closes stdin"
+        else
+            fail "exec closes stdin" "guest received: $output"
+        fi
+    else
+        fail "exec closes stdin" "stderr: $(guest_stderr)"
+    fi
+
+    local runner rc
+    for runner in coop_exec guest_exec; do
+        rc=0
+        "$runner" sh -c 'exit 42' || rc=$?
+        if [[ $rc -eq 42 ]]; then
+            pass "$runner preserves guest exit status"
+        else
+            fail "$runner preserves guest exit status" "expected 42, got $rc"
+        fi
+    done
 }
 
 test_claude_bin_path() {
@@ -4227,7 +4273,7 @@ PYEOF
     else
         fail "stopped legacy fixture has root-owned mode-0755 sockets and no PID"
     fi
-    if coop status && grep -qE "^${INSTANCE}[[:space:]]+stopped" <<<"$HARNESS_OUT"; then
+    if coop status && sed -n '/^Stopped$/,$p' <<<"$HARNESS_OUT" | grep -E "^${INSTANCE}[[:space:]]" >/dev/null; then
         pass "bare status reports old stopped VM with stale sockets"
     else
         fail "bare status reports old stopped VM with stale sockets" \
@@ -4503,7 +4549,7 @@ test_auto_resolve_stopped() {
     # Skip if other instances are running (pre-existing state).
 
     local running_count
-    running_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -c "running" || true)
+    running_count=$(RUST_LOG=off "$BINARY" list --json 2>/dev/null | grep -c '"state": "running"' || true)
 
     if [[ "$running_count" -gt 0 ]]; then
         skip "shell rejects when only stopped instances exist" "$running_count still running"
@@ -4556,7 +4602,7 @@ test_list_empty() {
     # Assert what this phase actually owns: the just-destroyed `$INSTANCE`
     # is gone. The empty-state message is only asserted on a clean host.
     local instance_count
-    instance_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -cE "running|stopped" || true)
+    instance_count=$(RUST_LOG=off "$BINARY" list --json 2>/dev/null | grep -cE '"state": "(running|stopped)"' || true)
 
     if [[ "$instance_count" -gt 0 ]]; then
         if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} "; then
@@ -4597,7 +4643,7 @@ test_status_stopped() {
             fail "stopped instance appears in status list" "got: $HARNESS_OUT"
         fi
 
-        if echo "$HARNESS_OUT" | grep "$INSTANCE" | grep -qi "stopped"; then
+        if sed -n '/^Stopped$/,$p' <<<"$HARNESS_OUT" | grep -E "^${INSTANCE}[[:space:]]" >/dev/null; then
             pass "status list shows stopped state"
         else
             fail "status list shows stopped state" "got: $HARNESS_OUT"
@@ -5613,7 +5659,7 @@ test_auto_resolve_no_instances() {
     # Skip if other instances exist (pre-existing state).
 
     local instance_count
-    instance_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -cE "running|stopped" || true)
+    instance_count=$(RUST_LOG=off "$BINARY" list --json 2>/dev/null | grep -cE '"state": "(running|stopped)"' || true)
 
     if [[ "$instance_count" -gt 0 ]]; then
         skip "shell rejects when no instances exist" "$instance_count instances still present"
@@ -6455,9 +6501,9 @@ guest_ip_of() {
     '
 }
 
-# coop shell collapses nonzero guest statuses to exit 1. Send a validated
-# result on stdout instead; keep ping diagnostics on stderr. Only the host
-# helper uses 42 for no reply, so sudo/SSH failures cannot manufacture a pass.
+# The stdout token distinguishes a validated no-reply result from sudo or SSH
+# failure; keep ping diagnostics on stderr. Only the host helper uses 42 for no
+# reply, so infrastructure failures cannot manufacture a pass.
 guest_ping() {
     local result
     # shellcheck disable=SC2016 # Expanded by the guest shell, not the host.
@@ -9680,9 +9726,11 @@ test_guest_user_alt() {
 
     # Create an instance from the alt-user image — no `--guest-user` flag
     # here on purpose; coop must read the persisted value.
-    local alt_ws="$tmpdir/${inst_name}-ws"
-    mkdir -p "$alt_ws"
-    if coop up "$alt_ws" --name "$inst_name" --no-agents --image "$img_name"; then
+    local alt_ws="$tmpdir/${inst_name}-ws" alt_mount="$tmpdir/${inst_name}-mount"
+    mkdir -p "$alt_ws" "$alt_mount"
+    echo "alternate user mount" > "$alt_mount/marker"
+    if coop up "$alt_ws" --name "$inst_name" --no-agents --image "$img_name" \
+            --extra-mount "$alt_mount:/data/project"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up (alt-user image) exits 0"
     else
@@ -9692,6 +9740,12 @@ test_guest_user_alt() {
     fi
 
     GUEST_INSTANCE="$inst_name"
+
+    if guest_exec test -f /data/project/marker && guest_exec touch /data/project/guest-write; then
+        pass "extra mount is populated and writable by $alt_user"
+    else
+        fail "extra mount is populated and writable by $alt_user" "$(guest_stderr)"
+    fi
 
     # whoami via SSH — this is the highest-signal assertion. If any
     # SshTarget construction site still hardcoded `ubuntu`, the session
