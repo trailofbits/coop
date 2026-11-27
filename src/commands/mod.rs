@@ -14,7 +14,7 @@ mod profiles;
 mod proxy;
 
 pub(crate) use admin::{UninstallOpts, cmd_init, cmd_uninstall, cmd_validate};
-pub(crate) use agent::{AgentSelection, AgentUpdateOpts, cmd_agent_update};
+pub(crate) use agent::{Agent, AgentSelection, cmd_agent_status, cmd_agent_update};
 pub(crate) use github::cmd_github;
 pub(crate) use lifecycle::{
     AgentKind, ProfileImageTarget, ProjectTransport, ReprovisionOpts, ResizeOpts, RestoreMode,

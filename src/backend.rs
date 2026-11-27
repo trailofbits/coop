@@ -939,16 +939,8 @@ pub struct ResourceUsage {
 
 impl std::fmt::Display for ResourceUsage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mem_pct = if self.mem_total_mib > 0 {
-            self.mem_used_mib * 100 / self.mem_total_mib
-        } else {
-            0
-        };
-        let disk_pct = if self.disk_total_mib > 0 {
-            self.disk_used_mib * 100 / self.disk_total_mib
-        } else {
-            0
-        };
+        let mem_pct = self.memory_percent();
+        let disk_pct = self.disk_percent();
         write!(
             f,
             "Load: {:.2}  Mem: {}/{} MiB ({mem_pct}%)  \
@@ -963,19 +955,20 @@ impl std::fmt::Display for ResourceUsage {
 }
 
 impl ResourceUsage {
-    /// Compact single-line summary for multi-instance listing.
-    pub fn summary(&self) -> String {
-        let mem_pct = if self.mem_total_mib > 0 {
+    pub(crate) fn memory_percent(&self) -> u64 {
+        if self.mem_total_mib > 0 {
             self.mem_used_mib * 100 / self.mem_total_mib
         } else {
             0
-        };
-        let disk_pct = if self.disk_total_mib > 0 {
+        }
+    }
+
+    pub(crate) fn disk_percent(&self) -> u64 {
+        if self.disk_total_mib > 0 {
             self.disk_used_mib * 100 / self.disk_total_mib
         } else {
             0
-        };
-        format!("load={:.2} mem={mem_pct}% disk={disk_pct}%", self.load_1m)
+        }
     }
 }
 
@@ -1209,9 +1202,8 @@ pub trait VmBackend: std::fmt::Display {
     /// consumed; callers that need it in the not-running branch can
     /// clone before calling.
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>>;
-    /// Visit instances for an unnamed status report in input order. The
-    /// default preserves per-row output on Firecracker; Lima can share one
-    /// inventory while retaining the stopped/uncertain distinction.
+    /// Visit instances for an unnamed status report in input order. Lima can
+    /// share one inventory while retaining the stopped/uncertain distinction.
     fn visit_running_for_status(
         &self,
         cfg: &CoopConfig,
@@ -5875,18 +5867,6 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         assert!(s.contains("Load: 1.50"));
         assert!(s.contains("Mem: 512/2048 MiB (25%)"));
         assert!(s.contains("Disk: 5000/20000 MiB (25%)"));
-    }
-
-    #[test]
-    fn resource_usage_summary() {
-        let usage = ResourceUsage {
-            load_1m: 0.42,
-            mem_used_mib: 1024,
-            mem_total_mib: 2048,
-            disk_used_mib: 10000,
-            disk_total_mib: 20000,
-        };
-        assert_eq!(usage.summary(), "load=0.42 mem=50% disk=50%");
     }
 
     #[test]

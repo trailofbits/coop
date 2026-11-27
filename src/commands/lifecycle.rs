@@ -256,14 +256,10 @@ fn create_git_repo_instance(
         persisted_guest_env,
     };
 
-    let derived_name = opts
-        .name
-        .cloned()
-        .or_else(|| github_repo::git_repo_default_instance_name(repo_url));
     allocate_and_start(
         be,
         cfg,
-        derived_name.as_ref(),
+        opts.name,
         &opts.effective_image(),
         None,
         &start_opts,
@@ -733,18 +729,14 @@ fn allocate_and_start(
         // necessarily contain the guest listener required by vsock control.
         be.validate_image_control(cfg, image, cfg.vm.firecracker_control)?;
     }
-    let inst = cfg.allocate_instance(name, image, workspace_path)?;
+    let (inst, _provisioning) =
+        allocate_up_instance(cfg, name, image, workspace_path, opts.git_repo)?;
     tracing::info!("Starting instance '{}' (index {})", inst.name, inst.index);
 
     let _guard = signal::install_handlers();
-    // Keep the global lock order consistent with reprovisioning: an instance's
-    // provisioning lock is always acquired before its image publication lock.
-    // Re-lock and revalidate the image immediately before the backend consumes
-    // it, since a commit could have replaced it after the pre-allocation check.
-    let result = (|| {
-        let _provisioning = crate::creation_hooks::lock_provisioning(&inst)?;
-        start_instance(be, &mut *cfg, &inst, opts, Some(image))
-    })();
+    // Revalidate under the image lock before consuming the image. A commit
+    // could have replaced it after the pre-allocation check.
+    let result = start_instance(be, &mut *cfg, &inst, opts, Some(image));
 
     if let Err(error) = &result
         && error.is::<crate::creation_hooks::CreationIncomplete>()
@@ -769,6 +761,26 @@ fn allocate_and_start(
     }
 
     result.map(|()| inst)
+}
+
+fn allocate_up_instance(
+    cfg: &config::CoopConfig,
+    name: Option<&config::InstanceName>,
+    image: &config::ImageName,
+    workspace_path: Option<&Path>,
+    repo_url: Option<&str>,
+) -> Result<(config::Instance, crate::fs_util::FileLock)> {
+    let generated_name = repo_url.and_then(github_repo::git_repo_default_instance_name);
+    let allocation_name = if let Some(name) = name {
+        config::AllocationName::Explicit(name)
+    } else if let Some(path) = workspace_path {
+        config::AllocationName::Workspace(path)
+    } else if let Some(name) = generated_name.as_ref() {
+        config::AllocationName::Generated(name)
+    } else {
+        config::AllocationName::Index
+    };
+    cfg.allocate_for_provisioning(allocation_name, image)
 }
 
 /// Find a stopped instance to restart, if applicable.
@@ -914,7 +926,13 @@ fn restart_confirmed_instance(
         pat_prompt::RepoHint::unrecorded()
     };
     if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated {
-        pat_prompt::maybe_prompt(cfg, opts.config_path, &inst, &hint, opts.no_prompt, None)?;
+        pat_prompt::maybe_prompt_existing_vm(
+            cfg,
+            opts.config_path,
+            &inst,
+            &hint,
+            &pat_prompt::SystemPromptIo::new(opts.no_prompt),
+        )?;
     }
     let mut stopped = be.as_stopped(inst.clone())?;
     let current = cfg.resolve_instance(Some(&inst.name))?;
@@ -1075,13 +1093,13 @@ fn start_instance(
                 .or_else(|| opts.mounts.first().map(|m| m.host_path.as_path())),
         )
     };
-    pat_prompt::maybe_prompt(
+    pat_prompt::maybe_prompt_new_vm(
         cfg,
         opts.config_path,
         inst,
         &hint,
-        opts.no_prompt,
         opts.pat_entry,
+        &pat_prompt::SystemPromptIo::new(opts.no_prompt),
     )?;
 
     // Forwards are checked up-front so an in-use host port fails fast,
@@ -1425,7 +1443,7 @@ pub(crate) fn cmd_shell(
     if command.is_empty() {
         ssh::run_interactive(&session, &[])
     } else {
-        ssh::run_command(&session, command)
+        ssh::run_command(&session, command, std::process::Stdio::inherit())
     }
 }
 
@@ -1515,7 +1533,7 @@ pub(crate) fn cmd_exec(
     command: &[String],
 ) -> Result<()> {
     let session = open_ssh_session(be, cfg, name)?;
-    ssh::exec_command(&session, command)
+    ssh::run_command(&session, command, std::process::Stdio::null())
 }
 
 /// Resolve a running instance and prepare an SSH session with env
@@ -2343,70 +2361,122 @@ pub(crate) fn cmd_status(
             .map_err(|e| anyhow::anyhow!("Failed to write status: {e}"))?;
     } else {
         let instances = cfg.list_instances()?;
-        if json_out {
-            let mut statuses = Vec::with_capacity(instances.len());
-            be.visit_running_for_status(cfg, &instances, &mut |index, running| {
-                anyhow::ensure!(
-                    index == statuses.len(),
-                    "Backend returned out-of-order instance status"
-                );
-                let inst = instances
-                    .get(index)
-                    .context("Backend returned an extra instance status")?;
-                statuses.push(instance_status_from_running(be, inst, running));
-                Ok(())
-            })?;
-            anyhow::ensure!(
-                statuses.len() == instances.len(),
-                "Backend returned an incomplete instance status inventory"
-            );
-            return json::render_json(&statuses);
-        }
-        if instances.is_empty() {
-            writeln!(std::io::stdout(), "No instances found")
-                .map_err(|e| anyhow::anyhow!("Failed to write status: {e}"))?;
-            return Ok(());
-        }
-        let mut next = 0;
+        let mut statuses = Vec::with_capacity(instances.len());
         be.visit_running_for_status(cfg, &instances, &mut |index, running| {
             anyhow::ensure!(
-                index == next,
+                index == statuses.len(),
                 "Backend returned out-of-order instance status"
             );
             let inst = instances
                 .get(index)
                 .context("Backend returned an extra instance status")?;
-            let (state, usage_str) = match running {
-                Some(running) => {
-                    let usage = backend::query_resource_usage(running.target())
-                        .map(|u| format!("  {}", u.summary()))
-                        .unwrap_or_default();
-                    ("running", usage)
-                }
-                None => ("stopped", String::new()),
-            };
-            writeln!(
-                std::io::stdout(),
-                "{:<16} {:<10} {:<10} {:<10} {}{usage_str}",
-                inst.name,
-                state,
-                inst.image,
-                if be.supports_firecracker_network_mode() {
-                    inst.firecracker_network().as_str()
-                } else {
-                    "n/a"
-                },
-                be,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to write status: {e}"))?;
-            next += 1;
+            statuses.push(instance_status_from_running(be, inst, running));
             Ok(())
         })?;
         anyhow::ensure!(
-            next == instances.len(),
+            statuses.len() == instances.len(),
             "Backend returned an incomplete instance status inventory"
         );
+
+        if json_out {
+            return json::render_json(&statuses);
+        }
+        write_instance_status(std::io::stdout().lock(), &mut statuses, be)
+            .context("Failed to write status")?;
     }
+    Ok(())
+}
+
+fn write_instance_status(
+    mut out: impl std::io::Write,
+    statuses: &mut [json::InstanceStatus<'_>],
+    backend: impl std::fmt::Display,
+) -> std::io::Result<()> {
+    if statuses.is_empty() {
+        return writeln!(out, "No instances found");
+    }
+
+    statuses.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+    let show_network = statuses.iter().any(|status| status.network.is_some());
+    let running_count = statuses
+        .iter()
+        .filter(|status| status.state == json::InstanceState::Running)
+        .count();
+    let stopped_count = statuses.len() - running_count;
+    writeln!(
+        out,
+        "{backend} · {running_count} running · {stopped_count} stopped"
+    )?;
+
+    for (state, heading, count) in [
+        (json::InstanceState::Running, "Running", running_count),
+        (json::InstanceState::Stopped, "Stopped", stopped_count),
+    ] {
+        if count == 0 {
+            continue;
+        }
+        let show_usage = state == json::InstanceState::Running;
+        let mut headers = vec!["NAME", "IMAGE"];
+        if show_network {
+            headers.push("NETWORK");
+        }
+        let usage_start = headers.len();
+        if show_usage {
+            headers.extend(["LOAD (1M)", "MEM", "DISK"]);
+        }
+
+        // Validated names and all other cells are ASCII, so byte length is
+        // also the display width.
+        let mut widths: Vec<_> = headers.iter().map(|header| header.len()).collect();
+        let mut rows = Vec::with_capacity(count + 1);
+        rows.push(headers.into_iter().map(str::to_owned).collect());
+        for status in statuses.iter().filter(|status| status.state == state) {
+            let mut row = vec![status.name.to_string(), status.image.to_string()];
+            if show_network {
+                row.push(
+                    status
+                        .network
+                        .map_or("-", config::FirecrackerNetworkMode::as_str)
+                        .to_owned(),
+                );
+            }
+            if show_usage {
+                let usage = status.usage.as_ref().map_or_else(
+                    || ["-".to_owned(), "-".to_owned(), "-".to_owned()],
+                    |usage| {
+                        [
+                            format!("{:.2}", usage.load_1m),
+                            format!("{}%", usage.memory_percent()),
+                            format!("{}%", usage.disk_percent()),
+                        ]
+                    },
+                );
+                row.extend(usage);
+            }
+            for (cell, width) in row.iter().zip(&mut widths) {
+                *width = (*width).max(cell.len());
+            }
+            rows.push(row);
+        }
+
+        writeln!(out, "\n{heading}")?;
+        for row in rows {
+            for (index, (cell, width)) in row.iter().zip(&widths).enumerate() {
+                if index > 0 {
+                    write!(out, "  ")?;
+                }
+                if index >= usage_start {
+                    write!(out, "{cell:>width$}", width = *width)?;
+                } else if index + 1 < widths.len() {
+                    write!(out, "{cell:<width$}", width = *width)?;
+                } else {
+                    write!(out, "{cell}")?;
+                }
+            }
+            writeln!(out)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -2892,7 +2962,13 @@ fn confirm_reprovision(
         pat_prompt::RepoHint::unrecorded()
     };
     if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated {
-        pat_prompt::maybe_prompt(cfg, opts.config_path, inst, &hint, opts.no_prompt, None)?;
+        pat_prompt::maybe_prompt_existing_vm(
+            cfg,
+            opts.config_path,
+            inst,
+            &hint,
+            &pat_prompt::SystemPromptIo::new(opts.no_prompt),
+        )?;
     }
     Ok(())
 }
@@ -3200,6 +3276,111 @@ mod tests {
     fn instance_list_reports_empty_inventory() {
         let mut out = Vec::new();
         super::write_instance_list(&mut out, &[]).unwrap();
+        assert_eq!(out, b"No instances found\n");
+    }
+
+    #[test]
+    fn instance_status_groups_and_aligns_instances() {
+        use crate::backend::{PlatformBackend, ResourceUsage};
+        use crate::commands::json::{BackendKind, InstanceState, InstanceStatus};
+        use crate::config::{FirecrackerNetworkMode, InstanceName, default_image_name};
+
+        let image = default_image_name();
+        let names = ["zulu", "long-running-instance", "alpha", "beta"]
+            .map(|name| InstanceName::new(name).unwrap());
+        for (backend, network) in [
+            ("lima", None),
+            ("firecracker", Some(FirecrackerNetworkMode::Isolated)),
+        ] {
+            let mut statuses = [
+                (&names[0], InstanceState::Stopped, None),
+                (
+                    &names[1],
+                    InstanceState::Running,
+                    Some(ResourceUsage {
+                        load_1m: 0.42,
+                        mem_used_mib: 512,
+                        mem_total_mib: 1024,
+                        disk_used_mib: 256,
+                        disk_total_mib: 1024,
+                    }),
+                ),
+                (&names[2], InstanceState::Stopped, None),
+                (&names[3], InstanceState::Running, None),
+            ]
+            .map(|(name, state, usage)| InstanceStatus {
+                name,
+                state,
+                image: &image,
+                backend: BackendKind::of(&PlatformBackend::new()),
+                network,
+                usage,
+            });
+            let mut out = Vec::new();
+            super::write_instance_status(&mut out, &mut statuses, backend).unwrap();
+
+            let (network_header, network_cell, stopped_network_header, stopped_network_cell) =
+                match network {
+                    Some(_) => ("NETWORK   ", "isolated  ", "    NETWORK", "  isolated"),
+                    None => ("", "", "", ""),
+                };
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                format!(
+                    "{backend} · 2 running · 2 stopped\n\n\
+                     Running\n\
+                     {:<21}  IMAGE    {network_header}LOAD (1M)  MEM  DISK\n\
+                     {:<21}  default  {network_cell}        -    -     -\n\
+                     {:<21}  default  {network_cell}     0.42  50%   25%\n\n\
+                     Stopped\n\
+                     NAME   IMAGE{stopped_network_header}\n\
+                     alpha  default{stopped_network_cell}\n\
+                     zulu   default{stopped_network_cell}\n",
+                    "NAME", "beta", "long-running-instance",
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn instance_status_omits_empty_groups() {
+        use crate::backend::PlatformBackend;
+        use crate::commands::json::{BackendKind, InstanceState, InstanceStatus};
+        use crate::config::{InstanceName, default_image_name};
+
+        let name = InstanceName::new("sample").unwrap();
+        let image = default_image_name();
+        let mut status = InstanceStatus {
+            name: &name,
+            state: InstanceState::Stopped,
+            image: &image,
+            backend: BackendKind::of(&PlatformBackend::new()),
+            network: None,
+            usage: None,
+        };
+        let mut out = Vec::new();
+        super::write_instance_status(&mut out, std::slice::from_mut(&mut status), "lima").unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "lima · 0 running · 1 stopped\n\nStopped\nNAME    IMAGE\nsample  default\n",
+        );
+
+        status.state = InstanceState::Running;
+        let mut out = Vec::new();
+        super::write_instance_status(&mut out, &mut [status], "lima").unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "lima · 1 running · 0 stopped\n\n\
+             Running\n\
+             NAME    IMAGE    LOAD (1M)  MEM  DISK\n\
+             sample  default          -    -     -\n",
+        );
+    }
+
+    #[test]
+    fn instance_status_reports_empty_inventory() {
+        let mut out = Vec::new();
+        super::write_instance_status(&mut out, &mut [], "lima").unwrap();
         assert_eq!(out, b"No instances found\n");
     }
 
@@ -3579,6 +3760,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repo_names_colliding_after_normalization_get_unique_suffixes() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let cfg = cfg_with_data_dir(tmp.path().join("data"));
+        let image = super::config::default_image_name();
+
+        let (first, _first_provisioning) = super::allocate_up_instance(
+            &cfg,
+            None,
+            &image,
+            None,
+            Some("https://example.com/org/a_b.git"),
+        )
+        .unwrap();
+        let (second, _second_provisioning) = super::allocate_up_instance(
+            &cfg,
+            None,
+            &image,
+            None,
+            Some("https://example.com/org/a-b.git"),
+        )
+        .unwrap();
+
+        assert_eq!(first.name.as_str(), "a-b");
+        assert_eq!(second.name.as_str(), "a-b-2");
+        assert!(first.dir.is_dir());
+        assert!(second.dir.is_dir());
+
+        let explicit = super::config::InstanceName::new("a-b").unwrap();
+        let error = super::allocate_up_instance(
+            &cfg,
+            Some(&explicit),
+            &image,
+            None,
+            Some("https://example.com/org/a-b.git"),
+        )
+        .err()
+        .expect("explicit duplicate name must fail allocation");
+        assert!(error.to_string().contains("already exists"), "{error:#}");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn unnamed_running_selection_propagates_uncertain_pid_state() {
@@ -3651,38 +3873,6 @@ mod tests {
         .to_string();
 
         assert!(error.contains("does not contain"), "{error}");
-        assert!(!cfg.instances_dir().join(name.as_str()).exists());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn fresh_creation_cleans_up_when_provisioning_lock_cannot_open() {
-        let root = private_test_root();
-        let mut cfg = cfg_with_data_dir(root.path().join("data"));
-        let image = super::config::ImageName::new("legacy").unwrap();
-        let name = super::config::InstanceName::new("lock-failure").unwrap();
-        write_legacy_firecracker_image(&cfg, &image);
-
-        crate::fs_util::private_dir(&cfg.instances_dir()).unwrap();
-        let lock_path = cfg
-            .instances_dir()
-            .join(format!("..{name}.provisioning.operation.lock"));
-        std::os::unix::fs::symlink(cfg.instances_dir(), &lock_path).unwrap();
-
-        let config_path = root.path().join("config.toml");
-        let opts = start_opts(Vec::new(), &config_path);
-        let error = super::allocate_and_start(
-            &super::backend::FirecrackerBackend::new(),
-            &mut cfg,
-            Some(&name),
-            &image,
-            None,
-            &opts,
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("Failed to open operation lock"), "{error}");
         assert!(!cfg.instances_dir().join(name.as_str()).exists());
     }
 

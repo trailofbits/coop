@@ -167,10 +167,17 @@ impl CreationState {
 
 /// Serialize boot prerequisites and running creation retries before backend locks.
 pub(crate) fn lock_provisioning(inst: &Instance) -> Result<crate::fs_util::FileLock> {
-    let target = inst
-        .dir
-        .with_file_name(format!(".{}.provisioning", inst.name));
-    crate::fs_util::lock_sibling_bounded(&target, Duration::from_secs(30))
+    crate::fs_util::lock_sibling_bounded(&provisioning_target(inst), Duration::from_secs(30))
+}
+
+/// Allocation holds the inventory lock and must never wait for a provisioner.
+pub(crate) fn try_lock_new_instance(inst: &Instance) -> Result<crate::fs_util::FileLock> {
+    crate::fs_util::lock_sibling_bounded(&provisioning_target(inst), Duration::ZERO)
+}
+
+fn provisioning_target(inst: &Instance) -> std::path::PathBuf {
+    inst.dir
+        .with_file_name(format!(".{}.provisioning", inst.name))
 }
 
 pub(crate) fn set_preparation(inst: &Instance, preparation: Preparation) -> Result<()> {

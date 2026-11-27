@@ -149,8 +149,8 @@ shared SSH consumer continues through the same vsock target.
 An instance operation lock is held from the stopped-state probe through disk
 resize, commit, or restore. Start, stop, and destroy acquire the same bounded
 lock. Its file is a sibling of the instance directory, so directory removal
-does not replace the lock inode. Allocation releases its directory lock before
-any instance operation lock is acquired.
+does not replace the lock inode. Allocation reserves the new name’s provisioning lock without waiting before
+publishing the instance. It releases its directory lock before boot.
 
 ## Command dispatch
 
@@ -172,7 +172,7 @@ any instance operation lock is acquired.
 
 The `commands/` submodules own the domains: `lifecycle.rs` (up/start/shell/
 exec/stop/destroy/status/list/resize/commit/restore),
-`profiles.rs` (+ images), `agent.rs` (`coop agent update`),
+`profiles.rs` (+ images), `agent.rs` (`coop agent update` / `status`),
 `model.rs` (`coop model`), `proxy.rs` (`coop proxy`), `github.rs`,
 `admin.rs` (init/validate/uninstall), and `json.rs` (machine-readable `--json` output types). `commands/mod.rs`
 re-exports the dispatch surface and holds cross-domain helpers

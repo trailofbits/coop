@@ -203,8 +203,10 @@ fn old_stopped_vm_sockets_allow_status_and_cleanup_but_live_api_refuses() {
         "{}",
         String::from_utf8_lossy(&status.stderr)
     );
-    assert!(String::from_utf8_lossy(&status.stdout).contains("old"));
-    assert!(String::from_utf8_lossy(&status.stdout).contains("stopped"));
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    let (_, stopped) = stdout.split_once("\nStopped\n").unwrap();
+    assert!(stopped.lines().any(|line| line.starts_with("old ")));
+    assert!(stopped.lines().next().unwrap().ends_with("NETWORK"));
     assert!(api.exists() && vsock.exists());
 
     let stop = coop(&["stop", "old"]);
