@@ -45,6 +45,7 @@ sudo -n "$coop_bin" __disk-op resize "$data_dir" "$user_disk" >/dev/null
 sudo -n "$coop_bin" __disk-op format "$data_dir" "$stage" >/dev/null
 sudo -n "$coop_bin" __disk-op sandbox-probe "$data_dir" "$stage"
 sudo -n "$coop_bin" __disk-op sandbox-probe-read "$data_dir" "$stage"
+sudo -n "$coop_bin" __disk-op sandbox-probe-launch "$data_dir" "$stage" >/dev/null
 sudo -n "$coop_bin" __disk-op fsck-read "$data_dir" "$stage" >/dev/null
 sudo -n "$coop_bin" __disk-op mount "$data_dir" "$stage"
 # Holding cwd inside the mount reproduces an EBUSY unmount. A failed cleanup

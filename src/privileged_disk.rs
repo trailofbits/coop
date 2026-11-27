@@ -47,6 +47,7 @@ enum DiskKind {
 enum DiskTool {
     FsckFix,
     FsckRead,
+    FsckLaunchProbe,
     Resize,
     Format,
 }
@@ -54,7 +55,7 @@ enum DiskTool {
 impl DiskTool {
     fn setup_role(self) -> SetupTool {
         match self {
-            Self::FsckFix | Self::FsckRead => SetupTool::E2fsck,
+            Self::FsckFix | Self::FsckRead | Self::FsckLaunchProbe => SetupTool::E2fsck,
             Self::Resize => SetupTool::Resize2fs,
             Self::Format => SetupTool::MkfsExt4,
         }
@@ -67,7 +68,7 @@ impl DiskTool {
         match self {
             // e2fsck(8): 1 means errors corrected; other bits still require failure.
             Self::FsckFix => status.code() == Some(1),
-            Self::FsckRead | Self::Resize | Self::Format => false,
+            Self::FsckRead | Self::FsckLaunchProbe | Self::Resize | Self::Format => false,
         }
     }
 }
@@ -400,6 +401,9 @@ pub(crate) fn run(operation: &str, root: &Path, path: &Path, argument: Option<&s
         "resize" if argument.is_none() => disk_tool(&disk, uid, DiskTool::Resize, &[], true),
         "sandbox-probe" if argument.is_none() => sandbox_probe(&disk, uid, DiskTool::Resize),
         "sandbox-probe-read" if argument.is_none() => sandbox_probe(&disk, uid, DiskTool::FsckRead),
+        "sandbox-probe-launch" if argument.is_none() => {
+            disk_tool(&disk, uid, DiskTool::FsckLaunchProbe, &["-fn"], false)
+        }
         "format" if argument.is_none() => format_disk(&disk, uid),
         "mount" if argument.is_none() => mount_disk(&disk, uid),
         "unmount" if argument.is_none() => unmount_target(&disk, None),
@@ -523,13 +527,14 @@ fn proc_fd(file: &File) -> String {
 }
 
 /// The root helper is dedicated to one operation, so confine it before it
-/// forks the filesystem parser. Its only writable regular file is the inode
-/// already checked by `DiskPath::file`; an image's on-disk metadata is untrusted.
+/// forks the filesystem parser. The inode checked by `DiskPath::file` is the
+/// only regular file the tool can open for writing; inherited output
+/// descriptors may already refer to other files. Image metadata is untrusted.
 fn confine_filesystem_tool(disk: &File, program: &Path, tool: DiskTool) -> Result<()> {
     // These system trees contain the executable, loader, and shared libraries.
     // Their contents are readable but never executable through this rule.
     let read = AccessFs::ReadFile | AccessFs::ReadDir;
-    let disk_access = if matches!(tool, DiskTool::FsckRead) {
+    let disk_access = if matches!(tool, DiskTool::FsckRead | DiskTool::FsckLaunchProbe) {
         AccessFs::ReadFile.into()
     } else {
         AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate
@@ -643,7 +648,8 @@ fn elf_interpreter(program: &Path) -> Result<Option<PathBuf>> {
 }
 
 /// Landlock does not mediate chmod/chown, xattrs, timestamps, or signals. This
-/// filter closes those root-owner escape paths, process creation, and sockets.
+/// filter closes those root-owner escape paths, separate process creation,
+/// and sockets.
 /// Install it in `pre_exec`: Rust uses a socket pair while spawning a child.
 fn disk_tool_denied_syscalls() -> Vec<libc::c_long> {
     let common = [
@@ -891,12 +897,18 @@ fn drop_disk_tool_capabilities(disk: &File) -> Result<()> {
     Ok(())
 }
 
-/// Exercise the same boundary as a real filesystem tool, using only harmless
-/// opens and a fixed no-op executable. Called by the privileged disk probe.
+/// Exercise the policy with harmless opens and a denied launch of a different
+/// trusted filesystem tool. Called by the privileged disk probe.
 fn sandbox_probe(disk: &DiskPath, uid: u32, tool: DiskTool) -> Result<()> {
     let read_only = matches!(tool, DiskTool::FsckRead);
     let file = disk.file(!read_only, uid)?;
     let executable = tool.setup_role().command()?.build();
+    let other_tool = if read_only {
+        SetupTool::Resize2fs
+    } else {
+        SetupTool::E2fsck
+    };
+    let mut other_command = other_tool.command()?.build();
     confine_filesystem_tool(&file, Path::new(executable.get_program()), tool)?;
     match File::open("/etc/passwd") {
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
@@ -910,7 +922,7 @@ fn sandbox_probe(disk: &DiskPath, uid: u32, tool: DiskTool) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
         result => bail!("Disk tool could open an unrelated host file for writing: {result:?}"),
     }
-    match std::process::Command::new("/usr/bin/true").status() {
+    match other_command.status() {
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
         result => bail!("Disk tool could launch an unrelated program: {result:?}"),
     }
@@ -1329,6 +1341,12 @@ fn run_on_descriptors(
         .transpose()?;
     if let Some(disk) = sandbox_disk {
         confine_filesystem_tool(disk, Path::new(command.get_program()), tool)?;
+        if matches!(tool, DiskTool::FsckLaunchProbe) {
+            match File::open("/etc/passwd") {
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+                result => bail!("Disk tool launch could read an unrelated host file: {result:?}"),
+            }
+        }
     }
     // SAFETY: pre_exec uses only fcntl and prctl on descriptors and a filter
     // prepared before fork. It does not allocate or acquire locks.
@@ -1341,6 +1359,17 @@ fn run_on_descriptors(
             }
             if let Some(filter) = &mut syscall_filter {
                 install_disk_tool_syscall_filter(filter)?;
+            }
+            if matches!(tool, DiskTool::FsckLaunchProbe) {
+                let socket = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                if socket >= 0 {
+                    libc::close(socket);
+                    return Err(io::Error::from_raw_os_error(libc::EACCES));
+                }
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EPERM) {
+                    return Err(error);
+                }
             }
             Ok(())
         });
